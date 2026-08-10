@@ -13,6 +13,7 @@ class EventLoop;
 class Channel {
 public:
   using ReadCallback = std::function<void()>;
+  using WriteCallback = std::function<void()>;
 
   Channel(EventLoop &loop, int fd) noexcept;
   ~Channel() noexcept;
@@ -23,7 +24,11 @@ public:
   Channel &operator=(Channel &&) = delete;
 
   void SetReadCallback(ReadCallback callback);
+  void SetWriteCallback(WriteCallback callback);
   void EnableReading();
+  void DisableReading();
+  void EnableWriting();
+  void DisableWriting();
   void DisableAll();
   void Remove();
 
@@ -31,6 +36,7 @@ private:
   friend class EventLoop;
 
   void HandleEvent(std::uint32_t events);
+  void UpdateOrRemove();
 
   EventLoop &loop_;
   int fd_ = -1;
@@ -38,6 +44,7 @@ private:
   std::uint64_t registration_token_ = 0;
   bool added_ = false;
   ReadCallback read_callback_;
+  WriteCallback write_callback_;
 };
 
 } // namespace aegisgate::net
