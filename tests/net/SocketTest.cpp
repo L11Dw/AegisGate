@@ -21,5 +21,13 @@ TEST(SocketTest, AcceptsLoopbackClientWithNonblockingDescriptor) {
   EXPECT_EQ(::close(accepted_fd), 0);
 }
 
+TEST(SocketTest, CreatesAReusableNonblockingTcpSocket) {
+  Socket listener = Socket::ListenLoopback();
+  Socket client = Socket::CreateNonblockingTcp();
+  EXPECT_TRUE(client.IsNonblocking());
+  const Socket::ConnectResult result = client.ConnectToLoopback(listener.BoundPort());
+  EXPECT_NE(result, Socket::ConnectResult::kError);
+}
+
 } // namespace
 } // namespace aegisgate::net

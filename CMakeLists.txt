@@ -11,8 +11,11 @@ add_library(aegisgate STATIC
     src/net/ClientConnection.cpp
     src/net/EventLoop.cpp
     src/net/Socket.cpp
+    src/net/UpstreamConnection.cpp
     src/http/HttpResponse.cpp
+    src/http/HttpResponseParser.cpp
     src/http/HttpRequestParser.cpp
+    src/http/HttpRequestSerializer.cpp
 )
 
 target_include_directories(aegisgate PUBLIC include)

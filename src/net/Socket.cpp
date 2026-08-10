@@ -66,19 +66,40 @@ Socket Socket::ListenLoopback() {
 }
 
 Socket Socket::ConnectLoopback(std::uint16_t port) {
-  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                          0);
-  if (fd < 0) {
-    ThrowSystemError("socket");
-  }
-  Socket client(fd);
-  const sockaddr_in address = LoopbackAddress(port);
-  if (::connect(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) <
-          0 &&
-      errno != EINPROGRESS) {
+  Socket client = CreateNonblockingTcp();
+  if (client.ConnectToLoopback(port) == ConnectResult::kError) {
     ThrowSystemError("connect");
   }
   return client;
+}
+
+Socket Socket::CreateNonblockingTcp() {
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) ThrowSystemError("socket");
+  return Socket(fd);
+}
+
+Socket::ConnectResult Socket::ConnectToLoopback(std::uint16_t port) noexcept {
+  const sockaddr_in address = LoopbackAddress(port);
+  for (;;) {
+    if (::connect(fd_, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == 0) {
+      return ConnectResult::kConnected;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EINPROGRESS || errno == EAGAIN || errno == EWOULDBLOCK) {
+      return ConnectResult::kInProgress;
+    }
+    return ConnectResult::kError;
+  }
+}
+
+int Socket::PendingError() const {
+  int error = 0;
+  socklen_t length = sizeof(error);
+  if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &error, &length) < 0) {
+    ThrowSystemError("getsockopt SO_ERROR");
+  }
+  return error;
 }
 
 int Socket::Accept() const {
