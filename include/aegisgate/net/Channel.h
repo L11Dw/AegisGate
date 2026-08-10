@@ -1,0 +1,34 @@
+#pragma once
+
+#include <cstdint>
+#include <functional>
+
+namespace aegisgate::net {
+
+class EventLoop;
+
+// A non-owning registration of one file descriptor with an EventLoop.
+class Channel {
+public:
+  using ReadCallback = std::function<void()>;
+
+  Channel(EventLoop &loop, int fd) noexcept;
+
+  void SetReadCallback(ReadCallback callback);
+  void EnableReading();
+  void DisableAll();
+  void Remove();
+
+private:
+  friend class EventLoop;
+
+  void HandleEvent(std::uint32_t events);
+
+  EventLoop &loop_;
+  int fd_ = -1;
+  std::uint32_t events_ = 0;
+  bool added_ = false;
+  ReadCallback read_callback_;
+};
+
+} // namespace aegisgate::net

@@ -6,6 +6,9 @@ option(AEGISGATE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehavio
 
 add_library(aegisgate STATIC
     src/net/Buffer.cpp
+    src/net/Channel.cpp
+    src/net/EventLoop.cpp
+    src/net/Socket.cpp
     src/http/HttpRequestParser.cpp
 )
 
