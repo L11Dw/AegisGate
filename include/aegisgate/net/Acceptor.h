@@ -13,6 +13,9 @@ class EventLoop;
 
 class Acceptor {
 public:
+  // A normally returning callback takes ownership of fd and must close it or
+  // transfer it to another owner. Acceptor closes fd when no callback is set
+  // or when this callback throws.
   using NewConnectionCallback = std::function<void(int)>;
 
   Acceptor(EventLoop &loop, std::string_view address, std::uint16_t port);
@@ -23,6 +26,7 @@ public:
   Acceptor(Acceptor &&) = delete;
   Acceptor &operator=(Acceptor &&) = delete;
 
+  // See NewConnectionCallback for accepted-fd ownership and error semantics.
   void SetNewConnectionCallback(NewConnectionCallback callback);
   void Listen();
   [[nodiscard]] std::uint16_t port() const;

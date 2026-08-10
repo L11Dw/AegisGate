@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <gtest/gtest.h>
@@ -27,6 +28,23 @@ TEST(AcceptorTest, DispatchesLoopbackClientWithNonblockingDescriptor) {
 
   ASSERT_NE(accepted_fd, -1);
   EXPECT_EQ(::close(accepted_fd), 0);
+}
+
+TEST(AcceptorTest, CallbackCanTakeOwnershipOfAcceptedConnection) {
+  EventLoop loop;
+  Acceptor acceptor(loop, "127.0.0.1", 0);
+  Socket accepted_connection;
+  acceptor.SetNewConnectionCallback([&](int fd) {
+    accepted_connection = Socket(fd);
+    loop.Quit();
+  });
+  acceptor.Listen();
+
+  Socket client = Socket::ConnectLoopback(acceptor.port());
+  loop.Loop();
+
+  ASSERT_TRUE(accepted_connection.Valid());
+  EXPECT_NE(::fcntl(accepted_connection.Fd(), F_GETFD), -1);
 }
 
 } // namespace

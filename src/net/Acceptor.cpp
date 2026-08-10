@@ -57,7 +57,10 @@ void Acceptor::SetNewConnectionCallback(NewConnectionCallback callback) {
 }
 
 void Acceptor::Listen() {
-  if (::listen(listen_socket_.Fd(), SOMAXCONN) < 0) {
+  while (::listen(listen_socket_.Fd(), SOMAXCONN) < 0) {
+    if (errno == EINTR) {
+      continue;
+    }
     throw std::system_error(errno, std::generic_category(), "listen");
   }
   accept_channel_.EnableReading();

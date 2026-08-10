@@ -82,15 +82,20 @@ Socket Socket::ConnectLoopback(std::uint16_t port) {
 }
 
 int Socket::Accept() const {
-  const int accepted_fd =
-      ::accept4(fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
-  if (accepted_fd >= 0) {
-    return accepted_fd;
+  for (;;) {
+    const int accepted_fd =
+        ::accept4(fd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (accepted_fd >= 0) {
+      return accepted_fd;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return -1;
+    }
+    ThrowSystemError("accept4");
   }
-  if (errno == EAGAIN || errno == EWOULDBLOCK) {
-    return -1;
-  }
-  ThrowSystemError("accept4");
 }
 
 std::uint16_t Socket::BoundPort() const {
