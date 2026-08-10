@@ -12,6 +12,7 @@ add_library(aegisgate STATIC
     src/net/EventLoop.cpp
     src/net/Socket.cpp
     src/http/HttpResponse.cpp
+    src/http/HttpResponseParser.cpp
     src/http/HttpRequestParser.cpp
     src/http/HttpRequestSerializer.cpp
 )

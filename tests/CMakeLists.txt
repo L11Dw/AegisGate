@@ -7,6 +7,7 @@ add_executable(aegisgate_tests
     net/SocketTest.cpp
     net/ClientConnectionTest.cpp
     http/HttpResponseTest.cpp
+    http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp
     http/HttpRequestSerializerTest.cpp
 )
