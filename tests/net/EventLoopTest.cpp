@@ -71,6 +71,39 @@ TEST(EventLoopTest, DispatchesPeerCloseToReadCallbackAndQuits) {
   EXPECT_EQ(::close(sockets[0]), 0);
 }
 
+TEST(EventLoopTest, KeepsReadInterestWhenWritableInterestIsDisabled) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  EventLoop loop;
+  Channel channel(loop, sockets[0]);
+  bool write_called = false;
+  bool read_called = false;
+  channel.SetWriteCallback([&] {
+    write_called = true;
+    channel.DisableWriting();
+    ASSERT_EQ(::write(sockets[1], "r", 1), 1);
+  });
+  channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(sockets[0], &byte, 1), 1);
+    EXPECT_EQ(byte, 'r');
+    read_called = true;
+    loop.Quit();
+  });
+  channel.EnableReading();
+  channel.EnableWriting();
+
+  loop.Loop();
+
+  EXPECT_TRUE(write_called);
+  EXPECT_TRUE(read_called);
+  channel.Remove();
+  EXPECT_EQ(::close(sockets[0]), 0);
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
 TEST(EventLoopTest, DoesNotDispatchChannelAfterItIsDestroyed) {
   std::array<int, 2> stale_sockets{};
   std::array<int, 2> wake_sockets{};
