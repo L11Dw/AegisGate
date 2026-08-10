@@ -4,9 +4,21 @@ add_executable(aegisgate_tests
     net/BufferTest.cpp
     net/AcceptorTest.cpp
     net/EventLoopTest.cpp
+    net/TimerQueueTest.cpp
     net/SocketTest.cpp
     net/ClientConnectionTest.cpp
     net/UpstreamConnectionTest.cpp
+    proxy/ProxyTransactionTest.cpp
+    proxy/UpstreamPoolTest.cpp
+    gateway/GatewayTest.cpp
+    config/ConfigTest.cpp
+    routing/RouteTableTest.cpp
+    routing/WeightedRoundRobinTest.cpp
+    resilience/TokenBucketTest.cpp
+    resilience/InflightLimiterTest.cpp
+    observability/MetricsTest.cpp
+    mock/MockBackendTest.cpp
+    integration/EndToEndTest.cpp
     http/HttpResponseTest.cpp
     http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp
@@ -14,6 +26,7 @@ add_executable(aegisgate_tests
 )
 
 target_link_libraries(aegisgate_tests PRIVATE aegisgate GTest::gtest_main)
+target_compile_definitions(aegisgate_tests PRIVATE AEGISGATE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 include(GoogleTest)
 gtest_add_tests(TARGET aegisgate_tests TEST_LIST aegisgate_tests_TESTS)

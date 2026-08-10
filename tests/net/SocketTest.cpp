@@ -1,5 +1,7 @@
 #include <unistd.h>
 
+#include <poll.h>
+
 #include <gtest/gtest.h>
 
 #include "aegisgate/net/Socket.h"
@@ -27,6 +29,21 @@ TEST(SocketTest, CreatesAReusableNonblockingTcpSocket) {
   EXPECT_TRUE(client.IsNonblocking());
   const Socket::ConnectResult result = client.ConnectToLoopback(listener.BoundPort());
   EXPECT_NE(result, Socket::ConnectResult::kError);
+}
+
+TEST(SocketTest, LiteralIpv4ConnectDoesNotSubstituteLoopback) {
+  Socket listener = Socket::ListenLoopback();
+  Socket client = Socket::CreateNonblockingTcp();
+
+  const Socket::ConnectResult result = client.ConnectToIpv4({127, 0, 0, 2}, listener.BoundPort());
+  if (result == Socket::ConnectResult::kInProgress) {
+    pollfd descriptor{client.Fd(), POLLOUT, 0};
+    ASSERT_GT(::poll(&descriptor, 1, 1000), 0);
+    EXPECT_NE(client.PendingError(), 0);
+  } else {
+    EXPECT_EQ(result, Socket::ConnectResult::kError);
+  }
+  EXPECT_EQ(listener.Accept(), -1);
 }
 
 } // namespace

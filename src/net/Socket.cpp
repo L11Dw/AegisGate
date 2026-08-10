@@ -16,10 +16,13 @@ namespace {
   throw std::system_error(errno, std::generic_category(), operation);
 }
 
-sockaddr_in LoopbackAddress(std::uint16_t port) {
+sockaddr_in Ipv4Address(const std::array<std::uint8_t, 4> &bytes, std::uint16_t port) {
   sockaddr_in address{};
   address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_addr.s_addr = htonl((static_cast<std::uint32_t>(bytes[0]) << 24U) |
+                                  (static_cast<std::uint32_t>(bytes[1]) << 16U) |
+                                  (static_cast<std::uint32_t>(bytes[2]) << 8U) |
+                                  static_cast<std::uint32_t>(bytes[3]));
   address.sin_port = htons(port);
   return address;
 }
@@ -54,7 +57,7 @@ Socket Socket::ListenLoopback() {
     ThrowSystemError("setsockopt");
   }
 
-  const sockaddr_in address = LoopbackAddress(0);
+  const sockaddr_in address = Ipv4Address({127, 0, 0, 1}, 0);
   if (::bind(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) <
       0) {
     ThrowSystemError("bind");
@@ -80,7 +83,12 @@ Socket Socket::CreateNonblockingTcp() {
 }
 
 Socket::ConnectResult Socket::ConnectToLoopback(std::uint16_t port) noexcept {
-  const sockaddr_in address = LoopbackAddress(port);
+  return ConnectToIpv4({127, 0, 0, 1}, port);
+}
+
+Socket::ConnectResult Socket::ConnectToIpv4(const std::array<std::uint8_t, 4> &bytes,
+                                             std::uint16_t port) noexcept {
+  const sockaddr_in address = Ipv4Address(bytes, port);
   for (;;) {
     if (::connect(fd_, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == 0) {
       return ConnectResult::kConnected;

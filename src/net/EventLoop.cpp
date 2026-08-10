@@ -12,7 +12,8 @@
 
 namespace aegisgate::net {
 
-EventLoop::EventLoop() : epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)) {
+EventLoop::EventLoop()
+    : epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)), owner_thread_(std::this_thread::get_id()) {
   if (epoll_fd_ < 0) {
     throw std::system_error(errno, std::generic_category(), "epoll_create1");
   }
@@ -48,10 +49,25 @@ void EventLoop::Loop() {
         break;
       }
     }
+    // A callback may have closed its own Channel.  Defer its owner teardown
+    // until no Channel::HandleEvent frame from this epoll batch is active.
+    while (!deferred_tasks_.empty()) {
+      auto deferred = std::move(deferred_tasks_);
+      deferred_tasks_.clear();
+      for (auto &task : deferred) task();
+    }
   }
 }
 
 void EventLoop::Quit() noexcept { quit_ = true; }
+
+void EventLoop::QueueAfterCurrentBatch(std::function<void()> task) {
+  if (std::this_thread::get_id() != owner_thread_) {
+    throw std::logic_error("deferred task must be queued on the EventLoop thread");
+  }
+  if (!task) return;
+  deferred_tasks_.push_back(std::move(task));
+}
 
 void EventLoop::UpdateChannel(Channel &channel) {
   epoll_event event{};

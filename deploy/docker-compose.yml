@@ -1,0 +1,58 @@
+services:
+  normal-backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/build/aegisgate_mock_backend"]
+    command: ["18080", "--status", "200", "--max-inflight", "64"]
+    networks:
+      aegisgate-demo:
+        ipv4_address: 172.29.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/18080'"]
+      interval: 1s
+      timeout: 1s
+      retries: 10
+
+  fault-backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/build/aegisgate_mock_backend"]
+    command: ["18081", "--status", "503", "--max-inflight", "8"]
+    networks:
+      aegisgate-demo:
+        ipv4_address: 172.29.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/18081'"]
+      interval: 1s
+      timeout: 1s
+      retries: 10
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/build/aegisgate_server"]
+    command: ["/src/configs/demo.yaml", "8080"]
+    depends_on:
+      normal-backend:
+        condition: service_healthy
+      fault-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/8080'"]
+      interval: 1s
+      timeout: 1s
+      retries: 10
+    ports:
+      - "8080:8080"
+    networks:
+      aegisgate-demo:
+        ipv4_address: 172.29.0.20
+
+networks:
+  aegisgate-demo:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

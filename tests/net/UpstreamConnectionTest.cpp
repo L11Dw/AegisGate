@@ -213,6 +213,34 @@ TEST(UpstreamConnectionTest, ParsesConnectionCloseResponseAndRejectsSecondStart)
   EXPECT_THROW(connection.Start(PostRequest()), std::logic_error);
 }
 
+TEST(UpstreamConnectionTest, TreatsCaseInsensitiveConnectionCloseTokenAsNonReusableBeforePeerEof) {
+  Socket listener = Socket::ListenLoopback();
+  std::atomic_bool callback_seen = false;
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    constexpr std::string_view response =
+        "HTTP/1.1 200 OK\r\nConnection: Keep-Alive, Close\r\nContent-Length: 2\r\n\r\nok";
+    if (::write(fd, response.data(), response.size()) != static_cast<ssize_t>(response.size())) return;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!callback_seen.load() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    (void)::close(fd);
+  });
+  EventLoop loop;
+  UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult result, http::HttpResponse) {
+    EXPECT_EQ(result, UpstreamResult::kSuccess);
+    callback_seen = true;
+    loop.Quit();
+  });
+  connection.Start(PostRequest());
+  loop.Loop();
+  server.join();
+
+  EXPECT_FALSE(connection.Reusable());
+  EXPECT_THROW(connection.Start(PostRequest()), std::logic_error);
+}
+
 TEST(UpstreamConnectionTest, CloseActiveConnectionRemovesChannelBeforeLaterLoopDispatch) {
   Socket listener = Socket::ListenLoopback();
   std::array<int, 2> wake_sockets{};

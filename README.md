@@ -40,6 +40,19 @@ Mock or application backends
 
 See [the design document](AegisGate-%E8%AE%BE%E8%AE%A1%E6%96%87%E6%A1%A3.md) for protocol boundaries, state ownership, failure handling, and verification criteria.
 
+## Run the demo
+
+The local Compose demo builds the existing CMake targets, starts the gateway and two deterministic mock backends, and publishes the gateway at `127.0.0.1:8080`.
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build
+curl -i -H 'Host: normal.demo.local' http://127.0.0.1:8080/
+curl -i -H 'Host: fault.demo.local' http://127.0.0.1:8080/
+curl -s http://127.0.0.1:8080/metrics
+```
+
+The demo uses fixed private Docker-network addresses because this MVP deliberately accepts only literal IPv4 upstream endpoints; it does not perform DNS resolution. See [benchmark/README.md](benchmark/README.md) for a reproducible measurement procedure and result-record template.
+
 ## Planned verification
 
 - unit and integration tests, including TCP segmentation, malformed HTTP, connection reuse, timeouts, and fault injection;
