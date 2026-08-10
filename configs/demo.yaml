@@ -1,0 +1,29 @@
+routes:
+  - name: normal
+    host: normal.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 172.29.0.10
+        port: 18080
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+    connect_timeout_ms: 500
+    first_byte_timeout_ms: 500
+    total_timeout_ms: 2000
+    retry_budget: 1
+  - name: fault
+    host: fault.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 172.29.0.11
+        port: 18081
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 8
+    connect_timeout_ms: 500
+    first_byte_timeout_ms: 100
+    total_timeout_ms: 500
+    retry_budget: 1

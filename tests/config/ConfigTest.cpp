@@ -4,6 +4,8 @@
 
 #include <array>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string_view>
 
@@ -44,6 +46,17 @@ TEST(ConfigTest, LoadsValidatedImmutableRouteValues) {
   EXPECT_EQ(route.rate_limit, 1200U);
   EXPECT_EQ(route.burst, 200U);
   EXPECT_EQ(route.max_inflight, 500U);
+}
+
+TEST(ConfigTest, LoadsTheCheckedInDemoConfiguration) {
+  const std::string path = std::string(AEGISGATE_SOURCE_DIR) + "/configs/demo.yaml";
+  std::ifstream input(path);
+  ASSERT_TRUE(input) << path;
+  const std::string yaml(std::istreambuf_iterator<char>(input), {});
+  const Config config = LoadFromYaml(yaml);
+  ASSERT_EQ(config.routes.size(), 2U);
+  EXPECT_EQ(config.routes[0].name, "normal");
+  EXPECT_EQ(config.routes[1].name, "fault");
 }
 
 TEST(ConfigTest, ParsesNumericIpv4LiteralForDirectConnect) {
