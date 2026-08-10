@@ -6,6 +6,7 @@ add_executable(aegisgate_tests
     net/EventLoopTest.cpp
     net/SocketTest.cpp
     net/ClientConnectionTest.cpp
+    http/HttpResponseTest.cpp
     http/HttpRequestParserTest.cpp
 )
 
