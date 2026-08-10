@@ -118,10 +118,22 @@ TEST(HttpResponseParserTest, RejectsHeaderFieldLineOverEightKiB) {
 
 TEST(HttpResponseParserTest, RejectsIncompleteHeaderFieldLineOverEightKiB) {
   Buffer input;
-  input.Append("HTTP/1.1 200 OK\r\n" + std::string(8193, 'a'));
+  input.Append("HTTP/1.1 200 OK\r\nX: " + std::string(8190, 'a'));
   HttpResponseParser parser;
 
   EXPECT_EQ(parser.Parse(input), ParseResult::kError);
+}
+
+TEST(HttpResponseParserTest, WaitsForCompleteHeaderFieldLineAtEightKiB) {
+  Buffer input;
+  input.Append("HTTP/1.1 200 OK\r\nX: " + std::string(8189, 'a'));
+  HttpResponseParser parser;
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kNeedMoreData);
+  input.Append("\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_EQ(parser.Parse(input), ParseResult::kComplete);
+  EXPECT_EQ(parser.Response().headers[0].first, "X");
+  EXPECT_EQ(parser.Response().headers[0].second, std::string(8189, 'a'));
 }
 
 TEST(HttpResponseParserTest, ResetAllowsReuseAfterTerminalResult) {
