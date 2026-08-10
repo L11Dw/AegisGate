@@ -231,7 +231,16 @@ ParseResult HttpRequestParser::Parse(net::Buffer &input) {
       result_ = ParseResult::kUnsupported;
       return result_;
     }
-    parsed.headers.insert_or_assign(name, std::string(value));
+    if (name == "connection") {
+      const auto existing = parsed.headers.find(name);
+      if (existing != parsed.headers.end()) {
+        existing->second.append(",").append(value);
+      } else {
+        parsed.headers.emplace(name, value);
+      }
+    } else {
+      parsed.headers.insert_or_assign(name, std::string(value));
+    }
     cursor = line_end + 2;
   }
 

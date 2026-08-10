@@ -139,6 +139,10 @@ void ClientConnection::Close() noexcept {
 
 bool ClientConnection::reading_paused() const noexcept { return reading_paused_; }
 
+std::weak_ptr<void> ClientConnection::LifetimeToken() const noexcept {
+  return lifetime_;
+}
+
 void ClientConnection::HandleRead() {
   if (!socket_.Valid()) {
     return;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 
 #include "aegisgate/http/HttpRequestParser.h"
 #include "aegisgate/http/HttpResponse.h"
@@ -30,6 +31,7 @@ public:
   void SendResponse(const http::HttpResponse &response);
   void Close() noexcept;
   [[nodiscard]] bool reading_paused() const noexcept;
+  [[nodiscard]] std::weak_ptr<void> LifetimeToken() const noexcept;
 
 private:
   void HandleRead();
@@ -46,6 +48,8 @@ private:
   bool reading_paused_ = false;
   bool writing_ = false;
   bool close_after_write_ = false;
+  // Declare last so the token expires before any other member is destroyed.
+  std::shared_ptr<int> lifetime_ = std::make_shared<int>(0);
 };
 
 } // namespace aegisgate::net

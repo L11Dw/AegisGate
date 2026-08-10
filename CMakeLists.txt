@@ -12,6 +12,7 @@ add_library(aegisgate STATIC
     src/net/EventLoop.cpp
     src/net/Socket.cpp
     src/net/UpstreamConnection.cpp
+    src/proxy/ProxyTransaction.cpp
     src/http/HttpResponse.cpp
     src/http/HttpResponseParser.cpp
     src/http/HttpRequestParser.cpp
