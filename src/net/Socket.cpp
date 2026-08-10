@@ -66,14 +66,16 @@ Socket Socket::ListenLoopback() {
 }
 
 Socket Socket::ConnectLoopback(std::uint16_t port) {
-  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                          0);
   if (fd < 0) {
     ThrowSystemError("socket");
   }
   Socket client(fd);
   const sockaddr_in address = LoopbackAddress(port);
   if (::connect(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) <
-      0) {
+          0 &&
+      errno != EINPROGRESS) {
     ThrowSystemError("connect");
   }
   return client;

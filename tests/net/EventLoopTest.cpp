@@ -47,6 +47,30 @@ TEST(EventLoopTest, DispatchesReadableSocketpairChannelAndQuits) {
   EXPECT_EQ(::close(sockets[1]), 0);
 }
 
+TEST(EventLoopTest, DispatchesPeerCloseToReadCallbackAndQuits) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  EventLoop loop;
+  Channel channel(loop, sockets[0]);
+  bool called = false;
+  channel.SetReadCallback([&] {
+    char byte = '\0';
+    EXPECT_EQ(::read(sockets[0], &byte, 1), 0);
+    called = true;
+    loop.Quit();
+  });
+  channel.EnableReading();
+
+  ASSERT_EQ(::close(sockets[1]), 0);
+  loop.Loop();
+
+  EXPECT_TRUE(called);
+  channel.Remove();
+  EXPECT_EQ(::close(sockets[0]), 0);
+}
+
 TEST(EventLoopTest, DoesNotDispatchChannelAfterItIsDestroyed) {
   std::array<int, 2> stale_sockets{};
   std::array<int, 2> wake_sockets{};

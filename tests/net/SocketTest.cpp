@@ -16,6 +16,7 @@ TEST(SocketTest, AcceptsLoopbackClientWithNonblockingDescriptor) {
   const int accepted_fd = listener.Accept();
   ASSERT_NE(accepted_fd, -1);
 
+  EXPECT_TRUE(client.IsNonblocking());
   EXPECT_TRUE(Socket::IsNonblocking(accepted_fd));
   EXPECT_EQ(::close(accepted_fd), 0);
 }

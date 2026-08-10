@@ -36,7 +36,8 @@ void Channel::DisableAll() {
 void Channel::Remove() { loop_.RemoveChannel(*this); }
 
 void Channel::HandleEvent(std::uint32_t events) {
-  if ((events & (EPOLLIN | EPOLLRDHUP)) != 0U && read_callback_) {
+  if ((events & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0U &&
+      read_callback_) {
     read_callback_();
   }
 }
