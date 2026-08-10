@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace aegisgate::net {
@@ -23,6 +24,10 @@ public:
   // Starts a nonblocking IPv4 loopback connect. Both successful states must
   // pass PendingError() before application bytes may be sent.
   [[nodiscard]] ConnectResult ConnectToLoopback(std::uint16_t port) noexcept;
+  // Starts a nonblocking connection to an already parsed literal IPv4 address.
+  // No name lookup or loopback fallback is performed.
+  [[nodiscard]] ConnectResult ConnectToIpv4(const std::array<std::uint8_t, 4> &address,
+                                             std::uint16_t port) noexcept;
   [[nodiscard]] int PendingError() const;
 
   // Returns -1 when a nonblocking listener has no pending connection.

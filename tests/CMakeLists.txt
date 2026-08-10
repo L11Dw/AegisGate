@@ -8,8 +8,10 @@ add_executable(aegisgate_tests
     net/ClientConnectionTest.cpp
     net/UpstreamConnectionTest.cpp
     proxy/ProxyTransactionTest.cpp
+    proxy/UpstreamPoolTest.cpp
     config/ConfigTest.cpp
     routing/RouteTableTest.cpp
+    routing/WeightedRoundRobinTest.cpp
     http/HttpResponseTest.cpp
     http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp
