@@ -1,6 +1,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <memory>
 #include <thread>
 #include <type_traits>
 
@@ -86,6 +87,59 @@ TEST(EventLoopTest, DoesNotDispatchChannelAfterItIsDestroyed) {
   EXPECT_EQ(::close(stale_sockets[1]), 0);
   EXPECT_EQ(::close(wake_sockets[0]), 0);
   EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(EventLoopTest, SkipsDestroyedChannelFromTheSameEpollBatch) {
+  std::array<int, 2> first_sockets{};
+  std::array<int, 2> second_sockets{};
+  ASSERT_EQ(
+      ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, first_sockets.data()),
+      0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                         second_sockets.data()),
+            0);
+
+  EventLoop loop;
+  auto second_channel = std::make_unique<Channel>(loop, second_sockets[0]);
+  bool destroyed_channel_called = false;
+  int first_callback_count = 0;
+  second_channel->SetReadCallback([&] { destroyed_channel_called = true; });
+
+  Channel first_channel(loop, first_sockets[0]);
+  first_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(first_sockets[0], &byte, 1), 1);
+    ++first_callback_count;
+    if (first_callback_count == 1) {
+      EXPECT_EQ(byte, 'a');
+      second_channel.reset();
+    } else {
+      EXPECT_EQ(byte, 'q');
+      loop.Quit();
+    }
+  });
+
+  // Register and make the first socket ready first so both events are returned
+  // by one epoll_wait batch, with the first callback destroying the second.
+  first_channel.EnableReading();
+  second_channel->EnableReading();
+  ASSERT_EQ(::write(first_sockets[1], "a", 1), 1);
+  ASSERT_EQ(::write(second_sockets[1], "b", 1), 1);
+
+  std::thread quit_loop([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(::write(first_sockets[1], "q", 1), 1);
+  });
+  loop.Loop();
+  quit_loop.join();
+
+  EXPECT_FALSE(destroyed_channel_called);
+  EXPECT_EQ(first_callback_count, 2);
+  first_channel.Remove();
+  EXPECT_EQ(::close(first_sockets[0]), 0);
+  EXPECT_EQ(::close(first_sockets[1]), 0);
+  EXPECT_EQ(::close(second_sockets[0]), 0);
+  EXPECT_EQ(::close(second_sockets[1]), 0);
 }
 
 } // namespace
