@@ -103,6 +103,21 @@ TEST(UpstreamConnectionTest, ReportsConnectErrorExactlyOnce) {
   EXPECT_EQ(callback_count, 1);
 }
 
+TEST(UpstreamConnectionTest, InvalidRequestCompletesOnceAndCannotBeRestarted) {
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamConnection connection(loop, 1, [&](UpstreamResult result, http::HttpResponse) {
+    EXPECT_EQ(result, UpstreamResult::kProtocolError);
+    ++callback_count;
+  });
+  http::HttpRequest invalid = PostRequest();
+  invalid.headers.clear();
+
+  EXPECT_NO_THROW(connection.Start(invalid));
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_THROW(connection.Start(PostRequest()), std::logic_error);
+}
+
 TEST(UpstreamConnectionTest, ReportsEofBeforeACompleteResponse) {
   Socket listener = Socket::ListenLoopback();
   std::thread server([&] {
@@ -171,6 +186,30 @@ TEST(UpstreamConnectionTest, CallbackMayDestroyOwnerAndRetainResponse) {
   server.join();
   EXPECT_EQ(connection, nullptr);
   EXPECT_EQ(body, "done");
+}
+
+TEST(UpstreamConnectionTest, ParsesConnectionCloseResponseAndRejectsSecondStart) {
+  Socket listener = Socket::ListenLoopback();
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    EXPECT_EQ(ReadAllRequest(fd, http::SerializeRequest(PostRequest()).size()),
+              http::SerializeRequest(PostRequest()));
+    constexpr std::string_view response =
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+    EXPECT_EQ(::write(fd, response.data(), response.size()), static_cast<ssize_t>(response.size()));
+    EXPECT_EQ(::shutdown(fd, SHUT_WR), 0);
+    EXPECT_EQ(::close(fd), 0);
+  });
+  EventLoop loop;
+  UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult result, http::HttpResponse response) {
+    EXPECT_EQ(result, UpstreamResult::kSuccess);
+    EXPECT_EQ(response.body, "ok");
+    loop.Quit();
+  });
+  connection.Start(PostRequest());
+  loop.Loop();
+  server.join();
+  EXPECT_THROW(connection.Start(PostRequest()), std::logic_error);
 }
 
 TEST(UpstreamConnectionTest, DrainsLargeRequestAcrossWritableEvents) {

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 
 #include "aegisgate/http/HttpRequestParser.h"
 #include "aegisgate/http/HttpResponse.h"
@@ -48,9 +49,11 @@ private:
   void HandleWrite();
   void Finish(UpstreamResult result);
 
-  Socket socket_;
-  Channel channel_;
+  EventLoop &loop_;
   std::uint16_t port_;
+  // Channel is destroyed before Socket so it cannot unregister a closed fd.
+  std::unique_ptr<Socket> socket_;
+  std::unique_ptr<Channel> channel_;
   Buffer input_;
   Buffer output_;
   http::HttpResponseParser parser_;

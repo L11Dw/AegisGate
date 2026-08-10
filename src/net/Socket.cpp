@@ -81,10 +81,16 @@ Socket Socket::CreateNonblockingTcp() {
 
 Socket::ConnectResult Socket::ConnectToLoopback(std::uint16_t port) noexcept {
   const sockaddr_in address = LoopbackAddress(port);
-  if (::connect(fd_, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == 0) {
-    return ConnectResult::kConnected;
+  for (;;) {
+    if (::connect(fd_, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == 0) {
+      return ConnectResult::kConnected;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EINPROGRESS || errno == EAGAIN || errno == EWOULDBLOCK) {
+      return ConnectResult::kInProgress;
+    }
+    return ConnectResult::kError;
   }
-  return errno == EINPROGRESS ? ConnectResult::kInProgress : ConnectResult::kError;
 }
 
 int Socket::PendingError() const {
