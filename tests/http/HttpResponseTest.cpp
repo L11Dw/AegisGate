@@ -17,11 +17,25 @@ TEST(HttpResponseTest, SerializesContentLengthResponse) {
             "hello");
 }
 
-TEST(HttpResponseTest, SerializesEmptyBody) {
+TEST(HttpResponseTest, OmitsFramingForBodylessStatus) {
   HttpResponse response{204, "No Content", {}, ""};
+  HttpResponse not_modified{304, "Not Modified", {}, ""};
+
+  EXPECT_EQ(response.Serialize(), "HTTP/1.1 204 No Content\r\n\r\n");
+  EXPECT_EQ(not_modified.Serialize(), "HTTP/1.1 304 Not Modified\r\n\r\n");
+}
+
+TEST(HttpResponseTest, PreservesProvidedHeaderOrder) {
+  HttpResponse response{200,
+                        "OK",
+                        {{"x-first", "1"}, {"x-second", "2"}},
+                        ""};
 
   EXPECT_EQ(response.Serialize(),
-            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            "HTTP/1.1 200 OK\r\n"
+            "x-first: 1\r\n"
+            "x-second: 2\r\n"
+            "Content-Length: 0\r\n\r\n");
 }
 
 TEST(HttpResponseTest, RejectsConflictingFramingHeaders) {
@@ -42,6 +56,12 @@ TEST(HttpResponseTest, RejectsInvalidStatusOrHeaderInjection) {
                std::invalid_argument);
   EXPECT_THROW(static_cast<void>(
                    HttpResponse{200, "OK", {{"x-test", "yes\nno"}}, ""}.Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(HttpResponse{600, "invalid", {}, ""}.Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(HttpResponse{101, "Switching Protocols", {}, ""}.Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(HttpResponse{204, "No Content", {}, "x"}.Serialize()),
                std::invalid_argument);
 }
 

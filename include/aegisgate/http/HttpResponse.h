@@ -1,7 +1,8 @@
 #pragma once
 
 #include <string>
-#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace aegisgate::http {
 
@@ -11,7 +12,10 @@ namespace aegisgate::http {
 struct HttpResponse {
   int status = 200;
   std::string reason = "OK";
-  std::unordered_map<std::string, std::string> headers;
+  // HTTP permits repeated fields; preserving caller order makes serialized
+  // output deterministic and leaves that extension possible without an API
+  // change.
+  std::vector<std::pair<std::string, std::string>> headers;
   std::string body;
 
   [[nodiscard]] std::string Serialize() const;

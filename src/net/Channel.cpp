@@ -41,7 +41,9 @@ void Channel::DisableReading() {
 }
 
 void Channel::EnableWriting() {
-  events_ |= EPOLLOUT | EPOLLRDHUP;
+  // A write-only Channel must wait for space, not repeatedly wake on a
+  // level-triggered peer half-close. Read interest already carries RDHUP.
+  events_ |= EPOLLOUT;
   UpdateOrRemove();
 }
 

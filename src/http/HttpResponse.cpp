@@ -23,8 +23,12 @@ std::string Lowercase(std::string_view value) {
 } // namespace
 
 std::string HttpResponse::Serialize() const {
-  if (status < 100 || status > 999 || HasLineBreak(reason)) {
+  if (status < 200 || status > 599 || HasLineBreak(reason)) {
     throw std::invalid_argument("invalid HTTP response status line");
+  }
+  const bool bodyless_status = status == 204 || status == 304;
+  if (bodyless_status && !body.empty()) {
+    throw std::invalid_argument("HTTP response status does not permit a body");
   }
 
   std::string result = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
@@ -38,7 +42,10 @@ std::string HttpResponse::Serialize() const {
     }
     result.append(name).append(": ").append(value).append("\r\n");
   }
-  result.append("Content-Length: ").append(std::to_string(body.size())).append("\r\n\r\n");
+  if (!bodyless_status) {
+    result.append("Content-Length: ").append(std::to_string(body.size())).append("\r\n");
+  }
+  result.append("\r\n");
   result.append(body);
   return result;
 }
