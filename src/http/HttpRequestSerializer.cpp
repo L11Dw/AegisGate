@@ -41,6 +41,15 @@ bool IsToken(std::string_view value) {
   return !value.empty();
 }
 
+bool TryAddWithinLimit(std::size_t *total, std::size_t value,
+                       std::size_t limit) {
+  if (value > limit - *total) {
+    return false;
+  }
+  *total += value;
+  return true;
+}
+
 bool IsHexDigit(unsigned char character) {
   return (character >= '0' && character <= '9') ||
          (character >= 'A' && character <= 'F') ||
@@ -133,17 +142,29 @@ std::string SerializeRequest(const HttpRequest &request) {
     throw std::invalid_argument("invalid HTTP request");
   }
 
-  const std::string request_line = request.method + " " + request.target + " " +
-                                   request.version + "\r\n";
-  if (request_line.size() - 2 > kMaxRequestLineBytes) {
+  std::size_t request_line_bytes = 0;
+  if (!TryAddWithinLimit(&request_line_bytes, request.method.size(),
+                         kMaxRequestLineBytes) ||
+      !TryAddWithinLimit(&request_line_bytes, 1, kMaxRequestLineBytes) ||
+      !TryAddWithinLimit(&request_line_bytes, request.target.size(),
+                         kMaxRequestLineBytes) ||
+      !TryAddWithinLimit(&request_line_bytes, 1, kMaxRequestLineBytes) ||
+      !TryAddWithinLimit(&request_line_bytes, request.version.size(),
+                         kMaxRequestLineBytes)) {
     throw std::invalid_argument("HTTP request line exceeds limit");
   }
 
-  std::string header_lines;
+  std::size_t header_bytes = 0;
   std::size_t host_count = 0;
   for (const auto &[name, value] : request.headers) {
     if (!IsToken(name) || !IsValidFieldValue(value)) {
       throw std::invalid_argument("invalid HTTP request header");
+    }
+    if (!TryAddWithinLimit(&header_bytes, name.size(), kMaxHeaderBytes) ||
+        !TryAddWithinLimit(&header_bytes, 2, kMaxHeaderBytes) ||
+        !TryAddWithinLimit(&header_bytes, value.size(), kMaxHeaderBytes) ||
+        !TryAddWithinLimit(&header_bytes, 2, kMaxHeaderBytes)) {
+      throw std::invalid_argument("HTTP request headers exceed limit");
     }
     const std::string lower_name = LowerAscii(name);
     if (lower_name == "host") {
@@ -153,7 +174,6 @@ std::string SerializeRequest(const HttpRequest &request) {
         lower_name == "connection") {
       throw std::invalid_argument("HTTP request framing is managed by Serialize");
     }
-    header_lines.append(name).append(": ").append(value).append("\r\n");
   }
   if (host_count != 1) {
     throw std::invalid_argument("HTTP/1.1 request requires exactly one Host header");
@@ -163,15 +183,21 @@ std::string SerializeRequest(const HttpRequest &request) {
                                      std::to_string(request.body.size()) + "\r\n";
   constexpr std::string_view kConnection = "Connection: keep-alive\r\n";
   constexpr std::string_view kHeaderTerminator = "\r\n";
-  if (header_lines.size() + content_length.size() + kConnection.size() +
-          kHeaderTerminator.size() >
-      kMaxHeaderBytes) {
+  if (!TryAddWithinLimit(&header_bytes, content_length.size(), kMaxHeaderBytes) ||
+      !TryAddWithinLimit(&header_bytes, kConnection.size(), kMaxHeaderBytes) ||
+      !TryAddWithinLimit(&header_bytes, kHeaderTerminator.size(), kMaxHeaderBytes)) {
     throw std::invalid_argument("HTTP request headers exceed limit");
   }
 
-  std::string result = request_line;
-  result.append(header_lines).append(content_length).append(kConnection).append(
-      kHeaderTerminator).append(request.body);
+  std::string result;
+  result.reserve(request_line_bytes + 2 + header_bytes + request.body.size());
+  result.append(request.method).append(" ").append(request.target).append(" ").append(
+      request.version).append("\r\n");
+  for (const auto &[name, value] : request.headers) {
+    result.append(name).append(": ").append(value).append("\r\n");
+  }
+  result.append(content_length).append(kConnection).append(kHeaderTerminator).append(
+      request.body);
   return result;
 }
 

@@ -186,5 +186,19 @@ TEST(HttpRequestSerializerTest, RejectsHeadersOverThirtyTwoKiB) {
                std::invalid_argument);
 }
 
+TEST(HttpRequestSerializerTest, RejectsOverLimitLegalTargetBeforeSerializingIt) {
+  const HttpRequest request{"GET", "/" + std::string(kMaxRequestLineBytes - 13, 'a'),
+                            "HTTP/1.1", "", {{"Host", "upstream.test"}}};
+
+  EXPECT_THROW(static_cast<void>(SerializeRequest(request)), std::invalid_argument);
+}
+
+TEST(HttpRequestSerializerTest, RejectsOverLimitLegalHeaderValueBeforeSerializingIt) {
+  const HttpRequest request{"GET", "/", "HTTP/1.1", "",
+                            {{"Host", std::string(kMaxHeaderBytes - 52, 'a')}}};
+
+  EXPECT_THROW(static_cast<void>(SerializeRequest(request)), std::invalid_argument);
+}
+
 } // namespace
 } // namespace aegisgate::http
