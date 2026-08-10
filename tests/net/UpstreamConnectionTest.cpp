@@ -212,6 +212,24 @@ TEST(UpstreamConnectionTest, ParsesConnectionCloseResponseAndRejectsSecondStart)
   EXPECT_THROW(connection.Start(PostRequest()), std::logic_error);
 }
 
+TEST(UpstreamConnectionTest, CloseActiveConnectionRemovesChannelBeforeLaterLoopDispatch) {
+  Socket listener = Socket::ListenLoopback();
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(::close(fd), 0);
+  });
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult, http::HttpResponse) {
+    ++callback_count;
+  });
+  connection.Start(PostRequest());
+  connection.Close();
+  server.join();
+  EXPECT_EQ(callback_count, 0);
+}
+
 TEST(UpstreamConnectionTest, DrainsLargeRequestAcrossWritableEvents) {
   Socket listener = Socket::ListenLoopback();
   const http::HttpRequest request = PostRequest(std::string(256 * 1024, 'x'));

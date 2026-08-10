@@ -48,8 +48,8 @@ void UpstreamConnection::Close() noexcept {
   if (channel_) {
     try { channel_->DisableAll(); } catch (...) {}
   }
-  if (socket_) socket_->Close();
   channel_.reset();
+  if (socket_) socket_->Close();
   socket_.reset();
 }
 
@@ -134,8 +134,8 @@ void UpstreamConnection::Finish(UpstreamResult result) {
   if (channel_) {
     try { channel_->DisableAll(); } catch (...) {}
   }
-  if (socket_) socket_->Close();
   channel_.reset();
+  if (socket_) socket_->Close();
   socket_.reset();
   const ResponseCallback callback = callback_;
   http::HttpResponse response;
