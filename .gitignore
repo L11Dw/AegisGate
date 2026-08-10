@@ -1,0 +1,30 @@
+# CMake and build outputs
+/build/
+/build-*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# Compiled binaries and profiling artifacts
+*.o
+*.a
+*.so
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Runtime and editor-local files
+/logs/
+*.log
+.obsidian/
+.vscode/
+*.swp
+.DS_Store
+
+# Private preparation notes (kept locally, never published)
+/介绍.md
+/record_host.txt
