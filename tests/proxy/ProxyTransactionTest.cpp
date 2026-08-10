@@ -19,6 +19,7 @@
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
 #include "aegisgate/proxy/ProxyTransaction.h"
+#include "aegisgate/resilience/RouteAdmission.h"
 
 namespace aegisgate::proxy {
 namespace {
@@ -126,6 +127,67 @@ private:
   std::thread thread_;
 };
 
+TEST(ProxyTransactionTest, RejectsRouteAdmissionBeforeStartingUpstream) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const auto now = std::chrono::steady_clock::now();
+  const config::Route route{"limited", "test", "/", {}, 1, 1, 1};
+  const auto admission = std::make_shared<resilience::RouteAdmission>(route, now);
+  auto held = admission->TryAcquire(now);
+  ASSERT_TRUE(held);
+
+  std::array<int, 2> sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, sockets[0], [&](net::ClientConnection &connection,
+                                                       const http::HttpRequest &parsed) {
+    transaction = ProxyTransaction::Start(loop, connection, listener.BoundPort(), parsed, admission);
+  });
+  client.Start();
+  constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()), static_cast<ssize_t>(request.size()));
+
+  WorkerResult peer_result;
+  constexpr std::string_view expected =
+      "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
+  std::thread peer([&] {
+    const auto response = ReadExactUntil(sockets[1], expected.size(), TestDeadline(), peer_result.error);
+    if (!response) return;
+    peer_result.received = *response;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  LoopWatchdog watchdog(wake_sockets[1]);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+
+  pollfd descriptor{listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "rejected request opened an upstream connection";
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, expected);
+  EXPECT_TRUE(peer_result.wire_ok);
+  EXPECT_TRUE(transaction);
+  held.reset();
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
 TEST(ProxyTransactionTest, ForwardsPostAndSegmentedResponseToClient) {
   net::Socket listener = net::Socket::ListenLoopback();
   // Framing and every hop-by-hop field, including fields nominated by
@@ -174,12 +236,15 @@ TEST(ProxyTransactionTest, ForwardsPostAndSegmentedResponseToClient) {
     loop.Quit();
   });
   wake_channel.EnableReading();
+  const config::Route route{"success", "origin.test", "/", {}, 2, 2, 1};
+  const auto admission = std::make_shared<resilience::RouteAdmission>(
+      route, std::chrono::steady_clock::now());
   std::weak_ptr<ProxyTransaction> transaction;
   bool request_callback_called = false;
   net::ClientConnection client(loop, sockets[0], [&](net::ClientConnection &connection,
                                                        const http::HttpRequest &parsed) {
     request_callback_called = true;
-    transaction = ProxyTransaction::Start(loop, connection, listener.BoundPort(), parsed);
+    transaction = ProxyTransaction::Start(loop, connection, listener.BoundPort(), parsed, admission);
   });
   client.Start();
   ASSERT_EQ(::write(sockets[1], wire_request.data(), wire_request.size()),
@@ -202,6 +267,9 @@ TEST(ProxyTransactionTest, ForwardsPostAndSegmentedResponseToClient) {
   EXPECT_FALSE(watchdog_fired);
   EXPECT_TRUE(request_callback_called);
   EXPECT_TRUE(transaction.expired());
+  // The upstream completion terminates the transaction before downstream I/O
+  // resumes; its route reservation must already be available again.
+  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
   EXPECT_TRUE(server_result.error.empty()) << server_result.error;
   EXPECT_EQ(server_result.received, expected_request);
   EXPECT_TRUE(server_result.wire_ok);

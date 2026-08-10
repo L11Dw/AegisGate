@@ -43,7 +43,13 @@ bool PrefixMatches(std::string_view path, std::string_view prefix) {
 
 } // namespace
 
-RouteTable::RouteTable(config::Config config) : config_(std::move(config)) {}
+RouteTable::RouteTable(config::Config config) : config_(std::move(config)) {
+  admissions_.reserve(config_.routes.size());
+  const auto now = resilience::TokenBucket::Clock::now();
+  for (const config::Route &route : config_.routes) {
+    admissions_.push_back(std::make_shared<resilience::RouteAdmission>(route, now));
+  }
+}
 
 const config::Route *RouteTable::Match(std::string_view host, std::string_view target) const noexcept {
   if (!IsOriginForm(target)) return nullptr;
@@ -54,6 +60,14 @@ const config::Route *RouteTable::Match(std::string_view host, std::string_view t
     if (best == nullptr || route.path_prefix.size() > best->path_prefix.size()) best = &route;
   }
   return best;
+}
+
+std::shared_ptr<resilience::RouteAdmission>
+RouteTable::AdmissionFor(const config::Route &route) const noexcept {
+  for (std::size_t index = 0; index < config_.routes.size(); ++index) {
+    if (&config_.routes[index] == &route) return admissions_[index];
+  }
+  return nullptr;
 }
 
 } // namespace aegisgate::routing

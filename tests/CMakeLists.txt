@@ -12,6 +12,8 @@ add_executable(aegisgate_tests
     config/ConfigTest.cpp
     routing/RouteTableTest.cpp
     routing/WeightedRoundRobinTest.cpp
+    resilience/TokenBucketTest.cpp
+    resilience/InflightLimiterTest.cpp
     http/HttpResponseTest.cpp
     http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp

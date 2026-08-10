@@ -11,6 +11,7 @@
 
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
+#include "aegisgate/resilience/RouteAdmission.h"
 
 namespace aegisgate::proxy {
 namespace {
@@ -78,17 +79,30 @@ void StripHopByHopHeaders(http::HttpResponse &response) {
 } // namespace
 
 ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
-                                   std::uint16_t upstream_port, http::HttpRequest request)
+                                   std::uint16_t upstream_port, http::HttpRequest request,
+                                   std::shared_ptr<resilience::RouteAdmission> admission)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
-      upstream_port_(upstream_port), request_(std::move(request)) {}
+      upstream_port_(upstream_port), request_(std::move(request)), admission_(std::move(admission)) {}
 
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
-                        std::uint16_t upstream_port, http::HttpRequest request) {
+                        std::uint16_t upstream_port, http::HttpRequest request,
+                        std::shared_ptr<resilience::RouteAdmission> admission) {
   const auto transaction = std::shared_ptr<ProxyTransaction>(
-      new ProxyTransaction(loop, client, upstream_port, std::move(request)));
-  transaction->StartUpstream();
+      new ProxyTransaction(loop, client, upstream_port, std::move(request), std::move(admission)));
+  transaction->Begin();
   return transaction;
+}
+
+void ProxyTransaction::Begin() {
+  if (admission_) {
+    reservation_ = admission_->TryAcquire(resilience::TokenBucket::Clock::now());
+    if (!reservation_) {
+      HandleAdmissionRejected();
+      return;
+    }
+  }
+  StartUpstream();
 }
 
 void ProxyTransaction::StartUpstream() {
@@ -114,9 +128,23 @@ void ProxyTransaction::StartUpstream() {
   }
 }
 
+void ProxyTransaction::HandleAdmissionRejected() {
+  if (finished_) return;
+  finished_ = true;
+  const auto client_lifetime = client_lifetime_.lock();
+  if (!client_lifetime) return;
+  const auto self = shared_from_this();
+  try {
+    client_->SendResponse(http::HttpResponse{429, "Too Many Requests", {}, ""});
+  } catch (const std::logic_error &) {
+  } catch (const std::system_error &) {
+  }
+}
+
 void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResponse response) {
   if (finished_) return;
   finished_ = true;
+  reservation_.reset();
   // UpstreamConnection can complete synchronously from Start().  Do not
   // destroy that object while its Start()/Finish() stack frame is active.
   if (!starting_upstream_) upstream_.reset();

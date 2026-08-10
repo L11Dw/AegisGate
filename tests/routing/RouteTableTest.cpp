@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <string_view>
 
 namespace aegisgate::routing {
@@ -80,6 +81,21 @@ TEST(RouteTableTest, MatchesHostWithExplicitPortExactly) {
 TEST(RouteTableTest, RejectsNonAsciiHostInput) {
   const RouteTable table = MakeTable();
   EXPECT_EQ(table.Match("api.demo.local\xC3\xA9", "/api"), nullptr);
+}
+
+TEST(RouteTableTest, KeepsOneAdmissionStateForEachMatchedRoute) {
+  RouteTable table = MakeTable();
+  const config::Route *route = table.Match("api.demo.local", "/api");
+  ASSERT_NE(route, nullptr);
+
+  const auto first_state = table.AdmissionFor(*route);
+  const auto second_state = table.AdmissionFor(*route);
+  ASSERT_NE(first_state, nullptr);
+  EXPECT_EQ(first_state, second_state);
+
+  const auto now = std::chrono::steady_clock::time_point{};
+  EXPECT_TRUE(first_state->TryAcquire(now));
+  EXPECT_FALSE(second_state->TryAcquire(now));
 }
 
 } // namespace
