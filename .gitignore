@@ -28,3 +28,5 @@ Makefile
 # Private preparation notes (kept locally, never published)
 /介绍.md
 /record_host.txt
+/docs/private/
+/.worktrees/
