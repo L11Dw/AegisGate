@@ -9,6 +9,7 @@ find_package(yaml-cpp CONFIG REQUIRED)
 add_library(aegisgate STATIC
     src/config/Config.cpp
     src/gateway/Gateway.cpp
+    src/mock/MockBackend.cpp
     src/observability/Metrics.cpp
     src/net/Buffer.cpp
     src/net/Acceptor.cpp
@@ -42,6 +43,10 @@ aegisgate_enable_warnings(aegisgate)
 add_executable(aegisgate_server apps/aegisgate/main.cpp)
 target_link_libraries(aegisgate_server PRIVATE aegisgate)
 aegisgate_enable_warnings(aegisgate_server)
+
+add_executable(aegisgate_mock_backend apps/mock-backend/main.cpp)
+target_link_libraries(aegisgate_mock_backend PRIVATE aegisgate)
+aegisgate_enable_warnings(aegisgate_mock_backend)
 
 
 include(CTest)

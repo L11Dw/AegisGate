@@ -17,6 +17,7 @@ add_executable(aegisgate_tests
     resilience/TokenBucketTest.cpp
     resilience/InflightLimiterTest.cpp
     observability/MetricsTest.cpp
+    mock/MockBackendTest.cpp
     http/HttpResponseTest.cpp
     http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp
