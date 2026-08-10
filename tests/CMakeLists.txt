@@ -8,6 +8,7 @@ add_executable(aegisgate_tests
     net/ClientConnectionTest.cpp
     http/HttpResponseTest.cpp
     http/HttpRequestParserTest.cpp
+    http/HttpRequestSerializerTest.cpp
 )
 
 target_link_libraries(aegisgate_tests PRIVATE aegisgate GTest::gtest_main)

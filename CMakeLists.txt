@@ -13,6 +13,7 @@ add_library(aegisgate STATIC
     src/net/Socket.cpp
     src/http/HttpResponse.cpp
     src/http/HttpRequestParser.cpp
+    src/http/HttpRequestSerializer.cpp
 )
 
 target_include_directories(aegisgate PUBLIC include)
