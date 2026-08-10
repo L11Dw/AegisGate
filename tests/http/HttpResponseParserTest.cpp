@@ -107,6 +107,15 @@ TEST(HttpResponseParserTest, EnforcesLineHeaderAndBodyLimits) {
   EXPECT_EQ(header_parser.Parse(headers), ParseResult::kError);
 }
 
+TEST(HttpResponseParserTest, RejectsHeaderFieldLineOverEightKiB) {
+  Buffer input;
+  input.Append("HTTP/1.1 200 OK\r\nX-Large: " + std::string(9 * 1024, 'a') +
+               "\r\nContent-Length: 0\r\n\r\n");
+  HttpResponseParser parser;
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kError);
+}
+
 TEST(HttpResponseParserTest, ResetAllowsReuseAfterTerminalResult) {
   Buffer input;
   input.Append("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n");

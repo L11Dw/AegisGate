@@ -158,6 +158,12 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
       break;
     }
     const std::string_view line = bytes.substr(cursor, line_end - cursor);
+    // Match the request parser's line-limit convention: the CRLF delimiter is
+    // not counted, so a field-line of exactly 8 KiB remains valid.
+    if (line.size() > kMaxStatusLineBytes) {
+      result_ = ParseResult::kError;
+      return result_;
+    }
     const std::size_t colon = line.find(':');
     if (colon == std::string_view::npos || colon == 0 || !IsToken(line.substr(0, colon))) {
       result_ = ParseResult::kError;
