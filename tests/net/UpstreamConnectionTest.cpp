@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "aegisgate/http/HttpRequestSerializer.h"
+#include "aegisgate/net/Channel.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
 #include "aegisgate/net/UpstreamConnection.h"
@@ -214,20 +215,45 @@ TEST(UpstreamConnectionTest, ParsesConnectionCloseResponseAndRejectsSecondStart)
 
 TEST(UpstreamConnectionTest, CloseActiveConnectionRemovesChannelBeforeLaterLoopDispatch) {
   Socket listener = Socket::ListenLoopback();
+  std::atomic<bool> upstream_ready = false;
   std::thread server([&] {
     const int fd = AcceptBlocking(listener);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    EXPECT_EQ(::write(fd, response.data(), response.size()),
+              static_cast<ssize_t>(response.size()));
+    upstream_ready = true;
     EXPECT_EQ(::close(fd), 0);
   });
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                         wake_sockets.data()), 0);
   EventLoop loop;
   int callback_count = 0;
   UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult, http::HttpResponse) {
     ++callback_count;
   });
   connection.Start(PostRequest());
+  while (!upstream_ready.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   connection.Close();
+
+  Channel wake_channel(loop, wake_sockets[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_sockets[0], &byte, 1), 1);
+    EXPECT_EQ(byte, 'q');
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  ASSERT_EQ(::write(wake_sockets[1], "q", 1), 1);
+  loop.Loop();
+
   server.join();
   EXPECT_EQ(callback_count, 0);
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
 TEST(UpstreamConnectionTest, DrainsLargeRequestAcrossWritableEvents) {
