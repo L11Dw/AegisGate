@@ -215,42 +215,56 @@ TEST(UpstreamConnectionTest, ParsesConnectionCloseResponseAndRejectsSecondStart)
 
 TEST(UpstreamConnectionTest, CloseActiveConnectionRemovesChannelBeforeLaterLoopDispatch) {
   Socket listener = Socket::ListenLoopback();
-  std::atomic<bool> upstream_ready = false;
-  std::thread server([&] {
-    const int fd = AcceptBlocking(listener);
-    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-    EXPECT_EQ(::write(fd, response.data(), response.size()),
-              static_cast<ssize_t>(response.size()));
-    upstream_ready = true;
-    EXPECT_EQ(::close(fd), 0);
-  });
   std::array<int, 2> wake_sockets{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
                          wake_sockets.data()), 0);
   EventLoop loop;
   int callback_count = 0;
-  UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult, http::HttpResponse) {
-    ++callback_count;
-  });
-  connection.Start(PostRequest());
-  while (!upstream_ready.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  connection.Close();
-
+  int wake_callback_count = 0;
+  std::unique_ptr<UpstreamConnection> connection;
+  // Register this Channel before the upstream Channel. With both descriptors
+  // ready, epoll returns its token first; its first callback removes the
+  // upstream registration while that old token remains in the same batch.
   Channel wake_channel(loop, wake_sockets[0]);
   wake_channel.SetReadCallback([&] {
     char byte = '\0';
     ASSERT_EQ(::read(wake_sockets[0], &byte, 1), 1);
+    ++wake_callback_count;
+    if (wake_callback_count == 1) {
+      EXPECT_EQ(byte, 'a');
+      connection->Close();
+      return;
+    }
     EXPECT_EQ(byte, 'q');
     loop.Quit();
   });
   wake_channel.EnableReading();
-  ASSERT_EQ(::write(wake_sockets[1], "q", 1), 1);
+  connection = std::make_unique<UpstreamConnection>(loop, listener.BoundPort(), [&](UpstreamResult, http::HttpResponse) {
+    ++callback_count;
+  });
+  connection->Start(PostRequest());
+
+  int peer_fd = -1;
+  for (int attempt = 0; attempt != 10000 && peer_fd < 0; ++attempt) {
+    peer_fd = listener.Accept();
+    if (peer_fd < 0) std::this_thread::yield();
+  }
+  ASSERT_NE(peer_fd, -1);
+  Socket peer(peer_fd);
+  constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+  ASSERT_EQ(::write(peer.Fd(), response.data(), response.size()),
+            static_cast<ssize_t>(response.size()));
+
+  // The accepted peer has completed the local handshake and supplied a
+  // response before either control byte is made ready. The upstream's
+  // EPOLLOUT/terminal-read readiness and the control read readiness therefore
+  // enter the same epoll_wait batch; registration order makes control first.
+  ASSERT_EQ(::write(wake_sockets[1], "aq", 2), 2);
   loop.Loop();
 
-  server.join();
   EXPECT_EQ(callback_count, 0);
+  EXPECT_EQ(wake_callback_count, 2);
+  connection.reset();
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_sockets[0]), 0);
   EXPECT_EQ(::close(wake_sockets[1]), 0);
