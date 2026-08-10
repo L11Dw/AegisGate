@@ -38,23 +38,69 @@ bool IsToken(std::string_view value) {
   return !value.empty();
 }
 
-bool IsValidTarget(std::string_view target) {
-  if (target.empty() || target.front() != '/') {
+bool IsHexDigit(unsigned char character) {
+  return (character >= '0' && character <= '9') ||
+         (character >= 'A' && character <= 'F') ||
+         (character >= 'a' && character <= 'f');
+}
+
+bool IsUnreserved(unsigned char character) {
+  return (character >= 'A' && character <= 'Z') ||
+         (character >= 'a' && character <= 'z') ||
+         (character >= '0' && character <= '9') || character == '-' ||
+         character == '.' || character == '_' || character == '~';
+}
+
+bool IsSubDelimiter(unsigned char character) {
+  switch (character) {
+  case '!':
+  case '$':
+  case '&':
+  case '\'':
+  case '(':
+  case ')':
+  case '*':
+  case '+':
+  case ',':
+  case ';':
+  case '=':
+    return true;
+  default:
     return false;
   }
-  for (const unsigned char character : target) {
-    if (character <= 0x20 || character == 0x7f) {
+}
+
+bool IsValidUriComponent(std::string_view value, bool is_query) {
+  for (std::size_t index = 0; index < value.size(); ++index) {
+    const unsigned char character = static_cast<unsigned char>(value[index]);
+    if (IsUnreserved(character) || IsSubDelimiter(character) || character == ':' ||
+        character == '@' || character == '/' || (is_query && character == '?')) {
+      continue;
+    }
+    if (character != '%' || index + 2 >= value.size() ||
+        !IsHexDigit(static_cast<unsigned char>(value[index + 1])) ||
+        !IsHexDigit(static_cast<unsigned char>(value[index + 2]))) {
       return false;
     }
+    index += 2;
   }
   return true;
 }
 
+bool IsValidTarget(std::string_view target) {
+  if (target.empty() || target.front() != '/') {
+    return false;
+  }
+  const std::size_t query_start = target.find('?');
+  const std::string_view path = target.substr(0, query_start);
+  const std::string_view query = query_start == std::string_view::npos
+                                     ? std::string_view{}
+                                     : target.substr(query_start + 1);
+  return IsValidUriComponent(path, false) && IsValidUriComponent(query, true);
+}
+
 bool IsValidFieldValue(std::string_view value) {
   for (const unsigned char character : value) {
-    if (character == '\t') {
-      continue;
-    }
     if (character < 0x20 || character == 0x7f) {
       return false;
     }
