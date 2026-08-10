@@ -1,5 +1,8 @@
 #include <array>
 #include <cerrno>
+#include <chrono>
+#include <thread>
+#include <type_traits>
 
 #include <gtest/gtest.h>
 
@@ -11,6 +14,11 @@
 
 namespace aegisgate::net {
 namespace {
+
+static_assert(!std::is_copy_constructible_v<Channel>);
+static_assert(!std::is_copy_assignable_v<Channel>);
+static_assert(!std::is_move_constructible_v<Channel>);
+static_assert(!std::is_move_assignable_v<Channel>);
 
 TEST(EventLoopTest, DispatchesReadableSocketpairChannelAndQuits) {
   std::array<int, 2> sockets{};
@@ -36,6 +44,48 @@ TEST(EventLoopTest, DispatchesReadableSocketpairChannelAndQuits) {
   channel.Remove();
   EXPECT_EQ(::close(sockets[0]), 0);
   EXPECT_EQ(::close(sockets[1]), 0);
+}
+
+TEST(EventLoopTest, DoesNotDispatchChannelAfterItIsDestroyed) {
+  std::array<int, 2> stale_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(
+      ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stale_sockets.data()),
+      0);
+  ASSERT_EQ(
+      ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()),
+      0);
+
+  EventLoop loop;
+  bool destroyed_channel_called = false;
+  {
+    Channel channel(loop, stale_sockets[0]);
+    channel.SetReadCallback([&] { destroyed_channel_called = true; });
+    channel.EnableReading();
+  }
+
+  Channel wake_channel(loop, wake_sockets[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_sockets[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+
+  ASSERT_EQ(::write(stale_sockets[1], "x", 1), 1);
+  std::thread wake_loop([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(::write(wake_sockets[1], "q", 1), 1);
+  });
+  loop.Loop();
+  wake_loop.join();
+
+  EXPECT_FALSE(destroyed_channel_called);
+  wake_channel.Remove();
+  EXPECT_EQ(::close(stale_sockets[0]), 0);
+  EXPECT_EQ(::close(stale_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
 } // namespace

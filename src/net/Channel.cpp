@@ -8,6 +8,13 @@ namespace aegisgate::net {
 
 Channel::Channel(EventLoop &loop, int fd) noexcept : loop_(loop), fd_(fd) {}
 
+Channel::~Channel() noexcept {
+  try {
+    DisableAll();
+  } catch (...) {
+  }
+}
+
 void Channel::SetReadCallback(ReadCallback callback) {
   read_callback_ = std::move(callback);
 }
@@ -19,7 +26,7 @@ void Channel::EnableReading() {
 
 void Channel::DisableAll() {
   events_ = 0;
-  loop_.UpdateChannel(*this);
+  loop_.RemoveChannel(*this);
 }
 
 void Channel::Remove() { loop_.RemoveChannel(*this); }

@@ -13,6 +13,12 @@ public:
   using ReadCallback = std::function<void()>;
 
   Channel(EventLoop &loop, int fd) noexcept;
+  ~Channel() noexcept;
+
+  Channel(const Channel &) = delete;
+  Channel &operator=(const Channel &) = delete;
+  Channel(Channel &&) = delete;
+  Channel &operator=(Channel &&) = delete;
 
   void SetReadCallback(ReadCallback callback);
   void EnableReading();
