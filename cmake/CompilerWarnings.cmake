@@ -3,8 +3,19 @@ function(aegisgate_enable_warnings target)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
         if(AEGISGATE_ENABLE_SANITIZERS)
-            target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
-            target_link_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            if(NOT TARGET aegisgate_sanitizers)
+                add_library(aegisgate_sanitizers INTERFACE)
+                target_compile_options(aegisgate_sanitizers INTERFACE
+                    -fsanitize=address,undefined
+                    -fno-omit-frame-pointer
+                )
+                target_link_options(aegisgate_sanitizers INTERFACE
+                    -fsanitize=address,undefined
+                    -fno-omit-frame-pointer
+                )
+            endif()
+
+            target_link_libraries(${target} PUBLIC aegisgate_sanitizers)
         endif()
     endif()
 endfunction()

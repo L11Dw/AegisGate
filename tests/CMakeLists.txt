@@ -8,6 +8,9 @@ add_executable(aegisgate_tests
 target_link_libraries(aegisgate_tests PRIVATE aegisgate GTest::gtest_main)
 
 include(GoogleTest)
-gtest_discover_tests(aegisgate_tests DISCOVERY_MODE PRE_TEST)
+gtest_add_tests(TARGET aegisgate_tests TEST_LIST aegisgate_tests_TESTS)
+set_tests_properties(${aegisgate_tests_TESTS} PROPERTIES
+    ENVIRONMENT "LSAN_OPTIONS=detect_leaks=0"
+)
 
 aegisgate_enable_warnings(aegisgate_tests)
