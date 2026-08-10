@@ -55,13 +55,16 @@ void ClientConnection::ResumeReading() {
     switch (parser_.Parse(input_)) {
     case http::ParseResult::kNeedMoreData:
       break;
-    case http::ParseResult::kComplete:
+    case http::ParseResult::kComplete: {
       channel_.DisableAll();
       reading_paused_ = true;
-      if (request_callback_) {
-        request_callback_(*this, parser_.Request());
+      const RequestCallback callback = request_callback_;
+      const http::HttpRequest request = parser_.Request();
+      if (callback) {
+        callback(*this, request);
       }
       return;
+    }
     case http::ParseResult::kError:
     case http::ParseResult::kUnsupported:
       Close();
@@ -97,13 +100,16 @@ void ClientConnection::HandleRead() {
       switch (parser_.Parse(input_)) {
       case http::ParseResult::kNeedMoreData:
         continue;
-      case http::ParseResult::kComplete:
+      case http::ParseResult::kComplete: {
         channel_.DisableAll();
         reading_paused_ = true;
-        if (request_callback_) {
-          request_callback_(*this, parser_.Request());
+        const RequestCallback callback = request_callback_;
+        const http::HttpRequest request = parser_.Request();
+        if (callback) {
+          callback(*this, request);
         }
         return;
+      }
       case http::ParseResult::kError:
       case http::ParseResult::kUnsupported:
         Close();

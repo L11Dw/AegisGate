@@ -1,6 +1,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <memory>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -126,6 +127,75 @@ TEST(ClientConnectionTest, DeliversSegmentedPostAndPausesBeforeCallback) {
   EXPECT_EQ(::close(sockets[1]), 0);
   EXPECT_EQ(::close(wake_sockets[0]), 0);
   EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(ClientConnectionTest, CallbackCanDestroyOwnerDuringRead) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  EventLoop loop;
+  std::unique_ptr<ClientConnection> connection;
+  bool callback_called = false;
+  connection = std::make_unique<ClientConnection>(
+      loop, sockets[0], [&](ClientConnection &, const http::HttpRequest &request) {
+        connection.reset();
+        EXPECT_EQ(request.method, "POST");
+        EXPECT_EQ(request.body, "hello");
+        callback_called = true;
+        loop.Quit();
+      });
+  connection->Start();
+
+  constexpr std::string_view request =
+      "POST /destroy HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()),
+            static_cast<ssize_t>(request.size()));
+  loop.Loop();
+
+  EXPECT_TRUE(callback_called);
+  EXPECT_EQ(connection, nullptr);
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
+TEST(ClientConnectionTest, CallbackCanDestroyOwnerDuringResumeReading) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  EventLoop loop;
+  std::unique_ptr<ClientConnection> connection;
+  int callback_count = 0;
+  connection = std::make_unique<ClientConnection>(
+      loop, sockets[0], [&](ClientConnection &, const http::HttpRequest &request) {
+        ++callback_count;
+        if (callback_count == 1) {
+          EXPECT_EQ(request.method, "GET");
+          EXPECT_EQ(request.body, "");
+          loop.Quit();
+          return;
+        }
+        connection.reset();
+        EXPECT_EQ(request.method, "POST");
+        EXPECT_EQ(request.body, "hello");
+        loop.Quit();
+      });
+  connection->Start();
+
+  constexpr std::string_view requests =
+      "GET /first HTTP/1.1\r\n\r\n"
+      "POST /destroy HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+  ASSERT_EQ(::write(sockets[1], requests.data(), requests.size()),
+            static_cast<ssize_t>(requests.size()));
+  loop.Loop();
+
+  ASSERT_EQ(callback_count, 1);
+  ASSERT_NE(connection, nullptr);
+  connection->ResumeReading();
+
+  EXPECT_EQ(callback_count, 2);
+  EXPECT_EQ(connection, nullptr);
+  EXPECT_EQ(::close(sockets[1]), 0);
 }
 
 TEST(ClientConnectionTest, CloseIsIdempotent) {
