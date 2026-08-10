@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "aegisgate/http/HttpRequestParser.h"
+#include "aegisgate/config/Config.h"
 #include "aegisgate/net/UpstreamConnection.h"
 #include "aegisgate/resilience/InflightLimiter.h"
 
@@ -19,6 +20,8 @@ class RouteAdmission;
 
 namespace aegisgate::proxy {
 
+class UpstreamPool;
+
 // Owns the one upstream exchange for one request while its client is paused.
 class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction> {
 public:
@@ -26,10 +29,18 @@ public:
   Start(net::EventLoop &loop, net::ClientConnection &client, std::uint16_t upstream_port,
         http::HttpRequest request,
         std::shared_ptr<resilience::RouteAdmission> admission = nullptr);
+  [[nodiscard]] static std::shared_ptr<ProxyTransaction>
+  Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
+        http::HttpRequest request, std::shared_ptr<UpstreamPool> pool,
+        std::shared_ptr<resilience::RouteAdmission> admission = nullptr);
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                    std::uint16_t upstream_port, http::HttpRequest request,
+                   std::shared_ptr<resilience::RouteAdmission> admission);
+  ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
+                   config::Endpoint endpoint, http::HttpRequest request,
+                   std::shared_ptr<UpstreamPool> pool,
                    std::shared_ptr<resilience::RouteAdmission> admission);
 
   void Begin();
@@ -41,10 +52,12 @@ private:
   net::ClientConnection *client_;
   std::weak_ptr<void> client_lifetime_;
   std::uint16_t upstream_port_;
+  std::optional<config::Endpoint> endpoint_;
   http::HttpRequest request_;
   std::shared_ptr<resilience::RouteAdmission> admission_;
   std::optional<resilience::InflightLimiter::Reservation> reservation_;
   std::unique_ptr<net::UpstreamConnection> upstream_;
+  std::shared_ptr<UpstreamPool> pool_;
   bool starting_upstream_ = false;
   bool finished_ = false;
 };

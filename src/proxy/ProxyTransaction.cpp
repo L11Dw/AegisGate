@@ -11,6 +11,7 @@
 
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
+#include "aegisgate/proxy/UpstreamPool.h"
 #include "aegisgate/resilience/RouteAdmission.h"
 
 namespace aegisgate::proxy {
@@ -84,12 +85,32 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       upstream_port_(upstream_port), request_(std::move(request)), admission_(std::move(admission)) {}
 
+ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
+                                   config::Endpoint endpoint, http::HttpRequest request,
+                                   std::shared_ptr<UpstreamPool> pool,
+                                   std::shared_ptr<resilience::RouteAdmission> admission)
+    : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
+      endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
+      pool_(std::move(pool)) {}
+
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         std::uint16_t upstream_port, http::HttpRequest request,
                         std::shared_ptr<resilience::RouteAdmission> admission) {
   const auto transaction = std::shared_ptr<ProxyTransaction>(
       new ProxyTransaction(loop, client, upstream_port, std::move(request), std::move(admission)));
+  transaction->Begin();
+  return transaction;
+}
+
+std::shared_ptr<ProxyTransaction>
+ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
+                        config::Endpoint endpoint, http::HttpRequest request,
+                        std::shared_ptr<UpstreamPool> pool,
+                        std::shared_ptr<resilience::RouteAdmission> admission) {
+  if (!pool) throw std::invalid_argument("upstream pool is required");
+  const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
+      loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission)));
   transaction->Begin();
   return transaction;
 }
@@ -111,6 +132,15 @@ void ProxyTransaction::StartUpstream() {
     // Each HTTP hop owns its framing and connection-scoped fields.
     http::HttpRequest upstream_request = request_;
     StripHopByHopHeaders(upstream_request);
+    if (pool_) {
+      starting_upstream_ = true;
+      pool_->Execute(*endpoint_, upstream_request,
+                     [self](net::UpstreamResult result, http::HttpResponse response) {
+                       self->HandleUpstream(result, std::move(response));
+                     });
+      starting_upstream_ = false;
+      return;
+    }
     upstream_ = std::make_unique<net::UpstreamConnection>(
         loop_, upstream_port_, [self](net::UpstreamResult result, http::HttpResponse response) {
           self->HandleUpstream(result, std::move(response));

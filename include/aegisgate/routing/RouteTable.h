@@ -2,6 +2,7 @@
 
 #include "aegisgate/config/Config.h"
 #include "aegisgate/resilience/RouteAdmission.h"
+#include "aegisgate/routing/WeightedRoundRobin.h"
 
 #include <memory>
 #include <string_view>
@@ -27,9 +28,14 @@ public:
   [[nodiscard]] std::shared_ptr<resilience::RouteAdmission>
   AdmissionFor(const config::Route &route) const noexcept;
 
+  // Advances the route-owned weighted selector.  Passing a Route from another
+  // table returns nullptr; this table is single-EventLoop-thread confined.
+  [[nodiscard]] const config::Endpoint *NextEndpoint(const config::Route &route) const noexcept;
+
 private:
   config::Config config_;
   std::vector<std::shared_ptr<resilience::RouteAdmission>> admissions_;
+  mutable std::vector<WeightedRoundRobin> selectors_;
 };
 
 } // namespace aegisgate::routing

@@ -31,7 +31,18 @@ void UpstreamPool::Execute(const config::Endpoint &endpoint, const http::HttpReq
                                net::UpstreamResult result, http::HttpResponse response) mutable {
     Complete(raw, key, std::move(callback), result, std::move(response));
   });
-  raw->Start(request);
+  try {
+    raw->Start(request);
+  } catch (...) {
+    // Start may fail before it has completed through Complete().  Do not leave
+    // a connection (and its callback-captured transaction) stranded active.
+    const auto active = active_.find(raw);
+    if (active != active_.end()) {
+      active->second->Close();
+      active_.erase(active);
+    }
+    throw;
+  }
 }
 
 std::size_t UpstreamPool::IdleCount(const config::Endpoint &endpoint) const noexcept {

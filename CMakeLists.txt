@@ -8,6 +8,7 @@ find_package(yaml-cpp CONFIG REQUIRED)
 
 add_library(aegisgate STATIC
     src/config/Config.cpp
+    src/gateway/Gateway.cpp
     src/net/Buffer.cpp
     src/net/Acceptor.cpp
     src/net/Channel.cpp
@@ -35,6 +36,10 @@ target_compile_features(aegisgate PUBLIC cxx_std_20)
 
 include(cmake/CompilerWarnings.cmake)
 aegisgate_enable_warnings(aegisgate)
+
+add_executable(aegisgate_server apps/aegisgate/main.cpp)
+target_link_libraries(aegisgate_server PRIVATE aegisgate)
+aegisgate_enable_warnings(aegisgate_server)
 
 include(CTest)
 if(BUILD_TESTING)

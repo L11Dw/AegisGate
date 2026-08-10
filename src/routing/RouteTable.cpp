@@ -48,6 +48,7 @@ RouteTable::RouteTable(config::Config config) : config_(std::move(config)) {
   const auto now = resilience::TokenBucket::Clock::now();
   for (const config::Route &route : config_.routes) {
     admissions_.push_back(std::make_shared<resilience::RouteAdmission>(route, now));
+    selectors_.emplace_back(route.endpoints);
   }
 }
 
@@ -66,6 +67,13 @@ std::shared_ptr<resilience::RouteAdmission>
 RouteTable::AdmissionFor(const config::Route &route) const noexcept {
   for (std::size_t index = 0; index < config_.routes.size(); ++index) {
     if (&config_.routes[index] == &route) return admissions_[index];
+  }
+  return nullptr;
+}
+
+const config::Endpoint *RouteTable::NextEndpoint(const config::Route &route) const noexcept {
+  for (std::size_t index = 0; index < config_.routes.size(); ++index) {
+    if (&config_.routes[index] == &route) return &selectors_[index].Next();
   }
   return nullptr;
 }

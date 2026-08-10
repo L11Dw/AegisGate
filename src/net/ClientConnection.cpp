@@ -90,6 +90,10 @@ void ClientConnection::Start() {
   }
 }
 
+void ClientConnection::SetCloseCallback(CloseCallback callback) {
+  close_callback_ = std::move(callback);
+}
+
 void ClientConnection::ResumeReading() {
   if (!socket_.Valid() || !reading_paused_ || writing_) {
     return;
@@ -135,6 +139,10 @@ void ClientConnection::Close() noexcept {
   } catch (...) {
   }
   socket_.Close();
+  try {
+    if (close_callback_) close_callback_();
+  } catch (...) {
+  }
 }
 
 bool ClientConnection::reading_paused() const noexcept { return reading_paused_; }
