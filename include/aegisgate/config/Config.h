@@ -25,6 +25,10 @@ struct Route {
   std::uint32_t rate_limit{};
   std::uint32_t burst{};
   std::uint32_t max_inflight{};
+  std::uint32_t connect_timeout_ms = 5000;
+  std::uint32_t first_byte_timeout_ms = 5000;
+  std::uint32_t total_timeout_ms = 30000;
+  std::uint32_t retry_budget = 1;
 };
 
 struct Config {

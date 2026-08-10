@@ -18,7 +18,9 @@
 #include "aegisgate/net/Channel.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
+#include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/proxy/ProxyTransaction.h"
+#include "aegisgate/proxy/UpstreamPool.h"
 #include "aegisgate/resilience/RouteAdmission.h"
 
 namespace aegisgate::proxy {
@@ -434,6 +436,95 @@ TEST(ProxyTransactionTest, DoesNotDereferenceClientDestroyedAfterRequestCallback
   EXPECT_TRUE(server_result.wire_ok);
   EXPECT_TRUE(client_lifetime.expired());
   EXPECT_TRUE(transaction.expired());
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(ProxyTransactionTest, CancelsAllDeadlinesAfterARetrySucceeds) {
+  net::Socket first_listener = net::Socket::ListenLoopback();
+  net::Socket second_listener = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_listener.BoundPort(), 1};
+  const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_listener.BoundPort(), 1};
+  constexpr std::string_view request =
+      "GET /retry HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string first_error;
+  std::string second_error;
+  std::thread first_backend([&] {
+    const int fd = AcceptUntil(first_listener, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), first_error);
+    (void)::close(fd);
+  });
+  std::thread second_backend([&] {
+    const int fd = AcceptUntil(second_listener, TestDeadline(), second_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), second_error);
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (second_error.empty() &&
+        ::write(fd, response.data(), response.size()) != static_cast<ssize_t>(response.size())) {
+      second_error = "failed to write retry response";
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.connect_timeout = std::chrono::seconds(1);
+    policy.first_byte_timeout = std::chrono::seconds(1);
+    policy.total_timeout = std::chrono::seconds(2);
+    policy.retry_budget = 1;
+    policy.retry_endpoints = {first, second};
+    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, nullptr, &timers,
+                                          std::move(policy));
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET /retry HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const auto received = ReadExactUntil(client_sockets[1], response.size(), TestDeadline(), peer_result.error);
+    if (!received) return;
+    peer_result.received = *received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  LoopWatchdog watchdog(wake_sockets[1]);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  first_backend.join();
+  second_backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_TRUE(second_error.empty()) << second_error;
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+  EXPECT_TRUE(peer_result.wire_ok);
+  EXPECT_TRUE(transaction);
+  EXPECT_EQ(timers.PendingCount(), 0U);
+  client.Close();
   wake_channel.Remove();
   EXPECT_EQ(::close(client_sockets[1]), 0);
   EXPECT_EQ(::close(wake_sockets[0]), 0);

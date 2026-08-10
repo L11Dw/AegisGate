@@ -209,6 +209,7 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
     result_ = ParseResult::kError;
     return result_;
   }
+  headers_complete_ = true;
   if (bytes.size() - cursor < content_length) return result_;
 
   parsed.body = bytes.substr(cursor, content_length);
@@ -220,8 +221,11 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
 
 const HttpResponse &HttpResponseParser::Response() const noexcept { return response_; }
 
+bool HttpResponseParser::HeadersComplete() const noexcept { return headers_complete_; }
+
 void HttpResponseParser::Reset() {
   result_ = ParseResult::kNeedMoreData;
+  headers_complete_ = false;
   response_ = HttpResponse{};
 }
 

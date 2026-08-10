@@ -60,6 +60,12 @@ std::uint32_t RequirePositiveUnsigned(const YAML::Node &node, std::string_view f
   return static_cast<std::uint32_t>(parsed);
 }
 
+std::uint32_t RequireRetryBudget(const YAML::Node &node) {
+  const std::string value = RequireString(node, "retry_budget");
+  if (value != "0" && value != "1") Invalid("retry_budget must be 0 or 1");
+  return static_cast<std::uint32_t>(value[0] - '0');
+}
+
 std::unordered_map<std::string, YAML::Node>
 ReadObject(const YAML::Node &node, const std::unordered_set<std::string> &allowed,
            std::string_view context) {
@@ -205,7 +211,8 @@ Endpoint ParseEndpoint(const YAML::Node &node) {
 Route ParseRoute(const YAML::Node &node) {
   const auto fields = ReadObject(node,
                                  {"name", "host", "path_prefix", "endpoints", "rate_limit", "burst",
-                                  "max_inflight"},
+                                  "max_inflight", "connect_timeout_ms", "first_byte_timeout_ms",
+                                  "total_timeout_ms", "retry_budget"},
                                  "route");
   Route route{RequireString(RequireField(fields, "name", "route"), "route name"),
               RequireString(RequireField(fields, "host", "route"), "route host"),
@@ -216,6 +223,18 @@ Route ParseRoute(const YAML::Node &node) {
                                          std::numeric_limits<std::uint32_t>::max()),
               RequirePositiveUnsigned(RequireField(fields, "max_inflight", "route"), "max_inflight",
                                          std::numeric_limits<std::uint32_t>::max())};
+  const auto optional_positive = [&fields](std::string_view field, std::uint32_t fallback) {
+    const auto found = fields.find(std::string(field));
+    return found == fields.end() ? fallback
+                                : RequirePositiveUnsigned(found->second, field,
+                                                          std::numeric_limits<std::uint32_t>::max());
+  };
+  route.connect_timeout_ms = optional_positive("connect_timeout_ms", route.connect_timeout_ms);
+  route.first_byte_timeout_ms = optional_positive("first_byte_timeout_ms", route.first_byte_timeout_ms);
+  route.total_timeout_ms = optional_positive("total_timeout_ms", route.total_timeout_ms);
+  if (const auto retry = fields.find("retry_budget"); retry != fields.end()) {
+    route.retry_budget = RequireRetryBudget(retry->second);
+  }
   if (!IsValidRouteHost(route.host)) Invalid("invalid route host");
   if (!IsValidPathPrefix(route.path_prefix)) Invalid("invalid route path_prefix");
   const YAML::Node &endpoints = RequireField(fields, "endpoints", "route");

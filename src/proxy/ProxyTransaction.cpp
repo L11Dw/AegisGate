@@ -88,10 +88,11 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
 ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                                    config::Endpoint endpoint, http::HttpRequest request,
                                    std::shared_ptr<UpstreamPool> pool,
-                                   std::shared_ptr<resilience::RouteAdmission> admission)
+                                   std::shared_ptr<resilience::RouteAdmission> admission,
+                                   net::TimerQueue *timers, UpstreamPolicy policy)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
-      pool_(std::move(pool)) {}
+      pool_(std::move(pool)), timers_(timers), policy_(std::move(policy)) {}
 
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
@@ -107,10 +108,12 @@ std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         config::Endpoint endpoint, http::HttpRequest request,
                         std::shared_ptr<UpstreamPool> pool,
-                        std::shared_ptr<resilience::RouteAdmission> admission) {
+                        std::shared_ptr<resilience::RouteAdmission> admission,
+                        net::TimerQueue *timers, UpstreamPolicy policy) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
-      loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission)));
+      loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
+      timers, std::move(policy)));
   transaction->Begin();
   return transaction;
 }
@@ -123,10 +126,16 @@ void ProxyTransaction::Begin() {
       return;
     }
   }
+  ArmTotalDeadline();
   StartUpstream();
 }
 
 void ProxyTransaction::StartUpstream() {
+  CancelAttemptDeadlines();
+  ++generation_;
+  connected_ = false;
+  response_header_received_ = false;
+  ArmConnectDeadline();
   const auto self = shared_from_this();
   try {
     // Each HTTP hop owns its framing and connection-scoped fields.
@@ -134,10 +143,10 @@ void ProxyTransaction::StartUpstream() {
     StripHopByHopHeaders(upstream_request);
     if (pool_) {
       starting_upstream_ = true;
-      pool_->Execute(*endpoint_, upstream_request,
+      active_connection_ = pool_->Execute(*endpoint_, upstream_request,
                      [self](net::UpstreamResult result, http::HttpResponse response) {
                        self->HandleUpstream(result, std::move(response));
-                     });
+                     }, [self](net::UpstreamProgress progress) { self->HandleProgress(progress); });
       starting_upstream_ = false;
       return;
     }
@@ -145,6 +154,9 @@ void ProxyTransaction::StartUpstream() {
         loop_, upstream_port_, [self](net::UpstreamResult result, http::HttpResponse response) {
           self->HandleUpstream(result, std::move(response));
         });
+    upstream_->SetProgressCallback([self](net::UpstreamProgress progress) {
+      self->HandleProgress(progress);
+    });
     starting_upstream_ = true;
     upstream_->Start(upstream_request);
     starting_upstream_ = false;
@@ -161,6 +173,7 @@ void ProxyTransaction::StartUpstream() {
 void ProxyTransaction::HandleAdmissionRejected() {
   if (finished_) return;
   finished_ = true;
+  CancelDeadlines();
   const auto client_lifetime = client_lifetime_.lock();
   if (!client_lifetime) return;
   const auto self = shared_from_this();
@@ -173,7 +186,21 @@ void ProxyTransaction::HandleAdmissionRejected() {
 
 void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResponse response) {
   if (finished_) return;
+  active_connection_ = nullptr;
+  if (RetryableFailure(result)) {
+    // Both UpstreamConnection::Finish and UpstreamPool::Complete are still
+    // executing their callback stack. Starting the replacement after this
+    // epoll batch prevents destruction/reuse of that owner from invalidating
+    // the callback's current frame.
+    const auto self = shared_from_this();
+    loop_.QueueAfterCurrentBatch([self] {
+      if (self->finished_) return;
+      if (!self->StartRetry()) self->HandleUpstream(net::UpstreamResult::kReadError, {});
+    });
+    return;
+  }
   finished_ = true;
+  CancelDeadlines();
   reservation_.reset();
   // UpstreamConnection can complete synchronously from Start().  Do not
   // destroy that object while its Start()/Finish() stack frame is active.
@@ -195,6 +222,108 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   } catch (const std::logic_error &) {
   } catch (const std::system_error &) {
   }
+}
+
+void ProxyTransaction::HandleProgress(net::UpstreamProgress progress) {
+  if (finished_) return;
+  if (progress == net::UpstreamProgress::kConnected) {
+    connected_ = true;
+    if (timers_ && connect_timer_ != 0) (void)timers_->Cancel(connect_timer_);
+    connect_timer_ = 0;
+    return;
+  }
+  if (progress == net::UpstreamProgress::kRequestWritten) {
+    ArmFirstByteDeadline();
+    return;
+  }
+  if (progress == net::UpstreamProgress::kFirstByte) {
+    if (timers_ && first_byte_timer_ != 0) (void)timers_->Cancel(first_byte_timer_);
+    first_byte_timer_ = 0;
+    return;
+  }
+  response_header_received_ = true;
+}
+
+void ProxyTransaction::ArmConnectDeadline() {
+  if (!timers_) return;
+  if (connect_timer_ != 0) (void)timers_->Cancel(connect_timer_);
+  const auto generation = generation_;
+  const std::weak_ptr<ProxyTransaction> weak = shared_from_this();
+  connect_timer_ = timers_->ScheduleAfter(policy_.connect_timeout, [weak, generation] {
+    if (const auto self = weak.lock()) self->HandleDeadline(generation);
+  });
+}
+
+void ProxyTransaction::ArmFirstByteDeadline() {
+  if (!timers_) return;
+  const auto generation = generation_;
+  const std::weak_ptr<ProxyTransaction> weak = shared_from_this();
+  first_byte_timer_ = timers_->ScheduleAfter(policy_.first_byte_timeout, [weak, generation] {
+    if (const auto self = weak.lock()) self->HandleDeadline(generation);
+  });
+}
+
+void ProxyTransaction::ArmTotalDeadline() {
+  if (!timers_) return;
+  const std::weak_ptr<ProxyTransaction> weak = shared_from_this();
+  total_timer_ = timers_->ScheduleAfter(policy_.total_timeout, [weak] {
+    if (const auto self = weak.lock(); self && !self->finished_) self->FinishGatewayTimeout();
+  });
+}
+
+void ProxyTransaction::CancelDeadlines() {
+  if (!timers_) return;
+  CancelAttemptDeadlines();
+  if (total_timer_ != 0) (void)timers_->Cancel(total_timer_);
+  total_timer_ = 0;
+}
+
+void ProxyTransaction::CancelAttemptDeadlines() {
+  if (!timers_) return;
+  for (auto *timer : {&connect_timer_, &first_byte_timer_}) {
+    if (*timer != 0) (void)timers_->Cancel(*timer);
+    *timer = 0;
+  }
+}
+
+void ProxyTransaction::HandleDeadline(std::uint64_t generation) {
+  if (finished_ || generation != generation_) return;
+  FinishGatewayTimeout();
+}
+
+bool ProxyTransaction::RetryableFailure(net::UpstreamResult result) const noexcept {
+  return !response_header_received_ && retries_ == 0 && policy_.retry_budget != 0 &&
+         (request_.method == "GET" || request_.method == "HEAD") &&
+         result != net::UpstreamResult::kSuccess;
+}
+
+bool ProxyTransaction::StartRetry() {
+  if (!endpoint_) return false;
+  const auto next = std::find_if(policy_.retry_endpoints.begin(), policy_.retry_endpoints.end(),
+                                 [this](const config::Endpoint &candidate) {
+    return candidate.address != endpoint_->address || candidate.port != endpoint_->port;
+  });
+  if (next == policy_.retry_endpoints.end()) return false;
+  ++retries_;
+  *endpoint_ = *next;
+  StartUpstream();
+  return true;
+}
+
+void ProxyTransaction::FinishGatewayTimeout() {
+  if (finished_) return;
+  finished_ = true;
+  ++generation_;
+  CancelDeadlines();
+  reservation_.reset();
+  if (pool_ && active_connection_) (void)pool_->Cancel(active_connection_);
+  active_connection_ = nullptr;
+  if (upstream_) upstream_->Close();
+  upstream_.reset();
+  if (!client_lifetime_.lock()) return;
+  const auto self = shared_from_this();
+  try { client_->SendResponse(http::HttpResponse{504, "Gateway Timeout", {}, ""}); }
+  catch (const std::logic_error &) {} catch (const std::system_error &) {}
 }
 
 } // namespace aegisgate::proxy

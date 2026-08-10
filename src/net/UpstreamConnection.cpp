@@ -31,6 +31,8 @@ void UpstreamConnection::Start(const http::HttpRequest &request) {
   input_.RetrieveAll();
   output_.RetrieveAll();
   parser_.Reset();
+  first_byte_reported_ = false;
+  response_header_reported_ = false;
 
   try {
     output_.Append(http::SerializeRequest(request));
@@ -40,11 +42,22 @@ void UpstreamConnection::Start(const http::HttpRequest &request) {
   }
   if (socket_) {
     state_ = State::kWriting;
+    // An idle pooled descriptor completed its TCP handshake on a prior
+    // exchange.  Its new transaction must still clear the connect deadline.
+    if (progress_callback_) progress_callback_(UpstreamProgress::kConnected);
     channel_->EnableWriting();
     HandleWrite();
     return;
   }
   socket_ = std::make_unique<Socket>(Socket::CreateNonblockingTcp());
+  // Bound one nonblocking upstream exchange's kernel queue. Besides bounding
+  // memory, this ensures EPOLLOUT backpressure is exercised rather than
+  // allowing an unbounded local loopback send to mask write-state bugs.
+  int send_buffer = 64 * 1024;
+  if (::setsockopt(socket_->Fd(), SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) < 0) {
+    Finish(UpstreamResult::kConnectError);
+    return;
+  }
   channel_ = std::make_unique<Channel>(loop_, socket_->Fd());
   channel_->SetReadCallback([this] { HandleRead(); });
   channel_->SetWriteCallback([this] { HandleWrite(); });
@@ -61,6 +74,11 @@ void UpstreamConnection::Start(const http::HttpRequest &request) {
 void UpstreamConnection::SetResponseCallback(ResponseCallback callback) {
   if (state_ != State::kIdle) throw std::logic_error("upstream connection is not idle");
   callback_ = std::move(callback);
+}
+
+void UpstreamConnection::SetProgressCallback(ProgressCallback callback) {
+  if (state_ != State::kIdle) throw std::logic_error("upstream connection is not idle");
+  progress_callback_ = std::move(callback);
 }
 
 bool UpstreamConnection::Reusable() const noexcept { return state_ == State::kIdle && reusable_; }
@@ -95,7 +113,16 @@ void UpstreamConnection::HandleRead() {
     const ssize_t count = ::recv(socket_->Fd(), bytes.data(), bytes.size(), 0);
     if (count > 0) {
       input_.Append(std::string_view(bytes.data(), static_cast<std::size_t>(count)));
-      switch (parser_.Parse(input_)) {
+      if (!first_byte_reported_) {
+        first_byte_reported_ = true;
+        if (progress_callback_) progress_callback_(UpstreamProgress::kFirstByte);
+      }
+      const auto parse_result = parser_.Parse(input_);
+      if (parser_.HeadersComplete() && !response_header_reported_) {
+        response_header_reported_ = true;
+        if (progress_callback_) progress_callback_(UpstreamProgress::kResponseHeader);
+      }
+      switch (parse_result) {
       case http::ParseResult::kNeedMoreData:
         continue;
       case http::ParseResult::kComplete:
@@ -134,6 +161,7 @@ void UpstreamConnection::HandleWrite() {
       return;
     }
     state_ = State::kWriting;
+    if (progress_callback_) progress_callback_(UpstreamProgress::kConnected);
   }
   if (state_ != State::kWriting) return;
 
@@ -155,6 +183,10 @@ void UpstreamConnection::HandleWrite() {
 
   channel_->DisableWriting();
   state_ = State::kReading;
+  // The first-byte deadline begins only once the complete serialized request
+  // has reached the kernel. A backpressured send must remain a write/connect
+  // concern, not be misreported as an origin first-byte timeout.
+  if (progress_callback_) progress_callback_(UpstreamProgress::kRequestWritten);
   channel_->EnableReading();
 }
 

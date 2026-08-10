@@ -21,6 +21,7 @@ namespace aegisgate::proxy {
 class UpstreamPool {
 public:
   using ResponseCallback = net::UpstreamConnection::ResponseCallback;
+  using ProgressCallback = net::UpstreamConnection::ProgressCallback;
 
   explicit UpstreamPool(net::EventLoop &loop);
   ~UpstreamPool();
@@ -28,8 +29,13 @@ public:
   UpstreamPool(const UpstreamPool &) = delete;
   UpstreamPool &operator=(const UpstreamPool &) = delete;
 
-  void Execute(const config::Endpoint &endpoint, const http::HttpRequest &request,
-               ResponseCallback callback);
+  net::UpstreamConnection *Execute(const config::Endpoint &endpoint,
+                                   const http::HttpRequest &request,
+                                   ResponseCallback callback,
+                                   ProgressCallback progress = {});
+  // Aborts an active exchange. It suppresses its response callback and cannot
+  // return the descriptor to idle storage.
+  [[nodiscard]] bool Cancel(net::UpstreamConnection *connection) noexcept;
   [[nodiscard]] std::size_t IdleCount(const config::Endpoint &endpoint) const noexcept;
 
 private:

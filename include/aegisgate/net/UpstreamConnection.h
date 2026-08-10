@@ -28,12 +28,15 @@ enum class UpstreamResult {
   kUnsupported,
 };
 
+enum class UpstreamProgress { kConnected, kRequestWritten, kFirstByte, kResponseHeader };
+
 // Owns a serial upstream exchange on one literal IPv4 connection. A clean
 // HTTP/1.1 keep-alive response leaves it idle for a pool to reuse; no
 // pipelining, DNS, TLS, retries or timers are supported here.
 class UpstreamConnection {
 public:
   using ResponseCallback = std::function<void(UpstreamResult, http::HttpResponse)>;
+  using ProgressCallback = std::function<void(UpstreamProgress)>;
 
   UpstreamConnection(EventLoop &loop, std::uint16_t port, ResponseCallback callback);
   UpstreamConnection(EventLoop &loop, config::Endpoint endpoint, ResponseCallback callback);
@@ -46,6 +49,7 @@ public:
 
   void Start(const http::HttpRequest &request);
   void SetResponseCallback(ResponseCallback callback);
+  void SetProgressCallback(ProgressCallback callback);
   void Close() noexcept;
   [[nodiscard]] bool Reusable() const noexcept;
   // Re-probes an idle descriptor immediately before a pool lends it. Any EOF,
@@ -72,8 +76,11 @@ private:
   Buffer output_;
   http::HttpResponseParser parser_;
   ResponseCallback callback_;
+  ProgressCallback progress_callback_;
   State state_ = State::kIdle;
   bool reusable_ = false;
+  bool first_byte_reported_ = false;
+  bool response_header_reported_ = false;
 };
 
 } // namespace aegisgate::net

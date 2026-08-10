@@ -141,6 +141,47 @@ TEST(ConfigTest, RejectsInvalidEndpointPortWeightAndLimits) {
   }
 }
 
+TEST(ConfigTest, LoadsAndValidatesTimeoutAndRetryFields) {
+  std::string yaml(kValidConfig);
+  const auto insertion = yaml.rfind("    max_inflight: 500");
+  ASSERT_NE(insertion, std::string::npos);
+  const auto line_end = yaml.find('\n', insertion);
+  yaml.insert(line_end + 1,
+              "    connect_timeout_ms: 11\n    first_byte_timeout_ms: 12\n"
+              "    total_timeout_ms: 13\n    retry_budget: 1\n");
+  const Config config = LoadFromYaml(yaml);
+  EXPECT_EQ(config.routes[0].connect_timeout_ms, 11U);
+  EXPECT_EQ(config.routes[0].first_byte_timeout_ms, 12U);
+  EXPECT_EQ(config.routes[0].total_timeout_ms, 13U);
+  EXPECT_EQ(config.routes[0].retry_budget, 1U);
+
+  for (const std::string_view field : {"connect_timeout_ms", "first_byte_timeout_ms",
+                                       "total_timeout_ms"}) {
+    std::string invalid = yaml;
+    const auto position = invalid.find(std::string(field) + ":");
+    ASSERT_NE(position, std::string::npos);
+    const auto end = invalid.find('\n', position);
+    invalid.replace(position, end - position, std::string(field) + ": 0");
+    EXPECT_THROW(static_cast<void>(LoadFromYaml(invalid)), std::invalid_argument) << field;
+  }
+  std::string retries_disabled = yaml;
+  const auto retry_position = retries_disabled.find("retry_budget:");
+  ASSERT_NE(retry_position, std::string::npos);
+  const auto retry_end = retries_disabled.find('\n', retry_position);
+  retries_disabled.replace(retry_position, retry_end - retry_position, "retry_budget: 0");
+  EXPECT_EQ(LoadFromYaml(retries_disabled).routes[0].retry_budget, 0U);
+  for (const std::string_view value : {"2", "01", "-1"}) {
+    std::string invalid = yaml;
+    const auto position = invalid.find("retry_budget:");
+    ASSERT_NE(position, std::string::npos);
+    const auto end = invalid.find('\n', position);
+    invalid.replace(position, end - position, "retry_budget: " + std::string(value));
+    EXPECT_THROW(static_cast<void>(LoadFromYaml(invalid)), std::invalid_argument) << value;
+  }
+  yaml.append("    unknown_timeout: 1\n");
+  EXPECT_THROW(static_cast<void>(LoadFromYaml(yaml)), std::invalid_argument);
+}
+
 TEST(ConfigTest, RejectsMissingRequiredFieldsAndEmptyEndpoints) {
   for (const std::string_view removed : {"name", "host", "path_prefix", "endpoints",
                                          "rate_limit", "burst", "max_inflight"}) {

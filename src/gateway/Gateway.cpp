@@ -1,5 +1,6 @@
 #include "aegisgate/gateway/Gateway.h"
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -9,6 +10,7 @@
 #include "aegisgate/net/Acceptor.h"
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
+#include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/proxy/ProxyTransaction.h"
 #include "aegisgate/proxy/UpstreamPool.h"
 
@@ -18,6 +20,7 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
                  std::uint16_t listen_port)
     : loop_(loop), state_(std::make_shared<State>()), routes_(std::move(config)),
       upstream_pool_(std::make_shared<proxy::UpstreamPool>(loop)),
+      timers_(std::make_unique<net::TimerQueue>(loop)),
       acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)) {
   state_->owner = this;
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
@@ -74,8 +77,14 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
     client.SendResponse(http::HttpResponse{502, "Bad Gateway", {}, ""});
     return;
   }
+  proxy::UpstreamPolicy policy;
+  policy.connect_timeout = std::chrono::milliseconds(route->connect_timeout_ms);
+  policy.first_byte_timeout = std::chrono::milliseconds(route->first_byte_timeout_ms);
+  policy.total_timeout = std::chrono::milliseconds(route->total_timeout_ms);
+  policy.retry_budget = route->retry_budget;
+  policy.retry_endpoints = route->endpoints;
   (void)proxy::ProxyTransaction::Start(loop_, client, *endpoint, request, upstream_pool_,
-                                       routes_.AdmissionFor(*route));
+                                       routes_.AdmissionFor(*route), timers_.get(), std::move(policy));
 }
 
 void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,

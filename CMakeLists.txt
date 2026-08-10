@@ -14,6 +14,7 @@ add_library(aegisgate STATIC
     src/net/Channel.cpp
     src/net/ClientConnection.cpp
     src/net/EventLoop.cpp
+    src/net/TimerQueue.cpp
     src/net/Socket.cpp
     src/net/UpstreamConnection.cpp
     src/proxy/ProxyTransaction.cpp

@@ -4,6 +4,7 @@ add_executable(aegisgate_tests
     net/BufferTest.cpp
     net/AcceptorTest.cpp
     net/EventLoopTest.cpp
+    net/TimerQueueTest.cpp
     net/SocketTest.cpp
     net/ClientConnectionTest.cpp
     net/UpstreamConnectionTest.cpp

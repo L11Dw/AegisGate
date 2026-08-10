@@ -10,8 +10,10 @@ namespace aegisgate::proxy {
 UpstreamPool::UpstreamPool(net::EventLoop &loop) : loop_(loop) {}
 UpstreamPool::~UpstreamPool() = default;
 
-void UpstreamPool::Execute(const config::Endpoint &endpoint, const http::HttpRequest &request,
-                           ResponseCallback callback) {
+net::UpstreamConnection *UpstreamPool::Execute(const config::Endpoint &endpoint,
+                                               const http::HttpRequest &request,
+                                               ResponseCallback callback,
+                                               ProgressCallback progress) {
   const Key key = ToKey(endpoint);
   Connection connection;
   auto &idle = idle_[key];
@@ -31,6 +33,7 @@ void UpstreamPool::Execute(const config::Endpoint &endpoint, const http::HttpReq
                                net::UpstreamResult result, http::HttpResponse response) mutable {
     Complete(raw, key, std::move(callback), result, std::move(response));
   });
+  raw->SetProgressCallback(std::move(progress));
   try {
     raw->Start(request);
   } catch (...) {
@@ -43,6 +46,15 @@ void UpstreamPool::Execute(const config::Endpoint &endpoint, const http::HttpReq
     }
     throw;
   }
+  return active_.contains(raw) ? raw : nullptr;
+}
+
+bool UpstreamPool::Cancel(net::UpstreamConnection *connection) noexcept {
+  const auto active = active_.find(connection);
+  if (active == active_.end()) return false;
+  active->second->Close();
+  active_.erase(active);
+  return true;
 }
 
 std::size_t UpstreamPool::IdleCount(const config::Endpoint &endpoint) const noexcept {

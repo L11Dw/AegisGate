@@ -14,6 +14,7 @@ namespace aegisgate::net {
 class Acceptor;
 class ClientConnection;
 class EventLoop;
+class TimerQueue;
 } // namespace aegisgate::net
 
 namespace aegisgate::proxy {
@@ -54,6 +55,7 @@ private:
   std::shared_ptr<State> state_;
   routing::RouteTable routes_;
   std::shared_ptr<proxy::UpstreamPool> upstream_pool_;
+  std::unique_ptr<net::TimerQueue> timers_;
   std::unique_ptr<net::Acceptor> acceptor_;
   std::unordered_map<std::uint64_t, std::unique_ptr<net::ClientConnection>> clients_;
   std::uint64_t next_client_identifier_ = 1;
