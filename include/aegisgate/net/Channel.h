@@ -8,7 +8,8 @@ namespace aegisgate::net {
 class EventLoop;
 
 // A non-owning registration of one file descriptor with an EventLoop.
-// The EventLoop must outlive every Channel registered with it.
+// Every registered Channel must be destroyed before its EventLoop. A removed
+// Channel may outlive its EventLoop.
 class Channel {
 public:
   using ReadCallback = std::function<void()>;

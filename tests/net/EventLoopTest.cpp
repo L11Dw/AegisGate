@@ -89,6 +89,26 @@ TEST(EventLoopTest, DoesNotDispatchChannelAfterItIsDestroyed) {
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
+TEST(EventLoopTest, DestroysRemovedChannelAfterEventLoop) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  std::unique_ptr<Channel> channel;
+  {
+    auto loop = std::make_unique<EventLoop>();
+    channel = std::make_unique<Channel>(*loop, sockets[0]);
+    channel->EnableReading();
+    channel->Remove();
+
+    loop.reset();
+  }
+
+  channel.reset();
+  EXPECT_EQ(::close(sockets[0]), 0);
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
 TEST(EventLoopTest, SkipsDestroyedChannelFromTheSameEpollBatch) {
   std::array<int, 2> first_sockets{};
   std::array<int, 2> second_sockets{};

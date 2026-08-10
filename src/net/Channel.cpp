@@ -9,6 +9,10 @@ namespace aegisgate::net {
 Channel::Channel(EventLoop &loop, int fd) noexcept : loop_(loop), fd_(fd) {}
 
 Channel::~Channel() noexcept {
+  if (!added_) {
+    return;
+  }
+
   try {
     DisableAll();
   } catch (...) {
