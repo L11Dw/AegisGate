@@ -4,7 +4,10 @@ project(AegisGate LANGUAGES CXX)
 
 option(AEGISGATE_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
+find_package(yaml-cpp CONFIG REQUIRED)
+
 add_library(aegisgate STATIC
+    src/config/Config.cpp
     src/net/Buffer.cpp
     src/net/Acceptor.cpp
     src/net/Channel.cpp
@@ -13,11 +16,14 @@ add_library(aegisgate STATIC
     src/net/Socket.cpp
     src/net/UpstreamConnection.cpp
     src/proxy/ProxyTransaction.cpp
+    src/routing/RouteTable.cpp
     src/http/HttpResponse.cpp
     src/http/HttpResponseParser.cpp
     src/http/HttpRequestParser.cpp
     src/http/HttpRequestSerializer.cpp
 )
+
+target_link_libraries(aegisgate PUBLIC yaml-cpp)
 
 target_include_directories(aegisgate PUBLIC include)
 target_compile_features(aegisgate PUBLIC cxx_std_20)
