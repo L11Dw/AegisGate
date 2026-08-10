@@ -1,0 +1,10 @@
+function(aegisgate_enable_warnings target)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+
+        if(AEGISGATE_ENABLE_SANITIZERS)
+            target_compile_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(${target} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+        endif()
+    endif()
+endfunction()
