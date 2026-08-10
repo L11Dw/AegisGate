@@ -2,6 +2,10 @@ find_package(GTest CONFIG REQUIRED)
 
 add_executable(aegisgate_tests
     net/BufferTest.cpp
+    net/AcceptorTest.cpp
+    net/EventLoopTest.cpp
+    net/SocketTest.cpp
+    net/ClientConnectionTest.cpp
     http/HttpRequestParserTest.cpp
 )
 

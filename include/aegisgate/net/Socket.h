@@ -1,0 +1,34 @@
+#pragma once
+
+#include <cstdint>
+
+namespace aegisgate::net {
+
+class Socket {
+public:
+  Socket() noexcept = default;
+  explicit Socket(int fd) noexcept;
+  ~Socket();
+
+  Socket(const Socket &) = delete;
+  Socket &operator=(const Socket &) = delete;
+  Socket(Socket &&other) noexcept;
+  Socket &operator=(Socket &&other) noexcept;
+
+  [[nodiscard]] static Socket ListenLoopback();
+  [[nodiscard]] static Socket ConnectLoopback(std::uint16_t port);
+
+  // Returns -1 when a nonblocking listener has no pending connection.
+  [[nodiscard]] int Accept() const;
+  [[nodiscard]] std::uint16_t BoundPort() const;
+  [[nodiscard]] bool IsNonblocking() const;
+  [[nodiscard]] static bool IsNonblocking(int fd);
+  [[nodiscard]] bool Valid() const noexcept;
+  [[nodiscard]] int Fd() const noexcept;
+  void Close() noexcept;
+
+private:
+  int fd_ = -1;
+};
+
+} // namespace aegisgate::net
