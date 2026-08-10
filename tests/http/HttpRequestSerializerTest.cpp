@@ -39,7 +39,8 @@ TEST(HttpRequestSerializerTest, SerializesPostWithBody) {
 
 TEST(HttpRequestSerializerTest, RejectsCallerControlledFramingAndConnection) {
   for (const std::string header : {"Content-Length", "transfer-encoding", "CONNECTION"}) {
-    const HttpRequest request{"GET", "/", "HTTP/1.1", "", {{header, "value"}}};
+    const HttpRequest request{"GET", "/", "HTTP/1.1", "",
+                              {{"Host", "upstream.test"}, {header, "value"}}};
     EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
                  std::invalid_argument)
         << header;
@@ -49,9 +50,11 @@ TEST(HttpRequestSerializerTest, RejectsCallerControlledFramingAndConnection) {
 TEST(HttpRequestSerializerTest, RejectsInvalidHeaderNameOrValue) {
   const std::vector<std::pair<std::string, std::string>> headers = {
       {"", "value"}, {"bad name", "value"}, {"X-Test", "bad\r\nvalue"},
-      {"X-Test", std::string("bad\x01value")}};
+      {"X-Test", std::string("bad\x01value")},
+      {"X-Test", std::string("bad\x7fvalue")}};
   for (const auto &header : headers) {
-    const HttpRequest request{"GET", "/", "HTTP/1.1", "", {header}};
+    const HttpRequest request{"GET", "/", "HTTP/1.1", "",
+                              {{"Host", "upstream.test"}, header}};
     EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
                  std::invalid_argument);
   }
@@ -70,7 +73,7 @@ TEST(HttpRequestSerializerTest, RejectsLineBreakInjectionInRequestLine) {
        {std::tuple{"GE\r\nT", "/", "HTTP/1.1"},
         std::tuple{"GET", "/\r\nInjected: yes", "HTTP/1.1"},
         std::tuple{"GET", "/", "HTTP/1.1\r\nInjected: yes"}}) {
-    const HttpRequest request{method, target, version, "", {}};
+    const HttpRequest request{method, target, version, "", {{"Host", "upstream.test"}}};
     EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
                  std::invalid_argument);
   }
@@ -78,13 +81,16 @@ TEST(HttpRequestSerializerTest, RejectsLineBreakInjectionInRequestLine) {
 
 TEST(HttpRequestSerializerTest, RequiresTokenMethodAndOriginFormTarget) {
   EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(
-                   HttpRequest{"GET POST", "/", "HTTP/1.1", "", {}})),
+                   HttpRequest{"GET POST", "/", "HTTP/1.1", "",
+                               {{"Host", "upstream.test"}}})),
                std::invalid_argument);
   EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(
-                   HttpRequest{"GET", "", "HTTP/1.1", "", {}})),
+                   HttpRequest{"GET", "", "HTTP/1.1", "",
+                               {{"Host", "upstream.test"}}})),
                std::invalid_argument);
   EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(
-                   HttpRequest{"GET", "https://upstream.test/", "HTTP/1.1", "", {}})),
+                   HttpRequest{"GET", "https://upstream.test/", "HTTP/1.1", "",
+                               {{"Host", "upstream.test"}}})),
                std::invalid_argument);
 }
 
@@ -103,7 +109,8 @@ TEST(HttpRequestSerializerTest, RejectsInvalidOriginFormCharacters) {
   for (const std::string target : {"/a#fragment", "/a<bad>", "/[bad]",
                                    "/a%", "/a%2", "/a%ZZ", "/a b", "/a\x01",
                                    "/?query={bad}"}) {
-    const HttpRequest request{"GET", target, "HTTP/1.1", "", {}};
+    const HttpRequest request{"GET", target, "HTTP/1.1", "",
+                              {{"Host", "upstream.test"}}};
     EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
                  std::invalid_argument)
         << target;
@@ -112,7 +119,8 @@ TEST(HttpRequestSerializerTest, RejectsInvalidOriginFormCharacters) {
 
 TEST(HttpRequestSerializerTest, RejectsBodiesLargerThanOneMiB) {
   const HttpRequest request{"POST", "/upload", "HTTP/1.1",
-                            std::string(1024 * 1024 + 1, 'x'), {}};
+                            std::string(1024 * 1024 + 1, 'x'),
+                            {{"Host", "upstream.test"}}};
 
   EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
                std::invalid_argument);
