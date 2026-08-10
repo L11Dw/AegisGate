@@ -48,7 +48,26 @@ void ClientConnection::ResumeReading() {
   if (!socket_.Valid() || !reading_paused_) {
     return;
   }
+
+  parser_.Reset();
   reading_paused_ = false;
+  if (input_.ReadableBytes() != 0) {
+    switch (parser_.Parse(input_)) {
+    case http::ParseResult::kNeedMoreData:
+      break;
+    case http::ParseResult::kComplete:
+      channel_.DisableAll();
+      reading_paused_ = true;
+      if (request_callback_) {
+        request_callback_(*this, parser_.Request());
+      }
+      return;
+    case http::ParseResult::kError:
+    case http::ParseResult::kUnsupported:
+      Close();
+      return;
+    }
+  }
   channel_.EnableReading();
 }
 
@@ -75,7 +94,21 @@ void ClientConnection::HandleRead() {
     const ssize_t count = ::recv(socket_.Fd(), bytes.data(), bytes.size(), 0);
     if (count > 0) {
       input_.Append(std::string_view(bytes.data(), static_cast<std::size_t>(count)));
-      continue;
+      switch (parser_.Parse(input_)) {
+      case http::ParseResult::kNeedMoreData:
+        continue;
+      case http::ParseResult::kComplete:
+        channel_.DisableAll();
+        reading_paused_ = true;
+        if (request_callback_) {
+          request_callback_(*this, parser_.Request());
+        }
+        return;
+      case http::ParseResult::kError:
+      case http::ParseResult::kUnsupported:
+        Close();
+        return;
+      }
     }
     if (count == 0) {
       Close();
@@ -85,24 +118,8 @@ void ClientConnection::HandleRead() {
       continue;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      break;
+      return;
     }
-    Close();
-    return;
-  }
-
-  switch (parser_.Parse(input_)) {
-  case http::ParseResult::kNeedMoreData:
-    return;
-  case http::ParseResult::kComplete:
-    channel_.DisableAll();
-    reading_paused_ = true;
-    if (request_callback_) {
-      request_callback_(*this, parser_.Request());
-    }
-    return;
-  case http::ParseResult::kError:
-  case http::ParseResult::kUnsupported:
     Close();
     return;
   }

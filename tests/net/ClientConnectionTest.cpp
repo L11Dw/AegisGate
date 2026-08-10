@@ -16,6 +16,57 @@
 namespace aegisgate::net {
 namespace {
 
+TEST(ClientConnectionTest, ResumesAndDeliversBufferedPipelinedRequest) {
+  std::array<int, 2> sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                         wake_sockets.data()),
+            0);
+
+  constexpr std::string_view first_request = "GET /first HTTP/1.1\r\n\r\n";
+  constexpr std::string_view second_request = "GET /second HTTP/1.1\r\n\r\n";
+  const std::string requests = std::string(first_request) + std::string(second_request);
+
+  EventLoop loop;
+  int callback_count = 0;
+  ClientConnection connection(
+      loop, sockets[0], [&](ClientConnection &client, const http::HttpRequest &request) {
+        ++callback_count;
+        EXPECT_TRUE(client.reading_paused());
+        EXPECT_EQ(request.target,
+                  callback_count == 1 ? "/first" : "/second");
+        loop.Quit();
+      });
+  connection.Start();
+
+  ASSERT_EQ(::write(sockets[1], requests.data(), requests.size()),
+            static_cast<ssize_t>(requests.size()));
+  loop.Loop();
+
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_TRUE(connection.reading_paused());
+  Channel wake_channel(loop, wake_sockets[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    EXPECT_EQ(::read(wake_sockets[0], &byte, 1), 1);
+    connection.ResumeReading();
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  ASSERT_EQ(::write(wake_sockets[1], "q", 1), 1);
+  loop.Loop();
+
+  EXPECT_EQ(callback_count, 2);
+  EXPECT_TRUE(connection.reading_paused());
+  connection.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
 TEST(ClientConnectionTest, DeliversSegmentedPostAndPausesBeforeCallback) {
   std::array<int, 2> sockets{};
   std::array<int, 2> wake_sockets{};
