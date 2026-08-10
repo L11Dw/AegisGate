@@ -28,6 +28,14 @@ TEST(BufferTest, FindsCrlfOnlyAfterBothBytesAreReadable) {
   EXPECT_EQ(buffer.FindCrlf(), 10U);
 }
 
+TEST(BufferTest, FindsCrlfRelativeToUnreadBytesAfterRetrieve) {
+  Buffer buffer;
+  buffer.Append("ignore: one\r\nHost: demo\r\n");
+  buffer.Retrieve(13U);
+
+  EXPECT_EQ(buffer.FindCrlf(), 10U);
+}
+
 TEST(BufferTest, RetrievingPastReadableBytesThrowsWithoutChangingBuffer) {
   Buffer buffer;
   buffer.Append("abc");
