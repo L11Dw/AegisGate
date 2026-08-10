@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -21,6 +22,10 @@ namespace aegisgate::proxy {
 class UpstreamPool;
 } // namespace aegisgate::proxy
 
+namespace aegisgate::observability {
+class Metrics;
+} // namespace aegisgate::observability
+
 namespace aegisgate::gateway {
 
 // Single-threaded application assembly: one listener, immutable route table,
@@ -37,6 +42,7 @@ public:
   void Start();
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
+  [[nodiscard]] std::string MetricsText() const;
 
 private:
   struct State {
@@ -54,6 +60,7 @@ private:
   net::EventLoop &loop_;
   std::shared_ptr<State> state_;
   routing::RouteTable routes_;
+  std::shared_ptr<observability::Metrics> metrics_;
   std::shared_ptr<proxy::UpstreamPool> upstream_pool_;
   std::unique_ptr<net::TimerQueue> timers_;
   std::unique_ptr<net::Acceptor> acceptor_;

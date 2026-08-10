@@ -11,6 +11,7 @@
 #include "aegisgate/config/Config.h"
 #include "aegisgate/net/UpstreamConnection.h"
 #include "aegisgate/net/TimerQueue.h"
+#include "aegisgate/observability/Metrics.h"
 #include "aegisgate/resilience/InflightLimiter.h"
 
 namespace aegisgate::net {
@@ -44,8 +45,9 @@ public:
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
         http::HttpRequest request, std::shared_ptr<UpstreamPool> pool,
-        std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
-        net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {});
+                        std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
+        net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
+        std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {});
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -55,7 +57,8 @@ private:
                    config::Endpoint endpoint, http::HttpRequest request,
                    std::shared_ptr<UpstreamPool> pool,
                    std::shared_ptr<resilience::RouteAdmission> admission,
-                   net::TimerQueue *timers, UpstreamPolicy policy);
+                   net::TimerQueue *timers, UpstreamPolicy policy,
+                   std::shared_ptr<observability::Metrics> metrics, std::string route_name);
 
   void Begin();
   void StartUpstream();
@@ -71,6 +74,8 @@ private:
   void FinishGatewayTimeout();
   void HandleAdmissionRejected();
   void HandleUpstream(net::UpstreamResult result, http::HttpResponse response);
+  void CompleteMetric(int status, bool rate_limited = false) noexcept;
+  [[nodiscard]] std::string UpstreamLabel() const;
 
   net::EventLoop &loop_;
   net::ClientConnection *client_;
@@ -80,6 +85,9 @@ private:
   http::HttpRequest request_;
   std::shared_ptr<resilience::RouteAdmission> admission_;
   std::optional<resilience::InflightLimiter::Reservation> reservation_;
+  std::shared_ptr<observability::Metrics> metrics_;
+  std::string route_name_;
+  observability::Metrics::RequestHandle metric_request_;
   std::unique_ptr<net::UpstreamConnection> upstream_;
   std::shared_ptr<UpstreamPool> pool_;
   net::TimerQueue *timers_ = nullptr;

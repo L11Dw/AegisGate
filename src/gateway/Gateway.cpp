@@ -11,6 +11,7 @@
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/TimerQueue.h"
+#include "aegisgate/observability/Metrics.h"
 #include "aegisgate/proxy/ProxyTransaction.h"
 #include "aegisgate/proxy/UpstreamPool.h"
 
@@ -19,6 +20,7 @@ namespace aegisgate::gateway {
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port)
     : loop_(loop), state_(std::make_shared<State>()), routes_(std::move(config)),
+      metrics_(std::make_shared<observability::Metrics>()),
       upstream_pool_(std::make_shared<proxy::UpstreamPool>(loop)),
       timers_(std::make_unique<net::TimerQueue>(loop)),
       acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)) {
@@ -36,6 +38,8 @@ void Gateway::Start() { acceptor_->Listen(); }
 std::uint16_t Gateway::port() const { return acceptor_->port(); }
 
 std::size_t Gateway::ClientCount() const noexcept { return clients_.size(); }
+
+std::string Gateway::MetricsText() const { return metrics_->RenderPrometheus(); }
 
 void Gateway::Accept(int fd) {
   // Acceptor closes fd if its callback throws.  Once a ClientConnection owns
@@ -60,20 +64,29 @@ void Gateway::Accept(int fd) {
     const auto result = clients_.emplace(identifier, std::move(client));
     if (!result.second) throw std::logic_error("duplicate accepted client identifier");
     inserted = true;
+    metrics_->SetActiveConnections(clients_.size());
     result.first->second->Start();
   } catch (...) {
     if (inserted) clients_.erase(identifier);
+    metrics_->SetActiveConnections(clients_.size());
   }
 }
 
 void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpRequest &request) {
+  if (request.method == "GET" && request.target == "/metrics") {
+    client.SendResponse(http::HttpResponse{200, "OK", {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
+                                           metrics_->RenderPrometheus()});
+    return;
+  }
   const config::Route *route = routes_.Match(request.Header("host"), request.target);
   if (route == nullptr) {
+    try { metrics_->RecordImmediate("_unmatched", 404); } catch (...) {}
     client.SendResponse(http::HttpResponse{404, "Not Found", {}, ""});
     return;
   }
   const config::Endpoint *endpoint = routes_.NextEndpoint(*route);
   if (endpoint == nullptr) {
+    try { metrics_->RecordImmediate(route->name, 502); } catch (...) {}
     client.SendResponse(http::HttpResponse{502, "Bad Gateway", {}, ""});
     return;
   }
@@ -84,7 +97,8 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
   policy.retry_budget = route->retry_budget;
   policy.retry_endpoints = route->endpoints;
   (void)proxy::ProxyTransaction::Start(loop_, client, *endpoint, request, upstream_pool_,
-                                       routes_.AdmissionFor(*route), timers_.get(), std::move(policy));
+                                       routes_.AdmissionFor(*route), timers_.get(), std::move(policy),
+                                       metrics_, route->name);
 }
 
 void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,
@@ -105,6 +119,7 @@ void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak
 
 void Gateway::ReapClosedClients(std::vector<std::uint64_t> identifiers) {
   for (const std::uint64_t identifier : identifiers) clients_.erase(identifier);
+  metrics_->SetActiveConnections(clients_.size());
 }
 
 } // namespace aegisgate::gateway

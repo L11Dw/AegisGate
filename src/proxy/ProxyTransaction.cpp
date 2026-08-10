@@ -89,10 +89,13 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
                                    config::Endpoint endpoint, http::HttpRequest request,
                                    std::shared_ptr<UpstreamPool> pool,
                                    std::shared_ptr<resilience::RouteAdmission> admission,
-                                   net::TimerQueue *timers, UpstreamPolicy policy)
+                                   net::TimerQueue *timers, UpstreamPolicy policy,
+                                   std::shared_ptr<observability::Metrics> metrics,
+                                   std::string route_name)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
-      pool_(std::move(pool)), timers_(timers), policy_(std::move(policy)) {}
+      metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
+      timers_(timers), policy_(std::move(policy)) {}
 
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
@@ -109,16 +112,25 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         config::Endpoint endpoint, http::HttpRequest request,
                         std::shared_ptr<UpstreamPool> pool,
                         std::shared_ptr<resilience::RouteAdmission> admission,
-                        net::TimerQueue *timers, UpstreamPolicy policy) {
+                        net::TimerQueue *timers, UpstreamPolicy policy,
+                        std::shared_ptr<observability::Metrics> metrics, std::string route_name) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
       loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
-      timers, std::move(policy)));
+      timers, std::move(policy), std::move(metrics), std::move(route_name)));
   transaction->Begin();
   return transaction;
 }
 
 void ProxyTransaction::Begin() {
+  if (metrics_) {
+    try {
+      metric_request_ = metrics_->BeginRequest(route_name_);
+    } catch (...) {
+      // Observability must not turn a serviceable request into a failed one.
+      metrics_.reset();
+    }
+  }
   if (admission_) {
     reservation_ = admission_->TryAcquire(resilience::TokenBucket::Clock::now());
     if (!reservation_) {
@@ -174,6 +186,7 @@ void ProxyTransaction::HandleAdmissionRejected() {
   if (finished_) return;
   finished_ = true;
   CancelDeadlines();
+  CompleteMetric(429, true);
   const auto client_lifetime = client_lifetime_.lock();
   if (!client_lifetime) return;
   const auto self = shared_from_this();
@@ -206,6 +219,7 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   // destroy that object while its Start()/Finish() stack frame is active.
   if (!starting_upstream_) upstream_.reset();
 
+  CompleteMetric(result == net::UpstreamResult::kSuccess ? response.status : 502);
   const auto client_lifetime = client_lifetime_.lock();
   if (!client_lifetime) {
     return;
@@ -316,6 +330,7 @@ void ProxyTransaction::FinishGatewayTimeout() {
   ++generation_;
   CancelDeadlines();
   reservation_.reset();
+  CompleteMetric(504);
   if (pool_ && active_connection_) (void)pool_->Cancel(active_connection_);
   active_connection_ = nullptr;
   if (upstream_) upstream_->Close();
@@ -324,6 +339,19 @@ void ProxyTransaction::FinishGatewayTimeout() {
   const auto self = shared_from_this();
   try { client_->SendResponse(http::HttpResponse{504, "Gateway Timeout", {}, ""}); }
   catch (const std::logic_error &) {} catch (const std::system_error &) {}
+}
+
+void ProxyTransaction::CompleteMetric(int status, bool rate_limited) noexcept {
+  try {
+    metric_request_.Complete(status, UpstreamLabel(), rate_limited);
+  } catch (...) {
+    // Metrics are best-effort; forwarding and lifetime cleanup remain primary.
+  }
+}
+
+std::string ProxyTransaction::UpstreamLabel() const {
+  if (!endpoint_) return {};
+  return endpoint_->host + ":" + std::to_string(endpoint_->port);
 }
 
 } // namespace aegisgate::proxy

@@ -16,6 +16,7 @@ add_executable(aegisgate_tests
     routing/WeightedRoundRobinTest.cpp
     resilience/TokenBucketTest.cpp
     resilience/InflightLimiterTest.cpp
+    observability/MetricsTest.cpp
     http/HttpResponseTest.cpp
     http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp

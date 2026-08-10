@@ -89,6 +89,27 @@ std::string ReadExact(int fd, std::size_t size, Deadline deadline, std::string &
   return result;
 }
 
+std::string ReadUntilContains(int fd, std::string_view needle, Deadline deadline,
+                              std::string &error) {
+  std::string result;
+  std::array<char, 4096> bytes{};
+  while (result.find(needle) == std::string::npos) {
+    if (!WaitFor(fd, POLLIN | POLLHUP, deadline)) {
+      error = "read timed out";
+      return {};
+    }
+    const ssize_t count = ::read(fd, bytes.data(), bytes.size());
+    if (count > 0) {
+      result.append(bytes.data(), static_cast<std::size_t>(count));
+      continue;
+    }
+    if (count < 0 && errno == EINTR) continue;
+    error = "unexpected EOF or read error";
+    return {};
+  }
+  return result;
+}
+
 net::Socket ListenWithBacklog(int backlog) {
   const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) throw std::system_error(errno, std::generic_category(), "socket");
@@ -178,6 +199,9 @@ TEST(GatewayTest, RoutesTwoSequentialKeepAliveRequestsOverRealTcp) {
   EXPECT_EQ(upstream_requests[1], "GET /v1/two HTTP/1.1\r\nhost: gateway.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n");
   EXPECT_EQ(client_responses[0], "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\none");
   EXPECT_EQ(client_responses[1], "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo");
+  EXPECT_NE(gateway.MetricsText().find("aegisgate_requests_total{route=\"api\",status=\"200\",upstream=\"127.0.0.1:" +
+                                       std::to_string(endpoint.port) + "\"} 2\n"),
+            std::string::npos);
 
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
@@ -709,6 +733,60 @@ TEST(GatewayTest, DoesNotStartFirstByteDeadlineUntilLargeRequestIsFullyWritten) 
   wake_channel.Remove();
   EXPECT_EQ(::close(gate[0]), 0);
   EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+TEST(GatewayTest, RecordsActualUnmatchedOutcomeAndServesPrometheusEndpoint) {
+  net::Socket upstream_listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, upstream_listener.BoundPort(), 1};
+  const config::Config config{{{"known", "gateway.test", "/", {endpoint}, 10, 10, 4}}};
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  std::string client_error;
+  std::string metrics_response;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
+    constexpr std::string_view missing =
+        "GET /missing HTTP/1.1\r\nHost: unknown.test\r\n\r\n";
+    constexpr std::string_view missing_response =
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    if (!WriteAll(socket.Fd(), missing, TestDeadline(), client_error) ||
+        ReadExact(socket.Fd(), missing_response.size(), TestDeadline(), client_error) !=
+            missing_response) {
+      (void)::write(wake_fds[1], "q", 1);
+      return;
+    }
+    constexpr std::string_view metrics = "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n";
+    if (!WriteAll(socket.Fd(), metrics, TestDeadline(), client_error)) {
+      (void)::write(wake_fds[1], "q", 1);
+      return;
+    }
+    metrics_response = ReadUntilContains(socket.Fd(), "aegisgate_inflight_requests 0\n",
+                                         TestDeadline(), client_error);
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_NE(metrics_response.find("HTTP/1.1 200 OK\r\n"), std::string::npos);
+  EXPECT_NE(metrics_response.find("aegisgate_requests_total{route=\"_unmatched\",status=\"404\",upstream=\"\"} 1\n"),
+            std::string::npos);
+  EXPECT_NE(metrics_response.find("aegisgate_active_connections 1\n"), std::string::npos);
+  wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
   EXPECT_EQ(::close(wake_fds[1]), 0);
 }
