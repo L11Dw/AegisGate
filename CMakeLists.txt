@@ -8,6 +8,7 @@ add_library(aegisgate STATIC
     src/net/Buffer.cpp
     src/net/Acceptor.cpp
     src/net/Channel.cpp
+    src/net/ClientConnection.cpp
     src/net/EventLoop.cpp
     src/net/Socket.cpp
     src/http/HttpRequestParser.cpp
