@@ -1,6 +1,5 @@
 #include "aegisgate/http/HttpRequestSerializer.h"
 
-#include <cctype>
 #include <stdexcept>
 #include <string_view>
 
@@ -8,10 +7,14 @@ namespace aegisgate::http {
 namespace {
 
 constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
+constexpr std::size_t kMaxRequestLineBytes = 8 * 1024;
+constexpr std::size_t kMaxHeaderBytes = 32 * 1024;
 
 bool IsToken(std::string_view value) {
   for (const unsigned char character : value) {
-    if (std::isalnum(character) != 0) {
+    if ((character >= 'A' && character <= 'Z') ||
+        (character >= 'a' && character <= 'z') ||
+        (character >= '0' && character <= '9')) {
       continue;
     }
     switch (character) {
@@ -101,6 +104,9 @@ bool IsValidTarget(std::string_view target) {
 
 bool IsValidFieldValue(std::string_view value) {
   for (const unsigned char character : value) {
+    if (character == '\t') {
+      continue;
+    }
     if (character < 0x20 || character == 0x7f) {
       return false;
     }
@@ -121,28 +127,51 @@ std::string LowerAscii(std::string_view value) {
 
 } // namespace
 
-std::string HttpRequestSerializer::Serialize(const HttpRequest &request) {
+std::string SerializeRequest(const HttpRequest &request) {
   if (!IsToken(request.method) || !IsValidTarget(request.target) ||
       request.version != "HTTP/1.1" || request.body.size() > kMaxBodyBytes) {
     throw std::invalid_argument("invalid HTTP request");
   }
 
-  std::string result = request.method + " " + request.target + " " +
-                       request.version + "\r\n";
+  const std::string request_line = request.method + " " + request.target + " " +
+                                   request.version + "\r\n";
+  if (request_line.size() - 2 > kMaxRequestLineBytes) {
+    throw std::invalid_argument("HTTP request line exceeds limit");
+  }
+
+  std::string header_lines;
+  std::size_t host_count = 0;
   for (const auto &[name, value] : request.headers) {
     if (!IsToken(name) || !IsValidFieldValue(value)) {
       throw std::invalid_argument("invalid HTTP request header");
     }
     const std::string lower_name = LowerAscii(name);
+    if (lower_name == "host") {
+      ++host_count;
+    }
     if (lower_name == "content-length" || lower_name == "transfer-encoding" ||
         lower_name == "connection") {
       throw std::invalid_argument("HTTP request framing is managed by Serialize");
     }
-    result.append(name).append(": ").append(value).append("\r\n");
+    header_lines.append(name).append(": ").append(value).append("\r\n");
   }
-  result.append("Content-Length: ").append(std::to_string(request.body.size()))
-      .append("\r\nConnection: keep-alive\r\n\r\n")
-      .append(request.body);
+  if (host_count != 1) {
+    throw std::invalid_argument("HTTP/1.1 request requires exactly one Host header");
+  }
+
+  const std::string content_length = "Content-Length: " +
+                                     std::to_string(request.body.size()) + "\r\n";
+  constexpr std::string_view kConnection = "Connection: keep-alive\r\n";
+  constexpr std::string_view kHeaderTerminator = "\r\n";
+  if (header_lines.size() + content_length.size() + kConnection.size() +
+          kHeaderTerminator.size() >
+      kMaxHeaderBytes) {
+    throw std::invalid_argument("HTTP request headers exceed limit");
+  }
+
+  std::string result = request_line;
+  result.append(header_lines).append(content_length).append(kConnection).append(
+      kHeaderTerminator).append(request.body);
   return result;
 }
 

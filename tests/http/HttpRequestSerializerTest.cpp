@@ -4,16 +4,20 @@
 
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace aegisgate::http {
 namespace {
 
+constexpr std::size_t kMaxRequestLineBytes = 8 * 1024;
+constexpr std::size_t kMaxHeaderBytes = 32 * 1024;
+
 TEST(HttpRequestSerializerTest, SerializesGetWithManagedFraming) {
   const HttpRequest request{"GET", "/health", "HTTP/1.1", "",
                             {{"Host", "upstream.test"}}};
 
-  EXPECT_EQ(HttpRequestSerializer::Serialize(request),
+  EXPECT_EQ(SerializeRequest(request),
             "GET /health HTTP/1.1\r\n"
             "Host: upstream.test\r\n"
             "Content-Length: 0\r\n"
@@ -22,14 +26,15 @@ TEST(HttpRequestSerializerTest, SerializesGetWithManagedFraming) {
 
 TEST(HttpRequestSerializerTest, SerializesPostWithBody) {
   const HttpRequest request{"POST", "/submit", "HTTP/1.1", "hello",
-                            {{"Content-Type", "text/plain"}}};
+                            {{"Host", "upstream.test"}, {"Content-Type", "text/plain"}}};
 
-  EXPECT_EQ(HttpRequestSerializer::Serialize(request),
-            "POST /submit HTTP/1.1\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 5\r\n"
-            "Connection: keep-alive\r\n\r\n"
-            "hello");
+  const std::string serialized = HttpRequestSerializer::Serialize(request);
+  EXPECT_TRUE(serialized.starts_with("POST /submit HTTP/1.1\r\n"));
+  EXPECT_NE(serialized.find("Host: upstream.test\r\n"), std::string::npos);
+  EXPECT_NE(serialized.find("Content-Type: text/plain\r\n"), std::string::npos);
+  EXPECT_TRUE(serialized.ends_with("Content-Length: 5\r\n"
+                                   "Connection: keep-alive\r\n\r\n"
+                                   "hello"));
 }
 
 TEST(HttpRequestSerializerTest, RejectsCallerControlledFramingAndConnection) {
@@ -44,12 +49,20 @@ TEST(HttpRequestSerializerTest, RejectsCallerControlledFramingAndConnection) {
 TEST(HttpRequestSerializerTest, RejectsInvalidHeaderNameOrValue) {
   const std::vector<std::pair<std::string, std::string>> headers = {
       {"", "value"}, {"bad name", "value"}, {"X-Test", "bad\r\nvalue"},
-      {"X-Test", "tab\tvalue"}, {"X-Test", std::string("bad\x01value")}};
+      {"X-Test", std::string("bad\x01value")}};
   for (const auto &header : headers) {
     const HttpRequest request{"GET", "/", "HTTP/1.1", "", {header}};
     EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
                  std::invalid_argument);
   }
+}
+
+TEST(HttpRequestSerializerTest, PreservesAllowedHorizontalTabInHeaderValue) {
+  const HttpRequest request{"GET", "/", "HTTP/1.1", "",
+                            {{"Host", "upstream.test"}, {"X-Note", "keep\tthis"}}};
+
+  EXPECT_NE(HttpRequestSerializer::Serialize(request).find("X-Note: keep\tthis\r\n"),
+            std::string::npos);
 }
 
 TEST(HttpRequestSerializerTest, RejectsLineBreakInjectionInRequestLine) {
@@ -77,12 +90,13 @@ TEST(HttpRequestSerializerTest, RequiresTokenMethodAndOriginFormTarget) {
 
 TEST(HttpRequestSerializerTest, AcceptsOriginFormPathAndQuery) {
   const HttpRequest request{"GET", "/a-._~!$&'()*+,;=:@/%2F?x=/a?b&y=%20",
-                            "HTTP/1.1", "", {}};
+                            "HTTP/1.1", "", {{"Host", "upstream.test"}}};
 
-  EXPECT_EQ(HttpRequestSerializer::Serialize(request),
-            "GET /a-._~!$&'()*+,;=:@/%2F?x=/a?b&y=%20 HTTP/1.1\r\n"
-            "Content-Length: 0\r\n"
-            "Connection: keep-alive\r\n\r\n");
+  const std::string serialized = HttpRequestSerializer::Serialize(request);
+  EXPECT_TRUE(serialized.starts_with(
+      "GET /a-._~!$&'()*+,;=:@/%2F?x=/a?b&y=%20 HTTP/1.1\r\n"));
+  EXPECT_TRUE(serialized.ends_with("Content-Length: 0\r\n"
+                                   "Connection: keep-alive\r\n\r\n"));
 }
 
 TEST(HttpRequestSerializerTest, RejectsInvalidOriginFormCharacters) {
@@ -106,13 +120,62 @@ TEST(HttpRequestSerializerTest, RejectsBodiesLargerThanOneMiB) {
 
 TEST(HttpRequestSerializerTest, SerializesBodyAtOneMiB) {
   const HttpRequest request{"POST", "/upload", "HTTP/1.1",
-                            std::string(1024 * 1024, 'x'), {}};
+                            std::string(1024 * 1024, 'x'), {{"Host", "upstream.test"}}};
 
   const std::string serialized = HttpRequestSerializer::Serialize(request);
-  EXPECT_TRUE(serialized.starts_with(
-      "POST /upload HTTP/1.1\r\nContent-Length: 1048576\r\n"
-      "Connection: keep-alive\r\n\r\n"));
+  EXPECT_TRUE(serialized.starts_with("POST /upload HTTP/1.1\r\n"));
+  EXPECT_NE(serialized.find("Content-Length: 1048576\r\n"), std::string::npos);
   EXPECT_TRUE(serialized.ends_with(request.body));
+}
+
+TEST(HttpRequestSerializerTest, RequiresExactlyOneHostHeader) {
+  EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(
+                   HttpRequest{"GET", "/", "HTTP/1.1", "", {}})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(
+                   HttpRequest{"GET", "/", "HTTP/1.1", "",
+                               {{"Host", "one.test"}, {"host", "two.test"}}})),
+               std::invalid_argument);
+}
+
+TEST(HttpRequestSerializerTest, RejectsNonAsciiMethodAndHeaderName) {
+  const std::string non_ascii(1, static_cast<char>(0xff));
+  EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(
+                   HttpRequest{"GET" + non_ascii, "/", "HTTP/1.1", "",
+                               {{"Host", "upstream.test"}}})),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(
+                   HttpRequest{"GET", "/", "HTTP/1.1", "",
+                               {{"Host", "upstream.test"}, {"X-" + non_ascii, "x"}}})),
+               std::invalid_argument);
+}
+
+TEST(HttpRequestSerializerTest, AcceptsRequestLineAndHeadersAtLimits) {
+  const HttpRequest request_line_limit{
+      "GET", "/" + std::string(kMaxRequestLineBytes - 14, 'a'), "HTTP/1.1", "",
+      {{"Host", "upstream.test"}}};
+  const HttpRequest header_limit{
+      "GET", "/", "HTTP/1.1", "",
+      {{"Host", std::string(kMaxHeaderBytes - 53, 'a')}}};
+
+  EXPECT_NO_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request_line_limit)));
+  EXPECT_NO_THROW(static_cast<void>(HttpRequestSerializer::Serialize(header_limit)));
+}
+
+TEST(HttpRequestSerializerTest, RejectsRequestLineOverEightKiB) {
+  const HttpRequest request{"GET", "/" + std::string(kMaxRequestLineBytes - 13, 'a'),
+                            "HTTP/1.1", "", {{"Host", "upstream.test"}}};
+
+  EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
+               std::invalid_argument);
+}
+
+TEST(HttpRequestSerializerTest, RejectsHeadersOverThirtyTwoKiB) {
+  const HttpRequest request{"GET", "/", "HTTP/1.1", "",
+                            {{"Host", std::string(kMaxHeaderBytes - 52, 'a')}}};
+
+  EXPECT_THROW(static_cast<void>(HttpRequestSerializer::Serialize(request)),
+               std::invalid_argument);
 }
 
 } // namespace
