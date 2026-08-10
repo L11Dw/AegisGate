@@ -116,6 +116,14 @@ TEST(HttpResponseParserTest, RejectsHeaderFieldLineOverEightKiB) {
   EXPECT_EQ(parser.Parse(input), ParseResult::kError);
 }
 
+TEST(HttpResponseParserTest, RejectsIncompleteHeaderFieldLineOverEightKiB) {
+  Buffer input;
+  input.Append("HTTP/1.1 200 OK\r\n" + std::string(8193, 'a'));
+  HttpResponseParser parser;
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kError);
+}
+
 TEST(HttpResponseParserTest, ResetAllowsReuseAfterTerminalResult) {
   Buffer input;
   input.Append("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n");

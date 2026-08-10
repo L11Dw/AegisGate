@@ -146,6 +146,12 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
     }
     const std::size_t line_end = bytes.find("\r\n", cursor);
     if (line_end == std::string_view::npos) {
+      // An unfinished line must still respect the per-line limit; waiting for
+      // its CRLF would otherwise retain up to the much larger header block.
+      if (bytes.size() - cursor > kMaxStatusLineBytes) {
+        result_ = ParseResult::kError;
+        return result_;
+      }
       if (bytes.size() > kMaxHeaderBytes + status_line_end + 2) result_ = ParseResult::kError;
       return result_;
     }
