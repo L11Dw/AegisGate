@@ -10,6 +10,8 @@ void Buffer::Append(std::string_view bytes) {
   }
 
   if (read_index_ > ReadableBytes()) {
+    // Avoid copying on every Retrieve(); compact only when discarded bytes
+    // outweigh the live suffix and a new append is about to grow storage_.
     storage_.erase(0, read_index_);
     read_index_ = 0;
   }

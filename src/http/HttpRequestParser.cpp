@@ -6,6 +6,8 @@
 namespace aegisgate::http {
 namespace {
 
+// Fixed MVP limits bound memory retained while a peer sends an incomplete
+// request.  Route-specific limits belong to the later proxy/config layer.
 constexpr std::size_t kMaxRequestLineBytes = 8 * 1024;
 constexpr std::size_t kMaxHeaderBytes = 32 * 1024;
 constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
@@ -138,6 +140,8 @@ ParseResult HttpRequestParser::Parse(net::Buffer &input) {
   const std::string_view protocol_bytes =
       headers_end == std::string_view::npos ? bytes
                                             : bytes.substr(0, headers_end + 4);
+  // A bare LF can otherwise make a malformed header look complete after a
+  // later append, enabling request-smuggling-style parser disagreement.
   if (HasBareLineFeed(protocol_bytes)) {
     result_ = ParseResult::kError;
     return result_;
@@ -232,6 +236,8 @@ ParseResult HttpRequestParser::Parse(net::Buffer &input) {
   }
 
   if (bytes.size() - cursor < content_length) {
+    // Do not consume the request line or headers until its declared body is
+    // complete: the next recv may append the remaining bytes to this Buffer.
     return result_;
   }
   parsed.body = bytes.substr(cursor, content_length);
