@@ -72,12 +72,21 @@ public:
     listener_.Close();
   }
 
-  // Signals the worker to release any held connection and exit, then joins.
+  // Signals the worker to release any held connection and exit, then joins
+  // and releases the stop descriptors.  Idempotent: a second call (e.g. from
+  // the destructor) is a no-op.  The signal write goes through a local string
+  // and is merged into the shared error under the mutex, never written
+  // concurrently with the worker's Fail().
   void Stop() {
-    if (stop_fds_[1] >= 0) {
-      (void)test::SignalWakeFd(stop_fds_[1], 's', *error_);
-    }
+    if (stop_fds_[1] < 0) return;
+    std::string local_error;
+    (void)test::SignalWakeFd(stop_fds_[1], 's', local_error);
+    if (!local_error.empty()) Fail(std::move(local_error));
     if (thread_.joinable()) thread_.join();
+    (void)::close(stop_fds_[0]);
+    (void)::close(stop_fds_[1]);
+    stop_fds_[0] = -1;
+    stop_fds_[1] = -1;
   }
 
   [[nodiscard]] std::uint16_t port() const { return listener_.BoundPort(); }
@@ -88,9 +97,28 @@ private:
     error_->append(std::move(message)).append("; ");
   }
 
+  // Waits up to the deadline for the stop byte and validates it: only an
+  // actual 's' counts as a stop request; poll timeouts are treated as a
+  // bounded no-stop, and any other outcome is reported through Fail().
   bool StopRequested() {
-    pollfd descriptor{stop_fds_[0], POLLIN, 0};
-    return ::poll(&descriptor, 1, 3000) > 0;
+    for (;;) {
+      pollfd descriptor{stop_fds_[0], POLLIN, 0};
+      const int ready = ::poll(&descriptor, 1, 3000);
+      if (ready > 0) break;
+      if (ready < 0 && errno == EINTR) continue;
+      return false;
+    }
+    char byte = '\0';
+    const ssize_t count = ::read(stop_fds_[0], &byte, 1);
+    if (count == 1 && byte == 's') return true;
+    if (count == 0) {
+      Fail("stop fd closed unexpectedly");
+    } else if (count < 0) {
+      Fail("stop fd read failed");
+    } else {
+      Fail("unexpected stop byte");
+    }
+    return true;
   }
 
   void Serve() {
@@ -105,12 +133,10 @@ private:
         Fail("read failed");
       }
       if (response.empty()) {
-        // A slow backend: hold the connection without writing until the main
-        // thread signals the check has timed out.
-        if (StopRequested()) {
-          char byte = '\0';
-          (void)::read(stop_fds_[0], &byte, 1);
-        }
+        // A slow backend: hold the connection without writing until the
+        // worker observes the stop byte (consumed and validated inside
+        // StopRequested).
+        (void)StopRequested();
       } else if (::write(fd, response.data(), response.size()) !=
                  static_cast<ssize_t>(response.size())) {
         Fail("write failed");
@@ -324,6 +350,39 @@ TEST(HealthCheckerTest, DestroyedCheckerIgnoresStaleResults) {
   EXPECT_TRUE(backend_error.empty()) << backend_error;
   EXPECT_EQ(::close(wake[0]), 0);
   EXPECT_EQ(::close(wake[1]), 0);
+}
+
+
+TEST(HealthCheckerTest, RepeatedStopIsSafe) {
+  std::string backend_error;
+  SequencedBackend backend({"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"},
+                           backend_error);
+  std::array<int, 2> wake{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  net::TimerQueue timers(loop);
+
+  std::string wake_error;
+  HealthChecker checker(loop, timers, Endpoint(backend.port()),
+                        {std::chrono::milliseconds(500), std::chrono::milliseconds(150)},
+                        [&](bool) { (void)test::SignalWakeFd(wake[1], 'q', wake_error); });
+  checker.Start();
+  loop.Loop();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake[0]), 0);
+  EXPECT_EQ(::close(wake[1]), 0);
+
+  backend.Stop();  // First stop: signal, join, release descriptors.
+  backend.Stop();  // Idempotent: must be a no-op.
+  EXPECT_TRUE(wake_error.empty()) << wake_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
 }
 
 } // namespace
