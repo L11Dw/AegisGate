@@ -99,6 +99,14 @@ void UpstreamConnection::Start(const http::HttpRequest &request) {
     Finish(UpstreamResult::kConnectError);
     return;
   }
+  // Bound the receive queue symmetrically: when downstream backpressure
+  // pauses our reads, the peer's send must stall instead of absorbing an
+  // unbounded response into this kernel queue.
+  int receive_buffer = 64 * 1024;
+  if (::setsockopt(socket_->Fd(), SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer)) < 0) {
+    Finish(UpstreamResult::kConnectError);
+    return;
+  }
   channel_ = std::make_unique<Channel>(loop_, socket_->Fd());
   channel_->SetReadCallback([this] { HandleRead(); });
   channel_->SetWriteCallback([this] { HandleWrite(); });

@@ -370,9 +370,9 @@ bool ProxyTransaction::HandleResponseBody(std::string_view bytes) {
   // Keep the transaction alive: HandleClientAbort below cancels the upstream
   // exchange, releasing every callback-held strong reference.
   const auto self = shared_from_this();
-  bool crossed = false;
+  bool at_high_watermark = false;
   try {
-    crossed = client_->WriteResponseBody(bytes);
+    at_high_watermark = client_->WriteResponseBody(bytes);
   } catch (const std::logic_error &) {
     HandleClientAbort();
     return false;
@@ -380,8 +380,13 @@ bool ProxyTransaction::HandleResponseBody(std::string_view bytes) {
     HandleClientAbort();
     return false;
   }
-  if (crossed) {
+  if (at_high_watermark) {
+    // The downstream queue is at or above the high watermark: decline every
+    // further chunk so the parser keeps it in the input buffer and pauses
+    // reading (bounded memory), and the read resumes only after a low-water
+    // drain notification.
     PauseUpstreamReading();
+    return false;
   }
   return true;
 }

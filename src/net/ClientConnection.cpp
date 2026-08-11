@@ -89,6 +89,12 @@ ClientConnection::ClientConnection(EventLoop &loop, int fd, RequestCallback call
     : socket_(fd), channel_(loop, fd), request_callback_(std::move(callback)),
       flow_control_(flow_control) {
   SetNonblocking(fd);
+  // Bound the kernel send queue (symmetric with the upstream connection) so a
+  // slow peer cannot absorb an unbounded response in the kernel: the queued
+  // bytes then cross the high watermark, pause the upstream read, and apply
+  // real receive-window backpressure instead of unbounded memory use.
+  int send_buffer = 64 * 1024;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
   channel_.SetReadCallback([this] { HandleRead(); });
   channel_.SetWriteCallback([this] { HandleWrite(); });
 }
@@ -167,15 +173,14 @@ bool ClientConnection::WriteResponseBody(std::string_view bytes) {
   if (bytes.empty()) {
     return false;
   }
-  const std::size_t queued = output_.ReadableBytes();
-  const bool crossed = queued < flow_control_.HighWatermark() &&
-                       queued + bytes.size() >= flow_control_.HighWatermark();
   output_.Append(bytes);
   if (!writing_) {
     writing_ = true;
   }
   HandleWrite();
-  return crossed;
+  // True while the queued bytes sit at or above the high watermark: the
+  // caller must keep the upstream reading paused until a low-water drain.
+  return output_.ReadableBytes() >= flow_control_.HighWatermark();
 }
 
 void ClientConnection::FinishResponse() {

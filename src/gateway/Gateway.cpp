@@ -19,13 +19,14 @@
 namespace aegisgate::gateway {
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
-                 std::uint16_t listen_port)
+                 std::uint16_t listen_port, net::StreamFlowControl flow_control)
     : lifetime_token_(std::make_shared<int>(0)), loop_(loop),
       state_(std::make_shared<State>()), routes_(std::move(config)),
       metrics_(std::make_shared<observability::Metrics>()),
       upstream_pool_(std::make_shared<proxy::UpstreamPool>(loop)),
       timers_(std::make_unique<net::TimerQueue>(loop)),
-      acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)) {
+      acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)),
+      flow_control_(flow_control) {
   state_->owner = this;
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
   for (const config::Route &route : routes_.Config().routes) {
@@ -108,10 +109,12 @@ void Gateway::Accept(int fd) {
   }
   try {
     identifier = next_client_identifier_++;
+    // The default 256/128 KiB hysteresis bounds every downstream write queue;
+    // per-route values will arrive with the M4 immutable config snapshot.
     auto client = std::make_unique<net::ClientConnection>(
         loop_, fd, [this](net::ClientConnection &connection, const http::HttpRequest &request) {
           HandleRequest(connection, request);
-        });
+        }, flow_control_);
     client->SetCloseCallback([&loop = loop_, state = std::weak_ptr<State>(state_), identifier] {
       NotifyClientClosed(loop, state, identifier);
     });
