@@ -2002,6 +2002,126 @@ TEST(ProxyTransactionTest, ClientCloseCancelsUpstream) {
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
+TEST(ProxyTransactionTest, ClientDestroyedBeforeCommittedFailureIsSafe) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  constexpr std::string_view request =
+      "GET /late-fail HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    // Commit the response head with a partial body, then wait for the client
+    // to be destroyed before failing the exchange with EOF.
+    constexpr std::string_view partial = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    if (backend_error.empty() &&
+        ::write(fd, partial.data(), partial.size()) != static_cast<ssize_t>(partial.size())) {
+      backend_error = "failed to write partial response";
+    }
+    char go = '\0';
+    if (::read(gate[0], &go, 1) != 1) {
+      if (backend_error.empty()) backend_error = "gate read failed";
+    }
+    (void)::close(fd);
+    (void)::write(gate[1], "d", 1);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  std::weak_ptr<ProxyTransaction> transaction;
+  std::unique_ptr<net::ClientConnection> client = std::make_unique<net::ClientConnection>(
+      loop, client_sockets[0],
+      [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+        transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr,
+                                              &timers);
+      });
+  client->Start();
+  constexpr std::string_view inbound = "GET /late-fail HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  // The committed head arrives while the loop runs; then the client is
+  // destroyed while the upstream exchange is still open.
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+    const auto received = ReadExactUntil(client_sockets[1], committed.size(), TestDeadline(),
+                                         peer_result.error);
+    if (!received) return;
+    peer_result.received = *received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n");
+
+  client.reset();
+  EXPECT_EQ(::write(gate[1], "g", 1), 1);
+  // The late upstream EOF now hits a destroyed client (R-047): the committed
+  // truncation path must not touch the client without a lifetime check.
+  // Drive the loop until the backend observes the connection close ('d');
+  // the watchdog only pumps the loop as a failure backstop.
+  std::array<int, 2> stop{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop.data()), 0);
+  std::string pump_error;
+  std::thread pump([&] {
+    pollfd descriptor{stop[0], POLLIN, 0};
+    while (::poll(&descriptor, 1, 100) == 0) {
+      if (::write(wake_sockets[1], "q", 1) != 1) {
+        pump_error = "pump wake failed";
+        return;
+      }
+    }
+  });
+  pollfd gate_descriptor{gate[0], POLLIN, 0};
+  const auto deadline = TestDeadline();
+  while ((::poll(&gate_descriptor, 1, 0) == 0 || !transaction.expired()) &&
+         std::chrono::steady_clock::now() < deadline) {
+    loop.Loop();
+  }
+  (void)test::SignalWakeFd(stop[1], 's', pump_error);
+  pump.join();
+  EXPECT_TRUE(pump_error.empty()) << pump_error;
+  char closed = '\0';
+  ASSERT_EQ(::read(gate[0], &closed, 1), 1);
+  EXPECT_EQ(closed, 'd');
+  backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_TRUE(transaction.expired());
+  EXPECT_EQ(timers.PendingCount(), 0U);
+  wake_channel.Remove();
+  EXPECT_EQ(::close(stop[0]), 0);
+  EXPECT_EQ(::close(stop[1]), 0);
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+}
+
 TEST(ProxyTransactionTest, ClearsClientStreamCallbacksAtTerminal) {
   net::Socket listener = net::Socket::ListenLoopback();
   const std::uint16_t port = listener.BoundPort();

@@ -508,14 +508,18 @@ void ProxyTransaction::FinishFailure() {
   if (!starting_upstream_) upstream_.reset();
   if (downstream_response_committed_) {
     // The head is already on the wire: truncate the client connection; a
-    // second status line must never replace the committed response.
+    // second status line must never replace the committed response.  The
+    // client may already be destroyed (late upstream failure after client
+    // teardown, R-047): touch it only while its lifetime token is alive.
     CompleteMetric(502);
     AccountFailure();
-    ClearClientStreamCallbacks();
-    try {
-      client_->AbortResponse();
-    } catch (const std::logic_error &) {
-    } catch (const std::system_error &) {
+    if (client_lifetime_.lock()) {
+      ClearClientStreamCallbacks();
+      try {
+        client_->AbortResponse();
+      } catch (const std::logic_error &) {
+      } catch (const std::system_error &) {
+      }
     }
     return;
   }
@@ -661,14 +665,17 @@ void ProxyTransaction::FinishGatewayTimeout() {
   upstream_.reset();
   if (downstream_response_committed_) {
     // The head is already on the wire: a 504 status line cannot replace it,
-    // so the connection is truncated instead.
+    // so the connection is truncated instead.  The client may already be
+    // destroyed (R-047): touch it only while its lifetime token is alive.
     CompleteMetric(504);
     AccountFailure();
-    ClearClientStreamCallbacks();
-    try {
-      client_->AbortResponse();
-    } catch (const std::logic_error &) {
-    } catch (const std::system_error &) {
+    if (client_lifetime_.lock()) {
+      ClearClientStreamCallbacks();
+      try {
+        client_->AbortResponse();
+      } catch (const std::logic_error &) {
+      } catch (const std::system_error &) {
+      }
     }
     return;
   }
