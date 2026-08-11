@@ -197,6 +197,59 @@ bool IsValidPathPrefix(std::string_view prefix) {
   return true;
 }
 
+std::uint32_t ParseThresholdPermille(const YAML::Node &node, std::string_view field) {
+  const std::string value = RequireString(node, field);
+  // Strict "(0,1) fraction": "0" "." followed by 1..3 digits.
+  if (value.size() < 3 || value[0] != '0' || value[1] != '.') {
+    Invalid("invalid " + std::string(field));
+  }
+  const std::string_view fraction(value.data() + 2, value.size() - 2);
+  if (fraction.empty() || fraction.size() > 3 ||
+      !std::all_of(fraction.begin(), fraction.end(), [](char character) {
+        return character >= '0' && character <= '9';
+      })) {
+    Invalid("invalid " + std::string(field));
+  }
+  std::uint32_t permille = 0;
+  for (const char character : fraction) {
+    permille = permille * 10 + static_cast<std::uint32_t>(character - '0');
+  }
+  for (std::size_t padding = fraction.size(); padding < 3; ++padding) {
+    permille *= 10;
+  }
+  if (permille == 0 || permille > 999) Invalid("out-of-range " + std::string(field));
+  return permille;
+}
+
+CircuitBreakerSettings ParseCircuitBreaker(const YAML::Node &node) {
+  const auto fields = ReadObject(node,
+                                 {"window_seconds", "min_requests", "failure_threshold",
+                                  "open_seconds", "half_open_probes"},
+                                 "circuit_breaker");
+  const auto maximum = std::numeric_limits<std::uint32_t>::max();
+  CircuitBreakerSettings settings{
+      RequirePositiveUnsigned(RequireField(fields, "window_seconds", "circuit_breaker"),
+                              "window_seconds", maximum),
+      RequirePositiveUnsigned(RequireField(fields, "min_requests", "circuit_breaker"),
+                              "min_requests", maximum),
+      ParseThresholdPermille(RequireField(fields, "failure_threshold", "circuit_breaker"),
+                             "failure_threshold"),
+      RequirePositiveUnsigned(RequireField(fields, "open_seconds", "circuit_breaker"),
+                              "open_seconds", maximum),
+      RequirePositiveUnsigned(RequireField(fields, "half_open_probes", "circuit_breaker"),
+                              "half_open_probes", maximum)};
+  return settings;
+}
+
+HealthCheckSettings ParseHealthCheck(const YAML::Node &node) {
+  const auto fields = ReadObject(node, {"interval_ms", "timeout_ms"}, "health_check");
+  const auto maximum = std::numeric_limits<std::uint32_t>::max();
+  return {RequirePositiveUnsigned(RequireField(fields, "interval_ms", "health_check"),
+                                  "interval_ms", maximum),
+          RequirePositiveUnsigned(RequireField(fields, "timeout_ms", "health_check"),
+                                  "timeout_ms", maximum)};
+}
+
 Endpoint ParseEndpoint(const YAML::Node &node) {
   const auto fields = ReadObject(node, {"host", "port", "weight"}, "endpoint");
   Endpoint endpoint{RequireString(RequireField(fields, "host", "endpoint"), "endpoint host"), {},
@@ -212,7 +265,8 @@ Route ParseRoute(const YAML::Node &node) {
   const auto fields = ReadObject(node,
                                  {"name", "host", "path_prefix", "endpoints", "rate_limit", "burst",
                                   "max_inflight", "connect_timeout_ms", "first_byte_timeout_ms",
-                                  "total_timeout_ms", "retry_budget"},
+                                  "total_timeout_ms", "retry_budget", "circuit_breaker",
+                                  "health_check"},
                                  "route");
   Route route{RequireString(RequireField(fields, "name", "route"), "route name"),
               RequireString(RequireField(fields, "host", "route"), "route host"),
@@ -234,6 +288,12 @@ Route ParseRoute(const YAML::Node &node) {
   route.total_timeout_ms = optional_positive("total_timeout_ms", route.total_timeout_ms);
   if (const auto retry = fields.find("retry_budget"); retry != fields.end()) {
     route.retry_budget = RequireRetryBudget(retry->second);
+  }
+  if (const auto breaker = fields.find("circuit_breaker"); breaker != fields.end()) {
+    route.circuit_breaker = ParseCircuitBreaker(breaker->second);
+  }
+  if (const auto health = fields.find("health_check"); health != fields.end()) {
+    route.health_check = ParseHealthCheck(health->second);
   }
   if (!IsValidRouteHost(route.host)) Invalid("invalid route host");
   if (!IsValidPathPrefix(route.path_prefix)) Invalid("invalid route path_prefix");
