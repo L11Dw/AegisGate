@@ -35,6 +35,7 @@ add_library(aegisgate STATIC
     src/health/HealthChecker.cpp
     src/health/CoordinatorState.cpp
     src/health/Coordinator.cpp
+    src/health/OutcomeChannel.cpp
     src/resilience/CircuitBreaker.cpp
     src/resilience/TokenBucket.cpp
     src/http/HttpResponse.cpp
