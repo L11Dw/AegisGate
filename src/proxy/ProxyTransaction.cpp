@@ -194,8 +194,12 @@ bool ProxyTransaction::StartUpstream() {
       // active slot at its terminal point before the retry was queued).
       return false;
     }
-    endpoint_ = *selection->endpoint;
+    endpoint_ = selection->endpoint;
     breaker_link_ = selection->link;
+    // Bind the request snapshot on the first successful selection; retries use
+    // the same provider (same snapshot), so this stays the request's own
+    // configuration (R-054).
+    request_snapshot_ = selection->snapshot;
     // Install the new attempt's active slot.  The previous slot is already
     // empty (released at the old attempt's terminal), so this move-assignment
     // releases nothing.

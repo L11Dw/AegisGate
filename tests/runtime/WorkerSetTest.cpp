@@ -42,13 +42,9 @@ TEST(WorkerSetTest, RoundRobinDistributesEvenly) {
   WorkerSet set(3);
   std::array<std::size_t, 3> counts{};
   for (int index = 0; index != 7; ++index) {
-    WorkerRuntime &worker = set.Next();
-    for (std::size_t candidate = 0; candidate != 3; ++candidate) {
-      if (&worker == &set.At(candidate)) {
-        ++counts[candidate];
-        break;
-      }
-    }
+    const WorkerSet::WorkerHandle handle = set.Next();
+    ++counts[handle.index];
+    EXPECT_EQ(&handle.worker, &set.At(handle.index));
   }
   EXPECT_EQ(counts, (std::array<std::size_t, 3>{3, 2, 2}));
 }

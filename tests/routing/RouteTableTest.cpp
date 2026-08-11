@@ -44,42 +44,42 @@ RouteTable MakeTable() { return RouteTable(config::LoadFromYaml(kRoutes)); }
 
 TEST(RouteTableTest, MatchesHostIgnoringAsciiCase) {
   const RouteTable table = MakeTable();
-  const config::Route *route = table.Match("API.DEMO.LOCAL", "/anything");
-  ASSERT_NE(route, nullptr);
-  EXPECT_EQ(route->name, "root");
+  const auto route = table.Match("API.DEMO.LOCAL", "/anything");
+  ASSERT_TRUE(route.has_value());
+  EXPECT_EQ(table.Config().routes[*route].name, "root");
 }
 
 TEST(RouteTableTest, SelectsLongestMatchingPathPrefix) {
   const RouteTable table = MakeTable();
-  const config::Route *route = table.Match("api.demo.local", "/api/v1/orders?full=1");
-  ASSERT_NE(route, nullptr);
-  EXPECT_EQ(route->name, "versioned");
+  const auto route = table.Match("api.demo.local", "/api/v1/orders?full=1");
+  ASSERT_TRUE(route.has_value());
+  EXPECT_EQ(table.Config().routes[*route].name, "versioned");
 }
 
 TEST(RouteTableTest, RequiresPathBoundaryForNonRootPrefixes) {
   const RouteTable table = MakeTable();
-  const config::Route *route = table.Match("api.demo.local", "/apix");
-  ASSERT_NE(route, nullptr);
-  EXPECT_EQ(route->name, "root");
+  const auto route = table.Match("api.demo.local", "/apix");
+  ASSERT_TRUE(route.has_value());
+  EXPECT_EQ(table.Config().routes[*route].name, "root");
 }
 
 TEST(RouteTableTest, RejectsNonOriginTargetAndUnknownHost) {
   const RouteTable table = MakeTable();
-  EXPECT_EQ(table.Match("api.demo.local", "https://api.demo.local/api"), nullptr);
-  EXPECT_EQ(table.Match("other.demo.local", "/api"), nullptr);
+  EXPECT_FALSE(table.Match("api.demo.local", "https://api.demo.local/api").has_value());
+  EXPECT_FALSE(table.Match("other.demo.local", "/api").has_value());
 }
 
 TEST(RouteTableTest, MatchesHostWithExplicitPortExactly) {
   const RouteTable table = MakeTable();
-  const config::Route *route = table.Match("ADMIN.DEMO.LOCAL:8080", "/");
-  ASSERT_NE(route, nullptr);
-  EXPECT_EQ(route->name, "ported");
-  EXPECT_EQ(table.Match("admin.demo.local", "/"), nullptr);
+  const auto route = table.Match("ADMIN.DEMO.LOCAL:8080", "/");
+  ASSERT_TRUE(route.has_value());
+  EXPECT_EQ(table.Config().routes[*route].name, "ported");
+  EXPECT_FALSE(table.Match("admin.demo.local", "/").has_value());
 }
 
 TEST(RouteTableTest, RejectsNonAsciiHostInput) {
   const RouteTable table = MakeTable();
-  EXPECT_EQ(table.Match("api.demo.local\xC3\xA9", "/api"), nullptr);
+  EXPECT_FALSE(table.Match("api.demo.local\xC3\xA9", "/api").has_value());
 }
 
 } // namespace

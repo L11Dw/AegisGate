@@ -56,22 +56,20 @@ public:
   [[nodiscard]] std::string MetricsText();
   // Test access to the immutable config snapshot's matcher.
   [[nodiscard]] routing::RouteTable &Routes() noexcept { return routes_; }
-  // M3-D test views over the live coordinator snapshot.  No worker or
-  // coordinator object is shared; the snapshot is the only contract.
-  [[nodiscard]] bool EndpointHealthy(const config::Route &route,
-                                     const config::Endpoint &endpoint) const noexcept;
+  // M3-D test views over the live coordinator snapshot, addressed by route and
+  // endpoint index into the config snapshot (obtainable via Routes().Match).
+  // No worker or coordinator object is shared; the snapshot is the only
+  // contract.  No bare Route* / Endpoint* is ever matched (R-060).
+  [[nodiscard]] bool EndpointHealthy(std::size_t route_index,
+                                     std::size_t endpoint_index) const noexcept;
   [[nodiscard]] resilience::CircuitBreaker::State
-  BreakerState(const config::Route &route, const config::Endpoint &endpoint) const noexcept;
+  BreakerState(std::size_t route_index, std::size_t endpoint_index) const noexcept;
   // Test seam: submits one attempt outcome to the coordinator and blocks
   // until it was processed and the snapshot republished.
-  void SubmitResultAndWait(const config::Route &route, const config::Endpoint &endpoint,
-                           bool success);
+  void SubmitResultAndWait(std::size_t route_index, std::size_t endpoint_index, bool success);
 
 private:
   void Accept(int fd);
-  [[nodiscard]] std::size_t RouteIndexOf(const config::Route &route) const noexcept;
-  [[nodiscard]] std::size_t EndpointIndexOf(std::size_t route_index,
-                                            const config::Endpoint &endpoint) const noexcept;
   [[nodiscard]] std::string RenderMetrics() const;
 
   net::EventLoop &loop_;

@@ -6,34 +6,36 @@
 namespace aegisgate::runtime {
 
 AttemptSelector::AttemptSelector(SelectionState &selection, std::shared_ptr<WorkerShared> shared,
-                                 std::size_t route_index)
-    : selection_(selection), shared_(std::move(shared)), route_index_(route_index) {}
+                                 std::size_t route_index, ConfigSnapshotRef snapshot)
+    : selection_(selection), shared_(std::move(shared)), route_index_(route_index),
+      snapshot_(std::move(snapshot)) {}
 
 std::optional<proxy::ProxyTransaction::AttemptSelection>
 AttemptSelector::Select(bool least_active) {
-  const auto snapshot = shared_->coordinator->CurrentSnapshot();
-  if (!snapshot) return std::nullopt;
+  const auto health_snapshot = shared_->coordinator->CurrentSnapshot();
+  if (!health_snapshot) return std::nullopt;
   if (least_active) {
     for (;;) {
       const auto index = selection_.NextLeastActiveIndex(
-          route_index_, tried_, [this, &snapshot](std::size_t endpoint_index) {
-            return Eligible(endpoint_index, *snapshot);
+          route_index_, tried_, [this, &health_snapshot](std::size_t endpoint_index) {
+            return Eligible(endpoint_index, *health_snapshot);
           });
       if (!index) return std::nullopt;
       tried_.insert(*index);
-      auto selection = MakeSelection(*index, *snapshot);
+      auto selection = MakeSelection(*index, *health_snapshot);
       if (selection) return selection;
       // A failed probe claim is not a candidate: re-scan (the index stays in
       // tried so the scan cannot loop on it).
     }
   }
-  const std::vector<config::Endpoint> &endpoints =
-      shared_->config_snapshot.load(std::memory_order_acquire)->config.routes[route_index_].endpoints;
+  // The request-bound snapshot: the initial attempt and every retry select
+  // from the same endpoint set (R-054).
+  const std::vector<config::Endpoint> &endpoints = snapshot_->config.routes[route_index_].endpoints;
   for (std::size_t attempts = 0; attempts < endpoints.size(); ++attempts) {
     const auto index = selection_.NextWeightedIndex(route_index_);
     if (!index || !tried_.insert(*index).second) continue;
-    if (!Eligible(*index, *snapshot)) continue;
-    auto selection = MakeSelection(*index, *snapshot);
+    if (!Eligible(*index, *health_snapshot)) continue;
+    auto selection = MakeSelection(*index, *health_snapshot);
     if (selection) return selection;
   }
   return std::nullopt;
@@ -77,10 +79,12 @@ AttemptSelector::MakeSelection(std::size_t endpoint_index,
     link = proxy::ProxyTransaction::BreakerLink{shared_->coordinator, route_index_,
                                                 endpoint_index, permit};
   }
-  const config::Endpoint &endpoint =
-      shared_->config_snapshot.load(std::memory_order_acquire)->config.routes[route_index_].endpoints[endpoint_index];
+  // Value-copied endpoint from the request-bound snapshot: the transaction
+  // never holds a pointer into snapshot internals (R-054).
+  const config::Endpoint endpoint = snapshot_->config.routes[route_index_].endpoints[endpoint_index];
   return proxy::ProxyTransaction::AttemptSelection{
-      &endpoint, std::move(link), selection_.AcquireActive(route_index_, endpoint_index)};
+      endpoint, std::move(link), selection_.AcquireActive(route_index_, endpoint_index),
+      snapshot_};
 }
 
 } // namespace aegisgate::runtime

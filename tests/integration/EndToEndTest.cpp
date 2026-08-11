@@ -3,6 +3,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -86,11 +87,11 @@ std::string ReadUntil(int fd, std::string_view needle, Deadline deadline, std::s
 // The coordinator processes breaker results asynchronously on its own loop:
 // a snapshot-state poll is the deterministic barrier the client side needs
 // before it may rely on the breaker being open (or closed again).
-bool WaitForBreakerState(const gateway::Gateway &gateway, const config::Route &route,
-                         const config::Endpoint &endpoint,
+bool WaitForBreakerState(const gateway::Gateway &gateway, std::size_t route_index,
+                         std::size_t endpoint_index,
                          resilience::CircuitBreaker::State wanted, Deadline deadline) {
   while (std::chrono::steady_clock::now() < deadline) {
-    if (gateway.BreakerState(route, endpoint) == wanted) return true;
+    if (gateway.BreakerState(route_index, endpoint_index) == wanted) return true;
   }
   return false;
 }
@@ -406,8 +407,8 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
     // deterministic barrier before the request and before the metrics read.
     // The route pointer must come from the gateway's own config copy
     // (RouteIndexOf matches by pointer identity).
-    const config::Route *matched = gateway.Routes().Match("guarded.e2e.test", "/");
-    if (!WaitForBreakerState(gateway, *matched, matched->endpoints.front(),
+    const std::optional<std::size_t> matched = gateway.Routes().Match("guarded.e2e.test", "/");
+    if (!WaitForBreakerState(gateway, *matched, 0,
                              resilience::CircuitBreaker::State::kOpen, TestDeadline())) {
       error = "breaker did not open in time";
     }
@@ -448,7 +449,7 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
     // the snapshot-state poll is the barrier before the recovered metrics
     // read renders the closed gauge.
     if (error.empty() &&
-        !WaitForBreakerState(gateway, *matched, matched->endpoints.front(),
+        !WaitForBreakerState(gateway, *matched, 0,
                              resilience::CircuitBreaker::State::kClosed, TestDeadline())) {
       error = "breaker did not close after the probe";
     }
@@ -488,8 +489,8 @@ TEST(EndToEndTest, AllEndpointsUnavailableServesUnique503WithInflightZero) {
   std::string recovered_metrics;
   RunGateway(config::Config{{route}}, [&](gateway::Gateway &gateway, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
-    const config::Route *matched = gateway.Routes().Match("guarded.e2e.test", "/");
-    if (error.empty() && matched == nullptr) error = "route not matched";
+    const std::optional<std::size_t> matched = gateway.Routes().Match("guarded.e2e.test", "/");
+    if (error.empty() && !matched.has_value()) error = "route not matched";
     constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: guarded.e2e.test\r\n\r\n";
     constexpr std::string_view upstream_fail = "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n";
     constexpr std::string_view gateway_fail = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
@@ -506,7 +507,7 @@ TEST(EndToEndTest, AllEndpointsUnavailableServesUnique503WithInflightZero) {
     // own loop asynchronously, so the client waits for the breaker to open
     // before the second request relies on the open state (no timing guess).
     if (error.empty() &&
-        !WaitForBreakerState(gateway, *matched, matched->endpoints.front(),
+        !WaitForBreakerState(gateway, *matched, 0,
                              resilience::CircuitBreaker::State::kOpen, TestDeadline())) {
       error = "breaker did not open after the failing request";
     }

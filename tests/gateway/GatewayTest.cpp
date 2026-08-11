@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -951,15 +952,15 @@ TEST(GatewayTest, SkipsUnhealthyEndpointWith503) {
   loop.Loop();  // First pass: the health check completes and marks unhealthy.
   backend.join();
   EXPECT_TRUE(backend_error.empty()) << backend_error;
-  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
-  ASSERT_NE(matched, nullptr);
+  const std::optional<std::size_t> matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_TRUE(matched.has_value());
   // The health result is committed asynchronously on the coordinator loop:
   // poll the snapshot until the endpoint becomes unhealthy.
   const auto health_deadline = TestDeadline();
-  while (gateway.EndpointHealthy(*matched, matched->endpoints.front()) &&
+  while (gateway.EndpointHealthy(*matched, 0) &&
          std::chrono::steady_clock::now() < health_deadline) {
   }
-  EXPECT_FALSE(gateway.EndpointHealthy(*matched, matched->endpoints.front()));
+  EXPECT_FALSE(gateway.EndpointHealthy(*matched, 0));
 
   std::string client_error;
   std::string client_response;
@@ -1007,14 +1008,14 @@ TEST(GatewayTest, SkipsOpenEndpointWithoutConnecting) {
   Gateway gateway(loop, config, "127.0.0.1", 0);
   gateway.Start();
 
-  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
-  ASSERT_NE(matched, nullptr);
+  const std::optional<std::size_t> matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_TRUE(matched.has_value());
   // Drive the endpoint's breaker open through the coordinator seam; each
   // submission blocks until the coordinator processed it and republished.
   for (int i = 0; i < 5; ++i) {
-    gateway.SubmitResultAndWait(*matched, matched->endpoints.front(), /*success=*/false);
+    gateway.SubmitResultAndWait(*matched, 0, /*success=*/false);
   }
-  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints.front()),
+  EXPECT_EQ(gateway.BreakerState(*matched, 0),
             resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
@@ -1077,12 +1078,12 @@ TEST(GatewayTest, RouteIsolatedBreakerState) {
 
   // Open route a's breaker; route b shares the same endpoint but keeps its
   // own state.
-  const config::Route *matched_a = gateway.Routes().Match("a.test", "/x");
-  ASSERT_NE(matched_a, nullptr);
+  const std::optional<std::size_t> matched_a = gateway.Routes().Match("a.test", "/x");
+  ASSERT_TRUE(matched_a.has_value());
   for (int i = 0; i < 5; ++i) {
-    gateway.SubmitResultAndWait(*matched_a, matched_a->endpoints.front(), /*success=*/false);
+    gateway.SubmitResultAndWait(*matched_a, 0, /*success=*/false);
   }
-  EXPECT_EQ(gateway.BreakerState(*matched_a, matched_a->endpoints.front()),
+  EXPECT_EQ(gateway.BreakerState(*matched_a, 0),
             resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
@@ -1149,12 +1150,12 @@ TEST(GatewayTest, RetrySkipsOpenCandidateWithoutConnecting) {
   gateway.Start();
 
   // Drive the second endpoint's breaker open through the coordinator seam.
-  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
-  ASSERT_NE(matched, nullptr);
+  const std::optional<std::size_t> matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_TRUE(matched.has_value());
   for (int i = 0; i < 5; ++i) {
-    gateway.SubmitResultAndWait(*matched, matched->endpoints[1], /*success=*/false);
+    gateway.SubmitResultAndWait(*matched, 1, /*success=*/false);
   }
-  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints[1]),
+  EXPECT_EQ(gateway.BreakerState(*matched, 1),
             resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
@@ -1221,13 +1222,13 @@ TEST(GatewayTest, RetryFailureAccountsExactlyOnce) {
   Gateway gateway(loop, config, "127.0.0.1", 0);
   gateway.Start();
 
-  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
-  ASSERT_NE(matched, nullptr);
+  const std::optional<std::size_t> matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_TRUE(matched.has_value());
   // Drive the backup endpoint open with its own two failures (min_requests=2).
   for (int i = 0; i < 2; ++i) {
-    gateway.SubmitResultAndWait(*matched, matched->endpoints[1], /*success=*/false);
+    gateway.SubmitResultAndWait(*matched, 1, /*success=*/false);
   }
-  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints[1]),
+  EXPECT_EQ(gateway.BreakerState(*matched, 1),
             resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
@@ -1253,7 +1254,7 @@ TEST(GatewayTest, RetryFailureAccountsExactlyOnce) {
   // The single retryable failure of the first endpoint was accounted exactly
   // once: with min_requests=2 the breaker must still be closed.  A double
   // count would open it.
-  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints[0]),
+  EXPECT_EQ(gateway.BreakerState(*matched, 0),
             resilience::CircuitBreaker::State::kClosed);
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
@@ -1449,13 +1450,13 @@ TEST(GatewayTest, LeastActiveSkipsUnhealthyAndOpen) {
 
   // Pass 1: the health checkers mark the first endpoint unhealthy.
   loop.Loop();
-  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
-  ASSERT_NE(matched, nullptr);
+  const std::optional<std::size_t> matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_TRUE(matched.has_value());
   const auto health_deadline = TestDeadline();
-  while (gateway.EndpointHealthy(*matched, matched->endpoints[0]) &&
+  while (gateway.EndpointHealthy(*matched, 0) &&
          std::chrono::steady_clock::now() < health_deadline) {
   }
-  EXPECT_FALSE(gateway.EndpointHealthy(*matched, matched->endpoints[0]));
+  EXPECT_FALSE(gateway.EndpointHealthy(*matched, 0));
 
   // Phase 1: the request must reach the healthy endpoint.
   std::string client_error;
@@ -1484,7 +1485,7 @@ TEST(GatewayTest, LeastActiveSkipsUnhealthyAndOpen) {
   // Open the healthy endpoint's breaker: no candidate remains, so the gateway
   // answers a unique 503 without connecting anywhere.
   for (int i = 0; i < 5; ++i) {
-    gateway.SubmitResultAndWait(*matched, matched->endpoints[1], /*success=*/false);
+    gateway.SubmitResultAndWait(*matched, 1, /*success=*/false);
   }
 
   std::string unavailable_response;

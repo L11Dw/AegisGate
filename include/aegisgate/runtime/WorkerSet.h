@@ -30,8 +30,14 @@ public:
   void StopAll() noexcept;
   [[nodiscard]] std::size_t size() const noexcept;
   [[nodiscard]] WorkerRuntime &At(std::size_t index);
+  // The round-robin target plus its index, so callers never back-look up the
+  // index by pointer (R-070).
+  struct WorkerHandle {
+    std::size_t index;
+    WorkerRuntime &worker;
+  };
   // Round-robin assignment; thread-safe for concurrent accepters.
-  [[nodiscard]] WorkerRuntime &Next() noexcept;
+  [[nodiscard]] WorkerHandle Next() noexcept;
 
 private:
   std::vector<std::unique_ptr<WorkerRuntime>> workers_;

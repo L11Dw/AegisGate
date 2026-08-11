@@ -33,9 +33,9 @@ WorkerRuntime &WorkerSet::At(std::size_t index) {
   return *workers_[index];
 }
 
-WorkerRuntime &WorkerSet::Next() noexcept {
+WorkerSet::WorkerHandle WorkerSet::Next() noexcept {
   const std::uint64_t index = next_.fetch_add(1, std::memory_order_relaxed) % workers_.size();
-  return *workers_[index];
+  return {static_cast<std::size_t>(index), *workers_[index]};
 }
 
 } // namespace aegisgate::runtime

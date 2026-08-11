@@ -17,7 +17,10 @@ WorkerData::WorkerData(net::EventLoop &loop, std::shared_ptr<WorkerShared> share
       state_(std::make_shared<State>()), pool_(std::make_shared<proxy::UpstreamPool>(loop)),
       timers_(std::make_unique<net::TimerQueue>(loop)), metrics_(std::move(metrics)),
       client_count_(std::move(client_count)),
-      selection_(shared_->config_snapshot.load(std::memory_order_acquire)->config),
+      // Bind the worker-local selection state to the request snapshot version
+      // it was built from (R-072); a reload rebuilds it for the new version.
+      selection_(shared_->config_snapshot.load(std::memory_order_acquire)->config,
+                 shared_->config_snapshot.load(std::memory_order_acquire)->version),
       lease_balances_(shared_->config_snapshot.load(std::memory_order_acquire)->config.routes.size(), 0) {
   state_->owner = this;
 }
@@ -75,9 +78,9 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
     return;
   }
   const ConfigSnapshotRef snapshot = shared_->config_snapshot.load(std::memory_order_acquire);
-  const config::Route *route =
+  const std::optional<std::size_t> route_index =
       routing::RouteTable::Match(snapshot->config, request.Header("host"), request.target);
-  if (route == nullptr) {
+  if (!route_index.has_value()) {
     try {
       metrics_->RecordImmediate("_unmatched", 404);
     } catch (...) {
@@ -89,22 +92,15 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
     }
     return;
   }
-  std::size_t route_index = snapshot->config.routes.size();
-  for (std::size_t index = 0; index < snapshot->config.routes.size(); ++index) {
-    if (&snapshot->config.routes[index] == route) {
-      route_index = index;
-      break;
-    }
-  }
-  if (route_index == snapshot->config.routes.size()) return;
+  const config::Route &route = snapshot->config.routes[*route_index];
 
   // Global admission: the in-flight slot first, then one lease token from the
   // worker-local balance (drawing a new lease when it runs low).  A rejection
   // answers 429 immediately and never starts a transaction.
   std::optional<resilience::GlobalAdmission::Reservation> reservation;
-  if (!TryAdmit(route_index, reservation)) {
+  if (!TryAdmit(*route_index, reservation)) {
     try {
-      metrics_->RecordImmediate(route->name, 429, {}, true);
+      metrics_->RecordImmediate(route.name, 429, {}, true);
     } catch (...) {
     }
     try {
@@ -116,22 +112,22 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
   }
 
   proxy::UpstreamPolicy policy;
-  policy.connect_timeout = std::chrono::milliseconds(route->connect_timeout_ms);
-  policy.first_byte_timeout = std::chrono::milliseconds(route->first_byte_timeout_ms);
-  policy.total_timeout = std::chrono::milliseconds(route->total_timeout_ms);
-  policy.retry_budget = route->retry_budget;
+  policy.connect_timeout = std::chrono::milliseconds(route.connect_timeout_ms);
+  policy.first_byte_timeout = std::chrono::milliseconds(route.first_byte_timeout_ms);
+  policy.total_timeout = std::chrono::milliseconds(route.total_timeout_ms);
+  policy.retry_budget = route.retry_budget;
   // The provider chooses the endpoint for the initial attempt and every
-  // retry through the same eligibility rules (R-036); no candidate ever
-  // connects.  It captures the immutable snapshot, never a raw Route*.
-  const bool least_active = route->balance == config::BalancePolicy::kLeastActive;
-  AttemptSelector selector(selection_, shared_, route_index);
+  // retry through the same eligibility rules (R-036), bound to the request's
+  // own snapshot (R-054); no candidate ever connects.
+  const bool least_active = route.balance == config::BalancePolicy::kLeastActive;
+  AttemptSelector selector(selection_, shared_, *route_index, snapshot);
   proxy::ProxyTransaction::AttemptProvider provider =
       [selector = std::move(selector), least_active]() mutable {
         return selector.Select(least_active);
       };
   (void)proxy::ProxyTransaction::Start(
-      loop_, client, route->endpoints.front(), request, pool_, std::move(reservation),
-      timers_.get(), std::move(policy), metrics_, route->name, std::move(provider),
+      loop_, client, route.endpoints.front(), request, pool_, std::move(reservation),
+      timers_.get(), std::move(policy), metrics_, route.name, std::move(provider),
       std::weak_ptr<void>(shared_->lifetime_token));
 }
 

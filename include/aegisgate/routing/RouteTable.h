@@ -2,6 +2,7 @@
 
 #include "aegisgate/config/Config.h"
 
+#include <optional>
 #include <string_view>
 
 namespace aegisgate::routing {
@@ -23,14 +24,16 @@ public:
   // The immutable configuration this table was built from.
   [[nodiscard]] const config::Config &Config() const noexcept { return config_; }
 
-  // Returns a pointer owned by the given immutable config, or nullptr when no
-  // route matches an origin-form request target and Host field.
-  [[nodiscard]] static const config::Route *
+  // Returns the index of the longest-prefix matching route in `config`, or
+  // nullopt when no route matches an origin-form request target and Host
+  // field.  Callers index config.routes with the result; no caller keeps a
+  // bare Route* across a snapshot boundary (R-071).
+  [[nodiscard]] static std::optional<std::size_t>
   Match(const config::Config &config, std::string_view host, std::string_view target) noexcept;
 
   // Instance convenience over the table's own config.
-  [[nodiscard]] const config::Route *Match(std::string_view host,
-                                           std::string_view target) const noexcept;
+  [[nodiscard]] std::optional<std::size_t> Match(std::string_view host,
+                                                 std::string_view target) const noexcept;
 
 private:
   config::Config config_;

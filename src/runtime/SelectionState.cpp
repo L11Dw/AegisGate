@@ -4,8 +4,8 @@
 
 namespace aegisgate::runtime {
 
-SelectionState::SelectionState(const config::Config &config)
-    : config_(config) {
+SelectionState::SelectionState(const config::Config &config, std::uint64_t version)
+    : config_(config), version_(version) {
   selectors_.reserve(config.routes.size());
   active_counts_.reserve(config.routes.size());
   for (const config::Route &route : config.routes) {

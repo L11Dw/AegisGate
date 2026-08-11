@@ -45,19 +45,25 @@ bool PrefixMatches(std::string_view path, std::string_view prefix) {
 
 RouteTable::RouteTable(config::Config config) : config_(std::move(config)) {}
 
-const config::Route *RouteTable::Match(const config::Config &config, std::string_view host,
-                                       std::string_view target) noexcept {
-  if (!IsOriginForm(target)) return nullptr;
+std::optional<std::size_t> RouteTable::Match(const config::Config &config, std::string_view host,
+                                             std::string_view target) noexcept {
+  if (!IsOriginForm(target)) return std::nullopt;
   const std::string_view path = PathOnly(target);
-  const config::Route *best = nullptr;
-  for (const config::Route &route : config.routes) {
+  std::optional<std::size_t> best;
+  std::size_t best_prefix_size = 0;
+  for (std::size_t index = 0; index < config.routes.size(); ++index) {
+    const config::Route &route = config.routes[index];
     if (!EqualsIgnoreCase(route.host, host) || !PrefixMatches(path, route.path_prefix)) continue;
-    if (best == nullptr || route.path_prefix.size() > best->path_prefix.size()) best = &route;
+    if (!best.has_value() || route.path_prefix.size() > best_prefix_size) {
+      best = index;
+      best_prefix_size = route.path_prefix.size();
+    }
   }
   return best;
 }
 
-const config::Route *RouteTable::Match(std::string_view host, std::string_view target) const noexcept {
+std::optional<std::size_t> RouteTable::Match(std::string_view host,
+                                             std::string_view target) const noexcept {
   return Match(config_, host, target);
 }
 

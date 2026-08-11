@@ -26,7 +26,15 @@ namespace aegisgate::runtime {
 // free of coordination concerns.
 class SelectionState {
 public:
-  explicit SelectionState(const config::Config &config);
+  // Binds the selection cursors to one immutable config snapshot (R-072): the
+  // version records which snapshot this state belongs to, so a snapshot
+  // reload (M4) rebuilds a fresh worker-local state instead of reusing cursors
+  // and route indices across versions.  In-flight transactions keep the state
+  // they started with.
+  explicit SelectionState(const config::Config &config, std::uint64_t version = 0);
+
+  // The snapshot version this state was built for.
+  [[nodiscard]] std::uint64_t Version() const noexcept { return version_; }
 
   // Advances the route's weighted cursor exactly once and returns the
   // table-owned index of the selected endpoint (content-matched back into the
@@ -50,6 +58,7 @@ public:
 
 private:
   const config::Config &config_;
+  std::uint64_t version_;
   std::vector<routing::WeightedRoundRobin> selectors_;
   std::vector<std::vector<std::shared_ptr<routing::ActiveReservation::State>>> active_counts_;
 };

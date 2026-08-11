@@ -150,36 +150,32 @@ std::size_t Gateway::ClientCount() const noexcept {
 
 std::string Gateway::MetricsText() { return RenderMetrics(); }
 
-bool Gateway::EndpointHealthy(const config::Route &route,
-                              const config::Endpoint &endpoint) const noexcept {
+bool Gateway::EndpointHealthy(std::size_t route_index,
+                              std::size_t endpoint_index) const noexcept {
   const auto snapshot = coordinator_->CurrentSnapshot();
   if (!snapshot) return true;
-  const std::size_t route_index = RouteIndexOf(route);
-  if (route_index >= snapshot->endpoints.size()) return true;
-  const std::size_t endpoint_index = EndpointIndexOf(route_index, endpoint);
-  if (endpoint_index >= snapshot->endpoints[route_index].size()) return true;
+  if (route_index >= snapshot->endpoints.size() ||
+      endpoint_index >= snapshot->endpoints[route_index].size()) {
+    return true;
+  }
   return snapshot->endpoints[route_index][endpoint_index].healthy;
 }
 
 resilience::CircuitBreaker::State
-Gateway::BreakerState(const config::Route &route, const config::Endpoint &endpoint) const noexcept {
+Gateway::BreakerState(std::size_t route_index, std::size_t endpoint_index) const noexcept {
   const auto snapshot = coordinator_->CurrentSnapshot();
   if (!snapshot) return resilience::CircuitBreaker::State::kClosed;
-  const std::size_t route_index = RouteIndexOf(route);
-  if (route_index >= snapshot->endpoints.size()) return resilience::CircuitBreaker::State::kClosed;
-  const std::size_t endpoint_index = EndpointIndexOf(route_index, endpoint);
-  if (endpoint_index >= snapshot->endpoints[route_index].size()) {
+  if (route_index >= snapshot->endpoints.size() ||
+      endpoint_index >= snapshot->endpoints[route_index].size()) {
     return resilience::CircuitBreaker::State::kClosed;
   }
   return static_cast<resilience::CircuitBreaker::State>(
       snapshot->endpoints[route_index][endpoint_index].breaker_state);
 }
 
-void Gateway::SubmitResultAndWait(const config::Route &route, const config::Endpoint &endpoint,
+void Gateway::SubmitResultAndWait(std::size_t route_index, std::size_t endpoint_index,
                                   bool success) {
   const auto snapshot = coordinator_->CurrentSnapshot();
-  const std::size_t route_index = RouteIndexOf(route);
-  const std::size_t endpoint_index = EndpointIndexOf(route_index, endpoint);
   if (!snapshot || route_index >= snapshot->endpoints.size() ||
       endpoint_index >= snapshot->endpoints[route_index].size()) {
     return;
@@ -198,13 +194,9 @@ void Gateway::Accept(int fd) {
     (void)::close(fd);
     return;
   }
-  runtime::WorkerRuntime &worker = workers_->Next();
-  const std::size_t worker_index = [&worker, this] {
-    for (std::size_t index = 0; index < workers_->size(); ++index) {
-      if (&worker == &workers_->At(index)) return index;
-    }
-    return std::size_t(0);
-  }();
+  const runtime::WorkerSet::WorkerHandle handle = workers_->Next();
+  runtime::WorkerRuntime &worker = handle.worker;
+  const std::size_t worker_index = handle.index;
   if (!worker.Post([this, worker_index, fd] {
         auto &slot = worker_datas_[worker_index];
         if (slot) {
@@ -217,27 +209,6 @@ void Gateway::Accept(int fd) {
   }
 }
 
-std::size_t Gateway::RouteIndexOf(const config::Route &route) const noexcept {
-  const std::vector<config::Route> &routes = routes_.Config().routes;
-  for (std::size_t index = 0; index < routes.size(); ++index) {
-    if (&routes[index] == &route) return index;
-  }
-  return routes.size();
-}
-
-std::size_t Gateway::EndpointIndexOf(std::size_t route_index,
-                                     const config::Endpoint &endpoint) const noexcept {
-  const std::vector<config::Route> &routes = routes_.Config().routes;
-  if (route_index >= routes.size()) return routes.size();
-  const std::vector<config::Endpoint> &endpoints = routes[route_index].endpoints;
-  for (std::size_t index = 0; index < endpoints.size(); ++index) {
-    if (endpoints[index].address == endpoint.address && endpoints[index].port == endpoint.port) {
-      return index;
-    }
-  }
-  return endpoints.size();
-}
-
 std::string Gateway::RenderMetrics() const {
   observability::Metrics::Data aggregate;
   for (const auto &metrics : worker_metrics_) {
@@ -246,7 +217,9 @@ std::string Gateway::RenderMetrics() const {
   std::vector<observability::Metrics::ProtectionSample> protection;
   const auto snapshot = coordinator_->CurrentSnapshot();
   if (snapshot) {
-    const std::vector<config::Route> &routes = routes_.Config().routes;
+    // Iterate the config snapshot (the same boundary workers and the
+    // coordinator use), never the table's own copy (R-060).
+    const std::vector<config::Route> &routes = config_snapshot_->config.routes;
     for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
       if (!routes[route_index].circuit_breaker.has_value() &&
           !routes[route_index].health_check.has_value()) {

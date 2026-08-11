@@ -18,6 +18,7 @@
 #include "aegisgate/health/CoordinatorState.h"
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/routing/ActiveReservation.h"
+#include "aegisgate/runtime/ConfigSnapshot.h"
 
 namespace aegisgate::net {
 class ClientConnection;
@@ -57,14 +58,17 @@ public:
     std::size_t endpoint_index;
     health::AttemptPermit permit;
   };
-  // The outcome of choosing one upstream attempt: an eligible endpoint plus
-  // its breaker link (absent when the route has no breaker) plus the active
-  // slot it holds.  The reservation is released exactly once when the attempt
-  // terminates; a selection is only constructed when an attempt starts.
+  // The outcome of choosing one upstream attempt: a value-copied endpoint from
+  // the request-bound config snapshot plus its breaker link (absent when the
+  // route has no breaker) plus the active slot it holds plus that same
+  // snapshot.  No pointer into snapshot internals is ever kept (R-054); the
+  // transaction stores the snapshot so a later retry stays on the request's
+  // configuration.
   struct AttemptSelection {
-    const config::Endpoint *endpoint;
+    config::Endpoint endpoint;
     std::optional<BreakerLink> link;
     routing::ActiveReservation active;
+    runtime::ConfigSnapshotRef snapshot;
   };
   // Chooses the endpoint for the initial attempt and for every retry, so
   // unhealthy or open candidates are never connected to.  nullopt means no
@@ -136,6 +140,10 @@ private:
   std::optional<std::weak_ptr<void>> gateway_lifetime_;
   std::uint16_t upstream_port_;
   std::optional<config::Endpoint> endpoint_;
+  // The request-bound configuration snapshot selected by the provider; held for
+  // the whole transaction so no retry re-reads the current global snapshot
+  // (R-054).  Null when the provider is absent (caller-owned lifetime).
+  runtime::ConfigSnapshotRef request_snapshot_;
   http::HttpRequest request_;
   // Pre-acquired by the caller (worker data plane) from the global
   // admission; released exactly once at the terminal path or by RAII.

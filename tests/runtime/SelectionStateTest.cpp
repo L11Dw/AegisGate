@@ -168,6 +168,16 @@ TEST(SelectionStateTest, ActiveCountsDoNotCrossRoutes) {
   EXPECT_EQ(selection.ActiveFor(1, 0), 0U);
 }
 
+// R-072: worker-local selection state is bound to the config snapshot version
+// it was built for, so a reload rebuilds a fresh state per version instead of
+// reusing cursors and route indices across versions.
+TEST(SelectionStateTest, BindsSnapshotVersion) {
+  Fixture fixture = MakeFixture({Loopback(9001, 1)});
+  SelectionState selection(*fixture.config, /*version=*/42);
+  EXPECT_EQ(selection.Version(), 42U);
+  EXPECT_EQ(SelectionState(*fixture.config).Version(), 0U);
+}
+
 // R-041 regression: the weighted selector must be reachable through a stable
 // index (never a pointer into the selector's internal copies).
 TEST(SelectionStateTest, WeightedIndexFollowsSelectorOrder) {

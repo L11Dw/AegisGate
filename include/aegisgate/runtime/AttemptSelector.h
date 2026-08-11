@@ -17,14 +17,16 @@ struct HealthCircuitSnapshot;
 namespace aegisgate::runtime {
 
 // Per-attempt endpoint selection shared by the initial attempt and every
-// retry (R-036): worker-local index selection, coordinator snapshot
-// eligibility, half-open probe claims, and the per-attempt active slot.  The
-// config snapshot is held by shared_ptr inside the closure that owns the
-// selector, so no hot-replaceable raw Route* is ever captured.
+// retry (R-036), bound to the request's own config snapshot (R-054): the
+// initial attempt and every retry read route/endpoint data from the same
+// snapshot_ the request started with, never the current global snapshot.  The
+// selector lives inside the provider closure the transaction owns, so the
+// snapshot outlives every attempt.  Eligibility (health + breaker) still comes
+// from the live coordinator snapshot.
 class AttemptSelector {
 public:
   AttemptSelector(SelectionState &selection, std::shared_ptr<WorkerShared> shared,
-                  std::size_t route_index);
+                  std::size_t route_index, ConfigSnapshotRef snapshot);
 
   // Picks one attempt selection for the route's balance policy.  nullopt
   // means no eligible candidate remains (initial -> unique 503, retry ->
@@ -43,6 +45,8 @@ private:
   SelectionState &selection_;
   std::shared_ptr<WorkerShared> shared_;
   std::size_t route_index_;
+  // The request-bound configuration; never re-read from the global snapshot.
+  ConfigSnapshotRef snapshot_;
   std::set<std::size_t> tried_;
 };
 

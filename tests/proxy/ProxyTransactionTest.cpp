@@ -569,7 +569,9 @@ class LeastActiveProvider {
 public:
   LeastActiveProvider(runtime::SelectionState &selection, const config::Config &config,
                       std::shared_ptr<health::Coordinator> coordinator)
-      : selection_(selection), config_(config), coordinator_(std::move(coordinator)) {}
+      : selection_(selection), config_(config), coordinator_(std::move(coordinator)),
+        request_snapshot_(std::make_shared<const runtime::ConfigSnapshot>(
+            runtime::ConfigSnapshot{1, config})) {}
 
   std::optional<ProxyTransaction::AttemptSelection> Select() {
     const auto snapshot = coordinator_->CurrentSnapshot();
@@ -590,7 +592,6 @@ public:
       const auto index = selection_.NextLeastActiveIndex(0, tried_, eligible);
       if (!index) return std::nullopt;
       tried_.insert(*index);
-      const config::Endpoint &endpoint = endpoints[*index];
       std::optional<ProxyTransaction::BreakerLink> link;
       if (snapshot->endpoints[0][*index].generation != 0) {
         link = ProxyTransaction::BreakerLink{
@@ -598,7 +599,8 @@ public:
             {false, snapshot->endpoints[0][*index].generation, 0}};
       }
       return ProxyTransaction::AttemptSelection{
-          &endpoint, std::move(link), selection_.AcquireActive(0, *index)};
+          endpoints[*index], std::move(link), selection_.AcquireActive(0, *index),
+          request_snapshot_};
     }
   }
 
@@ -606,6 +608,7 @@ private:
   runtime::SelectionState &selection_;
   const config::Config &config_;
   std::shared_ptr<health::Coordinator> coordinator_;
+  runtime::ConfigSnapshotRef request_snapshot_;
   std::set<std::size_t> tried_;
 };
 
