@@ -15,11 +15,15 @@ public:
   // True once a syntactically valid response header and framing declaration
   // has been received, even while its Content-Length body is incomplete.
   [[nodiscard]] bool HeadersComplete() const noexcept;
-  void Reset();
+  // response_to_head marks the request method as HEAD: the response completes
+  // at the end of the headers, only the header area is consumed, and the
+  // declared entity length is carried without a body.
+  void Reset(bool response_to_head = false);
 
 private:
   ParseResult result_ = ParseResult::kNeedMoreData;
   bool headers_complete_ = false;
+  bool response_to_head_ = false;
   HttpResponse response_;
 };
 

@@ -10,8 +10,9 @@ namespace aegisgate::http {
 
 // How the response body relates to the wire framing.  Normal responses emit
 // Content-Length from body.size() and send the body; a suppressed body (a HEAD
-// response) must not declare a length it never sends, and must not claim the
-// entity length is zero when the upstream declared a real one.
+// response) declares the entity length a GET would return but never sends the
+// body, and must not silently claim the entity length is zero when the
+// upstream declared a real one.
 enum class ResponseBodyMode {
   kNormal,
   kSuppressedWithKnownLength,    // Content-Length: <content_length>, no body
