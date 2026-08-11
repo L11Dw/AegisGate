@@ -381,12 +381,13 @@ bool ProxyTransaction::HandleResponseBody(std::string_view bytes) {
     return false;
   }
   if (at_high_watermark) {
-    // The downstream queue is at or above the high watermark: decline every
-    // further chunk so the parser keeps it in the input buffer and pauses
-    // reading (bounded memory), and the read resumes only after a low-water
-    // drain notification.
+    // The downstream queue is at or above the high watermark: pause the
+    // upstream read.  The chunk itself was already consumed (appended to the
+    // downstream queue), so this sink returns true: a false return would make
+    // the parser retain the bytes in its input and re-deliver them on resume
+    // (R-046).  The pause stops the streaming read loop and re-enables only
+    // after a low-water drain notification.
     PauseUpstreamReading();
-    return false;
   }
   return true;
 }

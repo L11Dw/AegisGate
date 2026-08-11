@@ -73,6 +73,7 @@ void UpstreamConnection::Start(const http::HttpRequest &request) {
   first_byte_reported_ = false;
   response_header_reported_ = false;
   header_reported_ = false;
+  reading_paused_ = false;
 
   try {
     output_.Append(http::SerializeRequest(request));
@@ -148,6 +149,7 @@ void UpstreamConnection::PauseReading() noexcept {
   if (!body_sink_ || state_ != State::kReading || !channel_) {
     return;
   }
+  reading_paused_ = true;
   try {
     channel_->DisableReading();
   } catch (...) {
@@ -158,12 +160,13 @@ void UpstreamConnection::ResumeReading() noexcept {
   if (!body_sink_ || state_ != State::kReading || !channel_) {
     return;
   }
+  reading_paused_ = false;
   try {
     channel_->EnableReading();
   } catch (...) {
   }
-  // Residual bytes buffered before the pause must be consumed before any
-  // fresh recv; HandleRead starts with the existing input for that reason.
+  // Anything buffered in the user-space input must be consumed before fresh
+  // recv; HandleRead starts with the existing input for that reason.
   if (input_.ReadableBytes() != 0U) {
     HandleRead();
   }
@@ -243,6 +246,11 @@ void UpstreamConnection::HandleRead() {
 
 void UpstreamConnection::HandleStreamingRead() {
   for (;;) {
+    // Downstream backpressure paused the read: stop recv()ing immediately,
+    // even inside the current batch, so the kernel queue absorbs the rest.
+    if (reading_paused_) {
+      return;
+    }
     // Residual input buffered before a pause is consumed first.
     if (input_.ReadableBytes() != 0U) {
       if (!ConsumeStreamingInput()) return;

@@ -110,6 +110,12 @@ private:
   bool first_byte_reported_ = false;
   bool response_header_reported_ = false;
   bool header_reported_ = false;
+  // Downstream backpressure pause: while set, the streaming read loop stops
+  // recv()ing even inside its current batch (the epoll interest is disabled
+  // separately), so the kernel queue absorbs the remainder.  Distinct from
+  // "chunk consumed": a paused connection has consumed everything already
+  // handed to the body sink.
+  bool reading_paused_ = false;
 };
 
 } // namespace aegisgate::net

@@ -628,6 +628,22 @@ TEST(EndToEndTest, StreamsLargeResponseUnderSlowClient) {
       error = "unexpected EOF while draining response";
       break;
     }
+    // R-046 regression: after the full response, nothing more may arrive.
+    // A pause/resume cycle that re-delivered a retained chunk would inflate
+    // the total beyond kExpected.
+    if (error.empty()) {
+      pollfd descriptor{client.Fd(), POLLIN, 0};
+      while (::poll(&descriptor, 1, 200) > 0) {
+        std::array<char, 4096> bytes{};
+        const ssize_t count = ::read(client.Fd(), bytes.data(), bytes.size());
+        if (count > 0) {
+          received.append(bytes.data(), static_cast<std::size_t>(count));
+          continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        break;
+      }
+    }
     if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
   });
   backend.join();
