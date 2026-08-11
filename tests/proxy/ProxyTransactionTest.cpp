@@ -2002,6 +2002,90 @@ TEST(ProxyTransactionTest, ClientCloseCancelsUpstream) {
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
+TEST(ProxyTransactionTest, LowWaterNotificationWithoutPauseDoesNotReenter) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  constexpr std::string_view request =
+      "GET /drain HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    const std::string response =
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + std::string(100, 'd');
+    if (backend_error.empty() &&
+        ::write(fd, response.data(), response.size()) != static_cast<ssize_t>(response.size())) {
+      backend_error = "failed to write response";
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  std::shared_ptr<ProxyTransaction> transaction;
+  // A tiny low watermark makes the in-sink drain cross it while the read was
+  // never paused: the low-water notification must not re-enter the upstream
+  // parser on the not-yet-retrieved chunk (R-049).
+  net::ClientConnection client(
+      loop, client_sockets[0],
+      [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+        transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr,
+                                              &timers);
+      },
+      net::StreamFlowControl{256 * 1024, 4});
+  client.Start();
+  constexpr std::string_view inbound = "GET /drain HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    const std::string expected =
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + std::string(100, 'd');
+    const auto received = ReadExactUntil(client_sockets[1], expected.size(), TestDeadline(),
+                                         peer_result.error);
+    if (!received) return;
+    peer_result.received = *received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  // Exactly one copy of the response: a re-entered resume would have
+  // forwarded the same chunk twice or errored on a header-less input.
+  EXPECT_EQ(peer_result.received,
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + std::string(100, 'd'));
+  EXPECT_TRUE(peer_result.wire_ok);
+  EXPECT_EQ(timers.PendingCount(), 0U);
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
 TEST(ProxyTransactionTest, ClientDestroyedBeforeCommittedFailureIsSafe) {
   net::Socket listener = net::Socket::ListenLoopback();
   const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};

@@ -157,7 +157,12 @@ void UpstreamConnection::PauseReading() noexcept {
 }
 
 void UpstreamConnection::ResumeReading() noexcept {
-  if (!body_sink_ || state_ != State::kReading || !channel_) {
+  // A low-water notification can fire synchronously inside the body sink,
+  // before PauseReading() was ever called: that drain crossed the low
+  // watermark but the read was never paused.  Resuming then would re-enter
+  // ConsumeBody() on the chunk the parser has not retrieved yet and forward
+  // it twice (R-049); without a pause there is nothing to resume.
+  if (!body_sink_ || state_ != State::kReading || !channel_ || !reading_paused_) {
     return;
   }
   reading_paused_ = false;

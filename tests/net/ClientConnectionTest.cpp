@@ -772,6 +772,59 @@ TEST(ClientConnectionTest, PeerCloseFiresAbortOnce) {
   EXPECT_EQ(abort_calls, 1);  // owner Close() does not repeat the abort
 }
 
+TEST(ClientConnectionTest, ConnectionCloseRequestStreamsFullBodyBeforeClosing) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  constexpr std::size_t kBodySize = 512 * 1024;
+  EventLoop loop;
+  std::string received;
+  received.reserve(kBodySize + 64);
+  ClientConnection connection(
+      loop, sockets[0], [&](ClientConnection &client, const http::HttpRequest &) {
+        http::HttpResponseHead head{200, "OK", {},
+                                    aegisgate::http::ResponseBodyMode::kNormal, kBodySize};
+        client.BeginResponse(head);
+        const std::string chunk(64 * 1024, 'c');
+        for (std::size_t written = 0; written < kBodySize; written += chunk.size()) {
+          (void)client.WriteResponseBody(chunk);
+        }
+        client.FinishResponse();
+      });
+  Channel client_reader(loop, sockets[1]);
+  client_reader.SetReadCallback([&] {
+    std::array<char, 16 * 1024> bytes{};
+    const ssize_t count = ::read(sockets[1], bytes.data(), bytes.size());
+    if (count > 0) {
+      received.append(bytes.data(), static_cast<std::size_t>(count));
+      if (received.size() == 43 + kBodySize) {
+        loop.Quit();
+      }
+      return;
+    }
+    EXPECT_EQ(count, 0);  // Connection: close closes after the full response
+    loop.Quit();
+  });
+  connection.Start();
+  client_reader.EnableReading();
+
+  // A Connection: close request must not close the connection while the
+  // committed stream is still unfinished (R-048).
+  constexpr std::string_view request = "GET /close HTTP/1.1\r\nConnection: close\r\n\r\n";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()),
+            static_cast<ssize_t>(request.size()));
+  loop.Loop();
+
+  EXPECT_EQ(received.size(), 43 + kBodySize);
+  EXPECT_EQ(received.substr(0, 43),
+            "HTTP/1.1 200 OK\r\nContent-Length: 524288\r\n\r\n");
+  EXPECT_EQ(received.substr(43), std::string(kBodySize, 'c'));
+  connection.Close();
+  client_reader.Remove();
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
 TEST(ClientConnectionTest, AbortDoesNotEmitSyntheticResponse) {
   std::array<int, 2> sockets{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),

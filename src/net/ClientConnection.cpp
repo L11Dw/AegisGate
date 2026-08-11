@@ -313,14 +313,16 @@ void ClientConnection::HandleWrite() {
 
   writing_ = false;
   channel_.DisableWriting();
-  if (close_after_write_) {
-    Close();
-    return;
-  }
   if (response_committed_ && !response_finished_) {
     // Streaming: more body chunks may follow, so request reading stays paused
-    // and the peer is not notified until FinishResponse().
+    // and the peer is not notified until FinishResponse().  close_after_write_
+    // (a Connection: close request) must NOT close the connection here: the
+    // committed stream is still unfinished and would be truncated (R-048).
     NotifyDrainedIfBelowLow(was_above_low);
+    return;
+  }
+  if (close_after_write_) {
+    Close();
     return;
   }
   ResumeReading();
