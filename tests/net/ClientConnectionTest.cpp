@@ -589,6 +589,285 @@ TEST(ClientConnectionTest, HalfClosedSlowPeerDoesNotStarveOtherReadyChannel) {
   EXPECT_EQ(::close(work_sockets[1]), 0);
 }
 
+TEST(ClientConnectionTest, StreamsHeaderAndBodyWithoutExtraBytes) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  EventLoop loop;
+  int request_count = 0;
+  std::string received;
+  ClientConnection connection(
+      loop, sockets[0], [&](ClientConnection &client, const http::HttpRequest &request) {
+        ++request_count;
+        EXPECT_EQ(request.target, "/stream");
+        http::HttpResponseHead head{200,
+                                    "OK",
+                                    {{"content-type", "text/plain"}},
+                                    aegisgate::http::ResponseBodyMode::kNormal,
+                                    std::size_t{5}};
+        client.BeginResponse(head);
+        (void)client.WriteResponseBody("hello");
+        client.FinishResponse();
+      });
+  Channel client_reader(loop, sockets[1]);
+  client_reader.SetReadCallback([&] {
+    std::array<char, 128> bytes{};
+    const ssize_t count = ::read(sockets[1], bytes.data(), bytes.size());
+    if (count > 0) {
+      received.append(bytes.data(), static_cast<std::size_t>(count));
+      return;
+    }
+    EXPECT_EQ(count, 0);
+    loop.Quit();
+  });
+  connection.Start();
+  client_reader.EnableReading();
+
+  constexpr std::string_view request = "GET /stream HTTP/1.1\r\n\r\n";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()),
+            static_cast<ssize_t>(request.size()));
+  if (::shutdown(sockets[1], SHUT_WR) < 0) {
+    if (errno == EPERM) {
+      GTEST_SKIP() << "the restricted sandbox blocks shutdown(2)";
+    }
+    FAIL() << "shutdown failed with errno=" << errno;
+  }
+  loop.Loop();
+
+  EXPECT_EQ(request_count, 1);
+  EXPECT_EQ(received,
+            "HTTP/1.1 200 OK\r\n"
+            "content-type: text/plain\r\n"
+            "Content-Length: 5\r\n\r\n"
+            "hello");
+  connection.Close();
+  client_reader.Remove();
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
+TEST(ClientConnectionTest, ReportsHighCrossingAndNotifiesLowWaterOnce) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  constexpr std::size_t kFirstBody = 512 * 1024;
+  constexpr std::size_t kSecondBody = 256 * 1024;
+  constexpr std::size_t kTotalBody = kFirstBody + kSecondBody;
+  EventLoop loop;
+  bool crossed = false;
+  int drained_calls = 0;
+  std::string received;
+  received.reserve(kTotalBody + 64);
+  ClientConnection connection(
+      loop, sockets[0], [&](ClientConnection &client, const http::HttpRequest &) {
+        http::HttpResponseHead head{200, "OK", {},
+                                    aegisgate::http::ResponseBodyMode::kNormal, kTotalBody};
+        client.BeginResponse(head);
+        const std::string chunk(64 * 1024, 'x');
+        for (std::size_t written = 0; written < kFirstBody; written += chunk.size()) {
+          crossed = client.WriteResponseBody(chunk) || crossed;
+        }
+        // The response stays open: the drained low-water notification must
+        // fire before FinishResponse is allowed to close the stream.
+      });
+  connection.SetWriteDrainedCallback([&] {
+    ++drained_calls;
+    if (drained_calls == 1) {
+      const std::string chunk(64 * 1024, 'z');
+      for (std::size_t written = 0; written < kSecondBody; written += chunk.size()) {
+        (void)connection.WriteResponseBody(chunk);
+      }
+      connection.FinishResponse();
+    }
+  });
+  Channel client_reader(loop, sockets[1]);
+  client_reader.SetReadCallback([&] {
+    std::array<char, 16 * 1024> bytes{};
+    const ssize_t count = ::read(sockets[1], bytes.data(), bytes.size());
+    if (count > 0) {
+      received.append(bytes.data(), static_cast<std::size_t>(count));
+      if (received.size() == 43 + kTotalBody) {
+        loop.Quit();
+      }
+      return;
+    }
+    EXPECT_EQ(count, 0);
+    loop.Quit();
+  });
+  connection.Start();
+  client_reader.EnableReading();
+
+  constexpr std::string_view request = "GET /large-stream HTTP/1.1\r\n\r\n";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()),
+            static_cast<ssize_t>(request.size()));
+  if (::shutdown(sockets[1], SHUT_WR) < 0) {
+    if (errno == EPERM) {
+      GTEST_SKIP() << "the restricted sandbox blocks shutdown(2)";
+    }
+    FAIL() << "shutdown failed with errno=" << errno;
+  }
+  loop.Loop();
+
+  EXPECT_TRUE(crossed);
+  EXPECT_EQ(drained_calls, 1);
+  EXPECT_EQ(received.size(), 43 + kTotalBody);
+  EXPECT_EQ(received.substr(0, 43),
+            "HTTP/1.1 200 OK\r\nContent-Length: 786432\r\n\r\n");
+  EXPECT_EQ(received.substr(43, kFirstBody), std::string(kFirstBody, 'x'));
+  EXPECT_EQ(received.substr(43 + kFirstBody), std::string(kSecondBody, 'z'));
+  connection.Close();
+  client_reader.Remove();
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
+TEST(ClientConnectionTest, PeerCloseFiresAbortOnce) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  EventLoop loop;
+  int abort_calls = 0;
+  ClientConnection connection(
+      loop, sockets[0], [&](ClientConnection &client, const http::HttpRequest &) {
+        http::HttpResponseHead head{200, "OK", {},
+                                    aegisgate::http::ResponseBodyMode::kNormal,
+                                    std::size_t{1024 * 1024}};
+        client.BeginResponse(head);
+        // Overflow the peer's socket buffer so the write stays pending on
+        // EPOLLOUT and the peer's reset is observable via EPOLLERR.
+        const std::string chunk(64 * 1024, 'y');
+        for (int i = 0; i < 16; ++i) {
+          (void)client.WriteResponseBody(chunk);
+        }
+      });
+  connection.SetRequestAbortCallback([&] {
+    ++abort_calls;
+    loop.Quit();
+  });
+  Channel peer(loop, sockets[1]);
+  peer.SetReadCallback([&] {
+    std::array<char, 4096> bytes{};
+    const ssize_t count = ::read(sockets[1], bytes.data(), bytes.size());
+    ASSERT_GT(count, 0);
+    // The peer stops reading, then resets the connection.
+    peer.Remove();
+    struct linger reset = {1, 0};
+    EXPECT_EQ(::setsockopt(sockets[1], SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)), 0);
+    EXPECT_EQ(::close(sockets[1]), 0);
+    loop.Quit();
+  });
+  connection.Start();
+  peer.EnableReading();
+
+  constexpr std::string_view request = "GET /reset HTTP/1.1\r\n\r\n";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()),
+            static_cast<ssize_t>(request.size()));
+  loop.Loop();
+
+  // The reset is observed on the next loop pass.
+  loop.Loop();
+  EXPECT_EQ(abort_calls, 1);
+  connection.Close();
+  EXPECT_EQ(abort_calls, 1);  // owner Close() does not repeat the abort
+}
+
+TEST(ClientConnectionTest, ConnectionCloseRequestStreamsFullBodyBeforeClosing) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  constexpr std::size_t kBodySize = 512 * 1024;
+  EventLoop loop;
+  std::string received;
+  received.reserve(kBodySize + 64);
+  ClientConnection connection(
+      loop, sockets[0], [&](ClientConnection &client, const http::HttpRequest &) {
+        http::HttpResponseHead head{200, "OK", {},
+                                    aegisgate::http::ResponseBodyMode::kNormal, kBodySize};
+        client.BeginResponse(head);
+        const std::string chunk(64 * 1024, 'c');
+        for (std::size_t written = 0; written < kBodySize; written += chunk.size()) {
+          (void)client.WriteResponseBody(chunk);
+        }
+        client.FinishResponse();
+      });
+  Channel client_reader(loop, sockets[1]);
+  client_reader.SetReadCallback([&] {
+    std::array<char, 16 * 1024> bytes{};
+    const ssize_t count = ::read(sockets[1], bytes.data(), bytes.size());
+    if (count > 0) {
+      received.append(bytes.data(), static_cast<std::size_t>(count));
+      if (received.size() == 43 + kBodySize) {
+        loop.Quit();
+      }
+      return;
+    }
+    EXPECT_EQ(count, 0);  // Connection: close closes after the full response
+    loop.Quit();
+  });
+  connection.Start();
+  client_reader.EnableReading();
+
+  // A Connection: close request must not close the connection while the
+  // committed stream is still unfinished (R-048).
+  constexpr std::string_view request = "GET /close HTTP/1.1\r\nConnection: close\r\n\r\n";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()),
+            static_cast<ssize_t>(request.size()));
+  loop.Loop();
+
+  EXPECT_EQ(received.size(), 43 + kBodySize);
+  EXPECT_EQ(received.substr(0, 43),
+            "HTTP/1.1 200 OK\r\nContent-Length: 524288\r\n\r\n");
+  EXPECT_EQ(received.substr(43), std::string(kBodySize, 'c'));
+  connection.Close();
+  client_reader.Remove();
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
+TEST(ClientConnectionTest, AbortDoesNotEmitSyntheticResponse) {
+  std::array<int, 2> sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),
+            0);
+
+  EventLoop loop;
+  std::string received;
+  ClientConnection connection(
+      loop, sockets[0], [&](ClientConnection &client, const http::HttpRequest &) {
+        http::HttpResponseHead head{200, "OK", {},
+                                    aegisgate::http::ResponseBodyMode::kNormal,
+                                    std::size_t{5}};
+        client.BeginResponse(head);
+        client.AbortResponse();
+      });
+  connection.Start();
+
+  constexpr std::string_view request = "GET /abort HTTP/1.1\r\n\r\n";
+  ASSERT_EQ(::write(sockets[1], request.data(), request.size()),
+            static_cast<ssize_t>(request.size()));
+  Channel peer(loop, sockets[1]);
+  peer.SetReadCallback([&] {
+    std::array<char, 4096> bytes{};
+    const ssize_t count = ::read(sockets[1], bytes.data(), bytes.size());
+    if (count > 0) {
+      received.append(bytes.data(), static_cast<std::size_t>(count));
+      return;
+    }
+    EXPECT_EQ(count, 0);  // the abort closes the connection
+    loop.Quit();
+  });
+  peer.EnableReading();
+  loop.Loop();
+
+  // Nothing beyond the already-committed header may reach the peer: no body
+  // bytes and no synthetic error response.
+  EXPECT_LE(received.size(), 38);
+  EXPECT_EQ(received.find("hello"), std::string::npos);
+  EXPECT_EQ(received.find("Bad Gateway"), std::string::npos);
+  peer.Remove();
+  EXPECT_EQ(::close(sockets[1]), 0);
+}
+
 TEST(ClientConnectionTest, ResumeAfterWriteCanDestroyConnectionInBufferedCallback) {
   std::array<int, 2> sockets{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()),

@@ -101,6 +101,15 @@ private:
   [[nodiscard]] bool StartUpstream();
   void FinishNoEndpoint();
   void HandleProgress(net::UpstreamProgress progress);
+  // Streaming response delivery: the head commits the downstream response
+  // (closing the retry window), body chunks are forwarded via
+  // WriteResponseBody, and the peer's death cancels the upstream exchange.
+  void HandleResponseHead(const http::HttpResponseHead &head);
+  [[nodiscard]] bool HandleResponseBody(std::string_view bytes);
+  void HandleClientAbort();
+  void PauseUpstreamReading() noexcept;
+  void ResumeUpstreamReading() noexcept;
+  void ClearClientStreamCallbacks() noexcept;
   void ArmConnectDeadline();
   void ArmFirstByteDeadline();
   void ArmTotalDeadline();
@@ -153,8 +162,13 @@ private:
   std::uint32_t retries_ = 0;
   bool connected_ = false;
   bool response_header_received_ = false;
+  // Set the moment the validated response head is handed to the downstream
+  // connection: the conservative retry boundary (the kernel may not have
+  // written any byte yet, but the output can no longer be replaced).
+  bool downstream_response_committed_ = false;
   bool starting_upstream_ = false;
   bool finished_ = false;
+  http::HttpResponseHead response_head_;
 };
 
 } // namespace aegisgate::proxy

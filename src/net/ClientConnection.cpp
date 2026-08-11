@@ -73,11 +73,28 @@ bool ResponseWantsClose(const http::HttpResponse &response) {
   return false;
 }
 
+bool HeadWantsClose(const http::HttpResponseHead &head) {
+  for (const auto &[name, value] : head.headers) {
+    if (EqualsIgnoreCase(name, "connection") && ContainsConnectionClose(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
-ClientConnection::ClientConnection(EventLoop &loop, int fd, RequestCallback callback)
-    : socket_(fd), channel_(loop, fd), request_callback_(std::move(callback)) {
+ClientConnection::ClientConnection(EventLoop &loop, int fd, RequestCallback callback,
+                                   StreamFlowControl flow_control)
+    : socket_(fd), channel_(loop, fd), request_callback_(std::move(callback)),
+      flow_control_(flow_control) {
   SetNonblocking(fd);
+  // Bound the kernel send queue (symmetric with the upstream connection) so a
+  // slow peer cannot absorb an unbounded response in the kernel: the queued
+  // bytes then cross the high watermark, pause the upstream read, and apply
+  // real receive-window backpressure instead of unbounded memory use.
+  int send_buffer = 64 * 1024;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
   channel_.SetReadCallback([this] { HandleRead(); });
   channel_.SetWriteCallback([this] { HandleWrite(); });
 }
@@ -100,6 +117,10 @@ void ClientConnection::ResumeReading() {
   }
 
   parser_.Reset();
+  // A new request cycle starts: the previous response's streaming state must
+  // not leak into the next SendResponse/BeginResponse.
+  response_committed_ = false;
+  response_finished_ = false;
   reading_paused_ = false;
   if (input_.ReadableBytes() != 0) {
     switch (parser_.Parse(input_)) {
@@ -119,7 +140,8 @@ void ClientConnection::ResumeReading() {
 }
 
 void ClientConnection::SendResponse(const http::HttpResponse &response) {
-  if (!socket_.Valid() || !reading_paused_ || writing_) {
+  if (!socket_.Valid() || !reading_paused_ || writing_ || response_committed_ ||
+      response_finished_) {
     throw std::logic_error("response is not valid in the current connection state");
   }
 
@@ -128,6 +150,74 @@ void ClientConnection::SendResponse(const http::HttpResponse &response) {
   writing_ = true;
   close_after_write_ = close_after_write_ || ResponseWantsClose(response);
   HandleWrite();
+}
+
+void ClientConnection::BeginResponse(const http::HttpResponseHead &head) {
+  if (!socket_.Valid() || !reading_paused_ || writing_ || response_committed_ ||
+      response_finished_) {
+    throw std::logic_error("response is not valid in the current connection state");
+  }
+
+  const std::string serialized = head.Serialize();
+  output_.Append(serialized);
+  writing_ = true;
+  response_committed_ = true;
+  close_after_write_ = close_after_write_ || HeadWantsClose(head);
+  HandleWrite();
+}
+
+bool ClientConnection::WriteResponseBody(std::string_view bytes) {
+  if (!socket_.Valid() || !response_committed_ || response_finished_) {
+    throw std::logic_error("response body is not valid in the current connection state");
+  }
+  if (bytes.empty()) {
+    return false;
+  }
+  output_.Append(bytes);
+  if (!writing_) {
+    writing_ = true;
+  }
+  HandleWrite();
+  // True while the queued bytes sit at or above the high watermark: the
+  // caller must keep the upstream reading paused until a low-water drain.
+  return output_.ReadableBytes() >= flow_control_.HighWatermark();
+}
+
+void ClientConnection::FinishResponse() {
+  if (!socket_.Valid() || !response_committed_ || response_finished_) {
+    throw std::logic_error("response is not valid in the current connection state");
+  }
+  response_finished_ = true;
+  if (!writing_) {
+    // Everything already drained synchronously: this path never re-enters
+    // HandleWrite(), so a Connection: close request must be honored here
+    // (R-048).  With bytes still queued, HandleWrite() applies
+    // close_after_write_ after the final drain instead.
+    if (close_after_write_) {
+      Close();
+      return;
+    }
+    ResumeReading();
+  }
+}
+
+void ClientConnection::AbortResponse() noexcept { Close(); }
+
+std::size_t ClientConnection::QueuedResponseBytes() const noexcept {
+  return output_.ReadableBytes();
+}
+
+void ClientConnection::SetWriteDrainedCallback(WriteDrainedCallback callback) {
+  write_drained_callback_ = std::move(callback);
+}
+
+void ClientConnection::SetRequestAbortCallback(RequestAbortCallback callback) {
+  request_abort_callback_ = std::move(callback);
+}
+
+void ClientConnection::ClearStreamCallbacks() noexcept {
+  write_drained_callback_ = nullptr;
+  request_abort_callback_ = nullptr;
 }
 
 void ClientConnection::Close() noexcept {
@@ -156,10 +246,13 @@ void ClientConnection::HandleRead() {
     return;
   }
   if (reading_paused_) {
-    // With EPOLLIN disabled, this callback is a terminal event. A peer may
-    // half-close after submitting a complete request; preserve the accepted
-    // response and close only after its pending bytes drain. Terminal events
+    // With EPOLLIN disabled, this callback is a terminal event: only
+    // EPOLLERR/EPOLLHUP/EPOLLRDHUP can fire here, so the peer connection is
+    // gone (RST or error) or half-closed.  Notify the streaming transaction
+    // once so it can cancel the upstream exchange; the accepted response
+    // still drains to the peer if the socket is writable.  Terminal events
     // take precedence over EPOLLOUT in Channel, so retry the write here.
+    NotifyRequestAbort();
     close_after_write_ = true;
     if (writing_) {
       HandleWrite();
@@ -205,6 +298,7 @@ void ClientConnection::HandleWrite() {
     return;
   }
 
+  const bool was_above_low = output_.ReadableBytes() > flow_control_.LowWatermark();
   while (output_.ReadableBytes() != 0U) {
     const std::string_view bytes = output_.ReadableView();
     const ssize_t count = ::send(socket_.Fd(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
@@ -216,20 +310,52 @@ void ClientConnection::HandleWrite() {
       continue;
     }
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      NotifyDrainedIfBelowLow(was_above_low);
       channel_.EnableWriting();
       return;
     }
+    NotifyRequestAbort();
     Close();
     return;
   }
 
   writing_ = false;
   channel_.DisableWriting();
+  if (response_committed_ && !response_finished_) {
+    // Streaming: more body chunks may follow, so request reading stays paused
+    // and the peer is not notified until FinishResponse().  close_after_write_
+    // (a Connection: close request) must NOT close the connection here: the
+    // committed stream is still unfinished and would be truncated (R-048).
+    NotifyDrainedIfBelowLow(was_above_low);
+    return;
+  }
   if (close_after_write_) {
     Close();
     return;
   }
   ResumeReading();
+}
+
+void ClientConnection::NotifyRequestAbort() noexcept {
+  if (abort_fired_) {
+    return;
+  }
+  abort_fired_ = true;
+  const RequestAbortCallback callback = request_abort_callback_;
+  if (callback) {
+    callback();
+  }
+}
+
+void ClientConnection::NotifyDrainedIfBelowLow(bool was_above_low) noexcept {
+  if (!response_committed_ || response_finished_ || !was_above_low ||
+      output_.ReadableBytes() > flow_control_.LowWatermark()) {
+    return;
+  }
+  const WriteDrainedCallback callback = write_drained_callback_;
+  if (callback) {
+    callback();
+  }
 }
 
 void ClientConnection::DeliverParsedRequest() {

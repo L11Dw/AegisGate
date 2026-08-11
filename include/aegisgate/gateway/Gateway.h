@@ -10,6 +10,7 @@
 #include "aegisgate/config/Config.h"
 #include "aegisgate/health/HealthChecker.h"
 #include "aegisgate/http/HttpRequestParser.h"
+#include "aegisgate/net/StreamFlowControl.h"
 #include "aegisgate/routing/RouteTable.h"
 
 namespace aegisgate::net {
@@ -34,7 +35,8 @@ namespace aegisgate::gateway {
 class Gateway {
 public:
   Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
-          std::uint16_t listen_port);
+          std::uint16_t listen_port,
+          net::StreamFlowControl flow_control = net::StreamFlowControl{});
   ~Gateway();
 
   Gateway(const Gateway &) = delete;
@@ -74,6 +76,7 @@ private:
   std::unique_ptr<net::Acceptor> acceptor_;
   std::vector<std::unique_ptr<health::HealthChecker>> health_checkers_;
   std::unordered_map<std::uint64_t, std::unique_ptr<net::ClientConnection>> clients_;
+  net::StreamFlowControl flow_control_;
   std::uint64_t next_client_identifier_ = 1;
 };
 

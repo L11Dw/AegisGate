@@ -83,6 +83,69 @@ TEST(HttpResponseTest, OmitsContentLengthForUnknownLengthHead) {
   EXPECT_EQ(response.Serialize(), "HTTP/1.1 200 OK\r\n\r\n");
 }
 
+// A streaming head carries framing without body bytes.  It must emit the
+// declared entity length instead of deriving "Content-Length: 0" from an
+// absent body, which is what HttpResponse::Serialize() would do.
+TEST(HttpResponseHeadTest, PreservesDeclaredContentLength) {
+  HttpResponseHead head{200,
+                        "OK",
+                        {{"content-type", "text/plain"}},
+                        ResponseBodyMode::kNormal,
+                        std::size_t{5}};
+
+  EXPECT_EQ(head.Serialize(),
+            "HTTP/1.1 200 OK\r\n"
+            "content-type: text/plain\r\n"
+            "Content-Length: 5\r\n\r\n");
+}
+
+TEST(HttpResponseHeadTest, HeadAndBodylessStatusesHaveNoBody) {
+  HttpResponseHead no_content{204, "No Content"};
+  HttpResponseHead not_modified{304, "Not Modified"};
+  EXPECT_EQ(no_content.Serialize(), "HTTP/1.1 204 No Content\r\n\r\n");
+  EXPECT_EQ(not_modified.Serialize(), "HTTP/1.1 304 Not Modified\r\n\r\n");
+
+  HttpResponseHead head_with_length{200, "OK", {}, ResponseBodyMode::kSuppressedWithKnownLength,
+                                    std::size_t{5}};
+  EXPECT_EQ(head_with_length.Serialize(), "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+
+  HttpResponseHead head_unknown_length{200, "OK", {},
+                                       ResponseBodyMode::kSuppressedWithUnknownLength};
+  EXPECT_EQ(head_unknown_length.Serialize(), "HTTP/1.1 200 OK\r\n\r\n");
+}
+
+TEST(HttpResponseHeadTest, RejectsFramingManagedHeaders) {
+  EXPECT_THROW(static_cast<void>(
+                   HttpResponseHead{200, "OK", {{"Content-Length", "1"}}, ResponseBodyMode::kNormal,
+                                    std::size_t{1}}.Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(
+                   HttpResponseHead{200, "OK", {{"transfer-encoding", "chunked"}}}.Serialize()),
+               std::invalid_argument);
+}
+
+TEST(HttpResponseHeadTest, RejectsInvalidFraming) {
+  // Streaming mode is only frameable with a declared entity length.
+  EXPECT_THROW(static_cast<void>(HttpResponseHead{200, "OK", {},
+                                                  ResponseBodyMode::kNormal}.Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(
+                   HttpResponseHead{200, "OK", {}, ResponseBodyMode::kSuppressedWithKnownLength}
+                       .Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(
+                   HttpResponseHead{200, "OK", {}, ResponseBodyMode::kSuppressedWithUnknownLength,
+                                    std::size_t{5}}.Serialize()),
+               std::invalid_argument);
+  // Bodyless statuses must not silently swallow framing metadata.
+  EXPECT_THROW(static_cast<void>(
+                   HttpResponseHead{204, "No Content", {}, ResponseBodyMode::kNormal,
+                                    std::size_t{0}}.Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(HttpResponseHead{99, "OK"}.Serialize()),
+               std::invalid_argument);
+}
+
 TEST(HttpResponseTest, RejectsInvalidBodyModeCombinations) {
   const auto build = [](ResponseBodyMode mode, std::optional<std::size_t> length,
                         std::string body) {

@@ -10,6 +10,8 @@ namespace {
 
 using aegisgate::http::HttpResponseParser;
 using aegisgate::http::ParseResult;
+using aegisgate::http::ResponseBodyMode;
+using aegisgate::http::HttpResponseHead;
 using aegisgate::net::Buffer;
 
 TEST(HttpResponseParserTest, ParsesSegmentedBodyAndLeavesPipelinedResponse) {
@@ -202,6 +204,86 @@ TEST(HttpResponseParserTest, HeadConsumesOnlyHeaderLeavingResidualBody) {
   // never be reused or lent out.
   EXPECT_EQ(input.ReadableView(), "hello");
   EXPECT_TRUE(parser.Response().body.empty());
+}
+
+// --- streaming (header/body split) path ---
+
+TEST(HttpResponseParserTest, ParserEmitsHeaderBeforeBody) {
+  Buffer input;
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+  HttpResponseParser parser;
+
+  EXPECT_EQ(parser.ParseHeaders(input), ParseResult::kComplete);
+  EXPECT_TRUE(parser.HeadersComplete());
+  EXPECT_FALSE(parser.BodyComplete());
+  const HttpResponseHead &head = parser.Head();
+  EXPECT_EQ(head.status, 200);
+  EXPECT_EQ(head.body_mode, ResponseBodyMode::kNormal);
+  ASSERT_TRUE(head.content_length.has_value());
+  EXPECT_EQ(*head.content_length, 5);
+  // The header area is consumed; the body stays for ConsumeBody.
+  EXPECT_EQ(input.ReadableView(), "hello");
+}
+
+TEST(HttpResponseParserTest, ConsumeBodyDeliversSegmentsIncrementally) {
+  HttpResponseParser parser;
+  {
+    Buffer input;
+    input.Append("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello wo");
+    EXPECT_EQ(parser.ParseHeaders(input), ParseResult::kComplete);
+    std::string delivered;
+    auto sink = [&delivered](std::string_view bytes) {
+      delivered.append(bytes.data(), bytes.size());
+      return true;
+    };
+    EXPECT_EQ(parser.ConsumeBody(input, sink), ParseResult::kNeedMoreData);
+    EXPECT_EQ(delivered, "hello wo");
+    EXPECT_FALSE(parser.BodyComplete());
+    input.Append("rld");
+    EXPECT_EQ(parser.ConsumeBody(input, sink), ParseResult::kComplete);
+    EXPECT_EQ(delivered, "hello world");
+    EXPECT_TRUE(parser.BodyComplete());
+    EXPECT_EQ(input.ReadableBytes(), 0);
+  }
+}
+
+TEST(HttpResponseParserTest, DeclinedSinkKeepsChunkInInput) {
+  Buffer input;
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+  HttpResponseParser parser;
+  EXPECT_EQ(parser.ParseHeaders(input), ParseResult::kComplete);
+
+  EXPECT_EQ(parser.ConsumeBody(input, [](std::string_view) { return false; }),
+            ParseResult::kNeedMoreData);
+  // The declined chunk remains available for a later attempt.
+  EXPECT_EQ(input.ReadableView(), "hello");
+  EXPECT_FALSE(parser.BodyComplete());
+}
+
+TEST(HttpResponseParserTest, HeadResponseCompletesWithoutBodySink) {
+  Buffer input;
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nunread");
+  HttpResponseParser parser;
+  parser.Reset(/*response_to_head=*/true);
+
+  EXPECT_EQ(parser.ParseHeaders(input), ParseResult::kComplete);
+  EXPECT_TRUE(parser.BodyComplete());
+  const HttpResponseHead &head = parser.Head();
+  EXPECT_EQ(head.body_mode, ResponseBodyMode::kSuppressedWithKnownLength);
+  ASSERT_TRUE(head.content_length.has_value());
+  EXPECT_EQ(*head.content_length, 5);
+  // HEAD consumes only the header area; residual bytes are not body.
+  EXPECT_EQ(input.ReadableView(), "unread");
+}
+
+TEST(HttpResponseParserTest, Streaming204CompletesWithoutBodySink) {
+  Buffer input;
+  input.Append("HTTP/1.1 204 No Content\r\n\r\n");
+  HttpResponseParser parser;
+  EXPECT_EQ(parser.ParseHeaders(input), ParseResult::kComplete);
+  EXPECT_TRUE(parser.BodyComplete());
+  EXPECT_EQ(parser.Head().body_mode, ResponseBodyMode::kNormal);
+  EXPECT_FALSE(parser.Head().content_length.has_value());
 }
 
 TEST(HttpResponseParserTest, GetStillAwaitsBodyAfterReset) {

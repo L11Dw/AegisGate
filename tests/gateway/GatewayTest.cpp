@@ -400,9 +400,23 @@ TEST(GatewayTest, TotalDeadlineWinsAfterFirstByteOfAnIncompleteResponse) {
   std::thread client([&] {
     net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
     constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
-    constexpr std::string_view response = "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n";
+    // Streaming semantics: the committed head plus the partial body byte are
+    // already on the wire, so the total deadline truncates the connection
+    // instead of replacing them with a 504 status line.
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nx";
     if (WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
-      client_response = ReadExact(socket.Fd(), response.size(), TestDeadline(), client_error);
+      client_response = ReadExact(socket.Fd(), committed.size(), TestDeadline(), client_error);
+    }
+    if (client_error.empty()) {
+      pollfd descriptor{socket.Fd(), POLLIN | POLLHUP, 0};
+      if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+        client_error = "truncated connection did not reach EOF";
+      } else {
+        std::array<char, 8> extra{};
+        if (::read(socket.Fd(), extra.data(), extra.size()) != 0) {
+          client_error = "expected EOF after truncated response";
+        }
+      }
     }
     if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
   });
@@ -412,7 +426,7 @@ TEST(GatewayTest, TotalDeadlineWinsAfterFirstByteOfAnIncompleteResponse) {
 
   EXPECT_TRUE(client_error.empty()) << client_error;
   EXPECT_TRUE(upstream_error.empty()) << upstream_error;
-  EXPECT_EQ(client_response, "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_EQ(client_response, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nx");
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
   EXPECT_EQ(::close(wake_fds[1]), 0);
@@ -449,9 +463,23 @@ TEST(GatewayTest, DoesNotRetryGetAfterACompleteResponseHeader) {
   std::thread client([&] {
     net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
     constexpr std::string_view request = "GET /header HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
-    constexpr std::string_view response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    // Streaming semantics: the validated head is committed downstream as soon
+    // as it arrives, so the body-mid EOF truncates the connection instead of
+    // replacing the committed response with a 502.
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
     if (WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
-      client_response = ReadExact(socket.Fd(), response.size(), TestDeadline(), client_error);
+      client_response = ReadExact(socket.Fd(), committed.size(), TestDeadline(), client_error);
+    }
+    if (client_error.empty()) {
+      pollfd descriptor{socket.Fd(), POLLIN | POLLHUP, 0};
+      if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+        client_error = "truncated connection did not reach EOF";
+      } else {
+        std::array<char, 8> extra{};
+        if (::read(socket.Fd(), extra.data(), extra.size()) != 0) {
+          client_error = "expected EOF after truncated response";
+        }
+      }
     }
     if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
   });
@@ -463,7 +491,7 @@ TEST(GatewayTest, DoesNotRetryGetAfterACompleteResponseHeader) {
   EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "GET with response header retried a second endpoint";
   EXPECT_TRUE(client_error.empty()) << client_error;
   EXPECT_TRUE(first_error.empty()) << first_error;
-  EXPECT_EQ(client_response, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_EQ(client_response, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n");
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
   EXPECT_EQ(::close(wake_fds[1]), 0);
@@ -515,13 +543,32 @@ TEST(GatewayTest, TotalTimeoutCancelsActiveConnectionBeforeTheNextBorrow) {
     net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
     constexpr std::string_view first = "GET /first HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
     constexpr std::string_view second = "GET /second HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
-    constexpr std::string_view timeout = "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n";
+    // Streaming semantics: the committed head plus the partial body byte are
+    // already on the wire, so the total timeout truncates the connection
+    // instead of replacing them with a 504 status line.
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nx";
     constexpr std::string_view success = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     if (WriteAll(socket.Fd(), first, TestDeadline(), client_error)) {
-      responses[0] = ReadExact(socket.Fd(), timeout.size(), TestDeadline(), client_error);
+      responses[0] = ReadExact(socket.Fd(), committed.size(), TestDeadline(), client_error);
     }
-    if (client_error.empty() && WriteAll(socket.Fd(), second, TestDeadline(), client_error)) {
-      responses[1] = ReadExact(socket.Fd(), success.size(), TestDeadline(), client_error);
+    if (client_error.empty()) {
+      pollfd descriptor{socket.Fd(), POLLIN | POLLHUP, 0};
+      if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+        client_error = "truncated connection did not reach EOF";
+      } else {
+        std::array<char, 8> extra{};
+        if (::read(socket.Fd(), extra.data(), extra.size()) != 0) {
+          client_error = "expected EOF after truncated response";
+        }
+      }
+    }
+    // The truncation closed the first connection: the second request runs on
+    // a fresh connection (the gateway borrows a new upstream descriptor).
+    if (client_error.empty()) {
+      net::Socket second_socket = net::Socket::ConnectLoopback(gateway.port());
+      if (WriteAll(second_socket.Fd(), second, TestDeadline(), client_error)) {
+        responses[1] = ReadExact(second_socket.Fd(), success.size(), TestDeadline(), client_error);
+      }
     }
     if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
   });
@@ -531,7 +578,7 @@ TEST(GatewayTest, TotalTimeoutCancelsActiveConnectionBeforeTheNextBorrow) {
 
   EXPECT_TRUE(client_error.empty()) << client_error;
   EXPECT_TRUE(upstream_error.empty()) << upstream_error;
-  EXPECT_EQ(responses[0], "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_EQ(responses[0], "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nx");
   EXPECT_EQ(responses[1], "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
@@ -1791,6 +1838,126 @@ TEST(GatewayTest, GatewayDestructionTerminatesInFlightAttempt) {
 
   // Completion signal: the backend observes the gateway closing the in-flight
   // connection.  The watchdog only pumps the loop as a failure backstop.
+  std::array<int, 2> stop{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop.data()), 0);
+  std::string watchdog_error;
+  std::thread watchdog([&] {
+    pollfd descriptor{stop[0], POLLIN, 0};
+    while (::poll(&descriptor, 1, 100) == 0) {
+      if (::write(wake_fds[1], "q", 1) != 1) {
+        watchdog_error = "watchdog wake failed";
+        return;
+      }
+    }
+  });
+  pollfd gate_descriptor{gate[0], POLLIN, 0};
+  const auto deadline = TestDeadline();
+  while (::poll(&gate_descriptor, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) {
+    loop.Loop();
+  }
+  (void)test::SignalWakeFd(stop[1], 's', watchdog_error);
+  watchdog.join();
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  char closed = '\0';
+  ASSERT_EQ(::read(gate[0], &closed, 1), 1);
+  EXPECT_EQ(closed, 'd');
+  backend.join();
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  wake_channel.Remove();
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(stop[0]), 0);
+  EXPECT_EQ(::close(stop[1]), 0);
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+TEST(GatewayTest, GatewayDestroyDuringStreamingIsSafe) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {endpoint}, 10, 10, 4};
+  route.retry_budget = 0;
+  const config::Config config{{route}};
+
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    constexpr std::string_view request =
+        "GET /v1/x HTTP/1.1\r\nhost: gateway.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    (void)ReadExact(fd, request.size(), TestDeadline(), backend_error);
+    // Start a streaming response: committed header plus a body chunk, then
+    // hold the connection open.  The gateway must terminate the exchange when
+    // destroyed, without waiting for EOF or a timeout.
+    constexpr std::string_view partial =
+        "HTTP/1.1 200 OK\r\nContent-Length: 524288\r\n\r\nstream";
+    if (backend_error.empty() &&
+        ::write(fd, partial.data(), partial.size()) != static_cast<ssize_t>(partial.size())) {
+      backend_error = "failed to write partial response";
+    }
+    if (::write(gate[1], "a", 1) != 1) {
+      backend_error = "accept gate failed";
+      (void)::close(fd);
+      return;
+    }
+    pollfd descriptor{fd, POLLHUP | POLLIN, 0};
+    bool saw_eof = false;
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) > 0) {
+      char byte = '\0';
+      saw_eof = ::recv(fd, &byte, 1, 0) == 0;
+    }
+    if (!saw_eof && backend_error.empty()) {
+      backend_error = "gateway did not close the streaming connection";
+    }
+    (void)::close(fd);
+    if (::write(gate[1], "d", 1) != 1 && backend_error.empty()) {
+      backend_error = "closed gate failed";
+    }
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  auto gateway = std::make_unique<Gateway>(loop, config, "127.0.0.1", 0);
+  gateway->Start();
+
+  std::string client_error;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway->port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    // Read the committed head, leaving the stream mid-body.
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 524288\r\n\r\n";
+    const auto received = ReadExact(socket.Fd(), committed.size(), TestDeadline(), client_error);
+    if (received != committed && client_error.empty()) {
+      client_error = "unexpected streaming head";
+    }
+    // Consume the accept gate so the later 'd' completion signal is next.
+    char accepted = '\0';
+    if (::read(gate[0], &accepted, 1) != 1 || accepted != 'a') {
+      if (client_error.empty()) client_error = "accept gate read failed";
+    }
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+  EXPECT_TRUE(client_error.empty()) << client_error;
+
+  // Destroy the gateway mid-stream: CancelAll must terminate the exchange.
+  gateway.reset();
+
   std::array<int, 2> stop{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop.data()), 0);
   std::string watchdog_error;

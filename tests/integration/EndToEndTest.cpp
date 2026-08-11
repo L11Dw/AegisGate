@@ -155,6 +155,37 @@ int AcceptBlocking(const net::Socket &listener, Deadline deadline) {
   }
 }
 
+// Deadline-bounded accept that reports failure via the shared error string.
+int AcceptUntil(const net::Socket &listener, Deadline deadline, std::string &error) {
+  const int fd = AcceptBlocking(listener, deadline);
+  if (fd < 0 && error.empty()) error = "accept timed out";
+  return fd;
+}
+
+// Deadline-bounded exact read that reports failure via the shared error
+// string; returns std::nullopt on any failure.
+std::optional<std::string> ReadExactUntil(int fd, std::size_t size, Deadline deadline,
+                                          std::string &error) {
+  std::string result(size, '\0');
+  std::size_t received = 0;
+  while (received < size) {
+    pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(deadline)) <= 0) {
+      if (error.empty()) error = "read timed out";
+      return std::nullopt;
+    }
+    const ssize_t count = ::read(fd, result.data() + received, size - received);
+    if (count > 0) {
+      received += static_cast<std::size_t>(count);
+      continue;
+    }
+    if (count < 0 && errno == EINTR) continue;
+    if (error.empty()) error = "unexpected EOF or read error";
+    return std::nullopt;
+  }
+  return result;
+}
+
 class SequencedBackend {
 public:
   explicit SequencedBackend(std::vector<std::string> responses, std::string &error)
@@ -212,14 +243,15 @@ config::Route Route(std::string name, std::string host, config::Endpoint endpoin
 }
 
 template <typename Client>
-void RunGateway(config::Config config, Client client) {
+void RunGateway(config::Config config, Client client,
+                net::StreamFlowControl flow_control = net::StreamFlowControl{}) {
   std::array<int, 2> wake{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake.data()), 0);
   net::EventLoop loop;
   net::Channel wake_channel(loop, wake[0]);
   wake_channel.SetReadCallback([&] { char byte = '\0'; ASSERT_EQ(::read(wake[0], &byte, 1), 1); loop.Quit(); });
   wake_channel.EnableReading();
-  gateway::Gateway gateway(loop, std::move(config), "127.0.0.1", 0);
+  gateway::Gateway gateway(loop, std::move(config), "127.0.0.1", 0, flow_control);
   gateway.Start();
   std::thread client_thread([&] { client(gateway.port(), wake[1]); });
   loop.Loop();
@@ -428,11 +460,17 @@ TEST(EndToEndTest, AllEndpointsUnavailableServesUnique503WithInflightZero) {
         if (error.empty()) error = "expected upstream 503";
       }
     }
+    if (!error.empty() && error == "unexpected EOF or read error") {
+      error += " (first response)";
+    }
     // Open: the gateway answers 503 without connecting or retrying.
     if (error.empty() && WriteAll(client.Fd(), request, TestDeadline(), error)) {
       if (ReadExact(client.Fd(), gateway_fail.size(), TestDeadline(), error) != gateway_fail) {
         if (error.empty()) error = "expected gateway 503 while open";
       }
+    }
+    if (!error.empty() && error == "unexpected EOF or read error") {
+      error += " (second response)";
     }
     if (error.empty() && WriteAll(client.Fd(), "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n",
                                   TestDeadline(), error)) {
@@ -506,6 +544,357 @@ TEST(EndToEndTest, LeastActiveSelectsBackendWithFewestInFlight) {
   fast.Stop();
   EXPECT_TRUE(slow_error.empty()) << slow_error;
   EXPECT_TRUE(fast_error.empty()) << fast_error;
+}
+
+// --- M3-C streaming end to end ---
+
+TEST(EndToEndTest, ConnectionCloseRequestClosesAfterStreamingResponse) {
+  std::string backend_error;
+  SequencedBackend backend({"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"}, backend_error);
+  std::string error;
+  std::string received;
+  RunGateway(config::Config{{Route("close", "close.e2e.test", Endpoint(backend.port()))}},
+             [&](std::uint16_t port, int wake) {
+    net::Socket client = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view request =
+        "GET / HTTP/1.1\r\nHost: close.e2e.test\r\nConnection: close\r\n\r\n";
+    constexpr std::string_view expected = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (WriteAll(client.Fd(), request, TestDeadline(), error)) {
+      received = ReadExact(client.Fd(), expected.size(), TestDeadline(), error);
+    }
+    // R-048: the Connection: close connection must close after the full
+    // streamed response.  This small response drains synchronously, so the
+    // close must happen in FinishResponse() (no pending write re-enters
+    // HandleWrite()).
+    if (error.empty()) {
+      pollfd descriptor{client.Fd(), POLLIN | POLLHUP, 0};
+      if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+        error = "connection stayed open after a Connection: close response";
+      } else {
+        std::array<char, 8> extra{};
+        if (::read(client.Fd(), extra.data(), extra.size()) != 0) {
+          error = "expected EOF after Connection: close response";
+        }
+      }
+    }
+    if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  backend.Stop();
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_EQ(received, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+}
+
+TEST(EndToEndTest, StreamsLargeResponseUnderSlowClient) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  constexpr std::size_t kBodySize = 128 * 1024;
+  std::array<int, 2> signal{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, signal.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    constexpr std::string_view request =
+        "GET /slow HTTP/1.1\r\nhost: slow.e2e.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    const std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                               std::to_string(kBodySize) + "\r\n\r\n";
+    if (backend_error.empty() &&
+        ::write(fd, header.data(), header.size()) != static_cast<ssize_t>(header.size())) {
+      backend_error = "failed to write header";
+    }
+    const std::string body(kBodySize, 'x');
+    std::size_t written = 0;
+    while (backend_error.empty() && written < body.size()) {
+      const ssize_t count = ::write(fd, body.data() + written, body.size() - written);
+      if (count > 0) {
+        written += static_cast<std::size_t>(count);
+        continue;
+      }
+      if (count < 0 && errno == EINTR) continue;
+      if (backend_error.empty()) backend_error = "backend write failed";
+      break;
+    }
+    (void)::close(fd);
+    // The body is fully buffered upstream; the client has read nothing yet.
+    (void)::write(signal[1], "d", 1);
+  });
+
+  config::Route route{"slow", "slow.e2e.test", "/", {Endpoint(listener.BoundPort())}, 100, 100, 8};
+  route.total_timeout_ms = 5000;
+  route.first_byte_timeout_ms = 1000;
+  std::string error;
+  std::string received;
+  // A small hysteresis makes the pause deterministic: the 128 KiB response
+  // far exceeds the 8 KiB high watermark once the kernel send queue (64 KiB)
+  // is saturated by the not-reading client.
+  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+    net::Socket client = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view request = "GET /slow HTTP/1.1\r\nHost: slow.e2e.test\r\n\r\n";
+    if (!WriteAll(client.Fd(), request, TestDeadline(), error)) {
+      (void)::write(wake, "q", 1);
+      return;
+    }
+    // Do not read anything while the whole response is buffered: the gateway
+    // pauses its upstream read above the high watermark instead of timing out
+    // or dropping bytes.  Wait for the backend to finish writing first.
+    pollfd signal_descriptor{signal[0], POLLIN, 0};
+    if (::poll(&signal_descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+      if (error.empty()) error = "backend never finished writing";
+    } else {
+      char byte = '\0';
+      EXPECT_EQ(::read(signal[0], &byte, 1), 1);
+    }
+    // Drain everything: the low-water notification resumes the upstream read
+    // and the complete response arrives exactly once (no loss, no duplicate,
+    // no total timeout while the client was slow).
+    constexpr std::size_t kExpected = 43 + kBodySize;
+    while (error.empty() && received.size() < kExpected) {
+      pollfd descriptor{client.Fd(), POLLIN | POLLHUP, 0};
+      if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+        error = "read timed out draining response";
+        break;
+      }
+      std::array<char, 64 * 1024> bytes{};
+      const ssize_t count = ::read(client.Fd(), bytes.data(), bytes.size());
+      if (count > 0) {
+        received.append(bytes.data(), static_cast<std::size_t>(count));
+        continue;
+      }
+      if (count < 0 && errno == EINTR) continue;
+      error = "unexpected EOF while draining response";
+      break;
+    }
+    // R-046 regression: after the full response, nothing more may arrive.
+    // A pause/resume cycle that re-delivered a retained chunk would inflate
+    // the total beyond kExpected.
+    if (error.empty()) {
+      pollfd descriptor{client.Fd(), POLLIN, 0};
+      while (::poll(&descriptor, 1, 200) > 0) {
+        std::array<char, 4096> bytes{};
+        const ssize_t count = ::read(client.Fd(), bytes.data(), bytes.size());
+        if (count > 0) {
+          received.append(bytes.data(), static_cast<std::size_t>(count));
+          continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        break;
+      }
+    }
+    if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  backend.join();
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_EQ(received.size(), 43 + kBodySize);
+  EXPECT_EQ(received.substr(0, 43),
+            "HTTP/1.1 200 OK\r\nContent-Length: 131072\r\n\r\n");
+  EXPECT_EQ(received.substr(43), std::string(kBodySize, 'x'));
+  EXPECT_EQ(::close(signal[0]), 0);
+  EXPECT_EQ(::close(signal[1]), 0);
+}
+
+TEST(EndToEndTest, CommittedBodyFailureDoesNotRetry) {
+  net::Socket first_listener = net::Socket::ListenLoopback();
+  net::Socket second_listener = net::Socket::ListenLoopback();
+  constexpr std::string_view request =
+      "GET /fail HTTP/1.1\r\nhost: fail.e2e.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string first_error;
+  std::thread first_backend([&] {
+    const int fd = AcceptUntil(first_listener, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), first_error);
+    constexpr std::string_view partial = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    if (first_error.empty() &&
+        ::write(fd, partial.data(), partial.size()) != static_cast<ssize_t>(partial.size())) {
+      first_error = "failed to write partial response";
+    }
+    (void)::close(fd);
+  });
+
+  config::Route route{"fail", "fail.e2e.test", "/",
+                      {Endpoint(first_listener.BoundPort()), Endpoint(second_listener.BoundPort())},
+                      100, 100, 8};
+  route.retry_budget = 1;
+  std::string error;
+  std::string received;
+  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+    net::Socket client = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view inbound = "GET /fail HTTP/1.1\r\nHost: fail.e2e.test\r\n\r\n";
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    if (WriteAll(client.Fd(), inbound, TestDeadline(), error)) {
+      received = ReadExact(client.Fd(), committed.size(), TestDeadline(), error);
+    }
+    if (error.empty()) {
+      pollfd descriptor{client.Fd(), POLLIN | POLLHUP, 0};
+      if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+        error = "truncated connection did not reach EOF";
+      } else {
+        std::array<char, 8> extra{};
+        if (::read(client.Fd(), extra.data(), extra.size()) != 0) {
+          error = "expected EOF after truncated response";
+        }
+      }
+    }
+    if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  first_backend.join();
+  pollfd descriptor{second_listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "committed body failure retried a second endpoint";
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_EQ(received, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart");
+}
+
+TEST(EndToEndTest, ClientDisconnectStopsUpstreamRead) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  constexpr std::size_t kBodySize = 512 * 1024;
+  std::array<int, 2> signal{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, signal.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    constexpr std::string_view request =
+        "GET /disconnect HTTP/1.1\r\nhost: disconnect.e2e.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    const std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                               std::to_string(kBodySize) + "\r\n\r\n";
+    if (backend_error.empty() &&
+        ::write(fd, header.data(), header.size()) != static_cast<ssize_t>(header.size())) {
+      backend_error = "failed to write header";
+    }
+    const std::string chunk(64 * 1024, 'd');
+    std::size_t written = 0;
+    while (backend_error.empty() && written < kBodySize) {
+      const std::size_t want = std::min(chunk.size(), kBodySize - written);
+      const ssize_t count = ::write(fd, chunk.data(), want);
+      if (count > 0) {
+        written += static_cast<std::size_t>(count);
+        continue;
+      }
+      if (count < 0 && errno == EINTR) continue;
+      break;  // EAGAIN (gateway paused) or EPIPE (gateway cancelled)
+    }
+    // The gateway must cancel the exchange once the client is gone.
+    pollfd descriptor{fd, POLLHUP | POLLIN, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+      if (backend_error.empty()) backend_error = "gateway did not close cancelled upstream";
+    } else {
+      char byte = '\0';
+      const ssize_t count = ::recv(fd, &byte, 1, 0);
+      const bool closed = count == 0 || (count < 0 && (errno == ECONNRESET || errno == EPIPE));
+      if (!closed && backend_error.empty()) backend_error = "expected EOF on cancelled upstream";
+    }
+    (void)::close(fd);
+    (void)::write(signal[1], "c", 1);
+  });
+
+  config::Route route{"disconnect", "disconnect.e2e.test", "/",
+                      {Endpoint(listener.BoundPort())}, 100, 100, 8};
+  route.total_timeout_ms = 5000;
+  std::string error;
+  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+    net::Socket client = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view inbound = "GET /disconnect HTTP/1.1\r\nHost: disconnect.e2e.test\r\n\r\n";
+    if (!WriteAll(client.Fd(), inbound, TestDeadline(), error)) {
+      (void)::write(wake, "q", 1);
+      return;
+    }
+    // Wait for the response head to reach the kernel (the stream is
+    // committed), then reset the connection WITHOUT reading: the gateway's
+    // downstream write stays pending, so the reset is observable there and
+    // must cancel the upstream exchange.
+    pollfd descriptor{client.Fd(), POLLIN | POLLHUP, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+      if (error.empty()) error = "no response bytes arrived";
+    }
+    struct linger reset = {1, 0};
+    (void)::setsockopt(client.Fd(), SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    (void)::close(client.Fd());
+    // The backend must observe the gateway closing the upstream exchange.
+    pollfd signal_descriptor{signal[0], POLLIN, 0};
+    if (::poll(&signal_descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+      if (error.empty()) error = "upstream was not cancelled after client reset";
+    } else {
+      char byte = '\0';
+      EXPECT_EQ(::read(signal[0], &byte, 1), 1);
+    }
+    if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  backend.join();
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_EQ(::close(signal[0]), 0);
+  EXPECT_EQ(::close(signal[1]), 0);
+}
+
+TEST(EndToEndTest, UpstreamReuseIsIndependentOfDownstreamDrain) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  constexpr std::string_view request =
+      "GET /reuse HTTP/1.1\r\nhost: reuse.e2e.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    constexpr std::string_view first_response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (backend_error.empty() &&
+        ::write(fd, first_response.data(), first_response.size()) !=
+            static_cast<ssize_t>(first_response.size())) {
+      backend_error = "failed to write first response";
+    }
+    // The same upstream connection serves the second request while the first
+    // client has not yet read its response bytes off the wire.
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    constexpr std::string_view second_response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone";
+    if (backend_error.empty() &&
+        ::write(fd, second_response.data(), second_response.size()) !=
+            static_cast<ssize_t>(second_response.size())) {
+      backend_error = "failed to write second response";
+    }
+    (void)::close(fd);
+  });
+
+  config::Route route{"reuse", "reuse.e2e.test", "/", {Endpoint(listener.BoundPort())}, 100, 100, 8};
+  std::string error;
+  std::string first_wire;
+  std::string second_wire;
+  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+    net::Socket first_client = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view inbound = "GET /reuse HTTP/1.1\r\nHost: reuse.e2e.test\r\n\r\n";
+    if (!WriteAll(first_client.Fd(), inbound, TestDeadline(), error)) {
+      (void)::write(wake, "q", 1);
+      return;
+    }
+    // The first response arriving in the kernel means the gateway has read
+    // the whole upstream body and returned the connection to the idle pool.
+    // Do NOT read the bytes off the wire yet: the second request must reuse
+    // the upstream descriptor while the first client's wire is still pending.
+    pollfd first_check{first_client.Fd(), POLLIN | POLLHUP, 0};
+    if (::poll(&first_check, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+      if (error.empty()) error = "first response never reached the gateway output";
+    }
+    net::Socket second_client = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view second_expected = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone";
+    if (error.empty() && WriteAll(second_client.Fd(), inbound, TestDeadline(), error)) {
+      second_wire = ReadExact(second_client.Fd(), second_expected.size(), TestDeadline(), error);
+    }
+    constexpr std::string_view first_expected = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (error.empty()) {
+      first_wire = ReadExact(first_client.Fd(), first_expected.size(), TestDeadline(), error);
+    }
+    if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  backend.join();
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_EQ(first_wire, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+  EXPECT_EQ(second_wire, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone");
+  // The backend accepted exactly one connection: the idle upstream descriptor
+  // was reused while the first client's response was still undelivered.
+  pollfd descriptor{listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "second request opened a new upstream connection";
 }
 
 } // namespace
