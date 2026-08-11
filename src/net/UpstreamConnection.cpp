@@ -44,7 +44,8 @@ void UpstreamConnection::Start(const http::HttpRequest &request) {
     state_ = State::kWriting;
     // An idle pooled descriptor completed its TCP handshake on a prior
     // exchange.  Its new transaction must still clear the connect deadline.
-    if (progress_callback_) progress_callback_(UpstreamProgress::kConnected);
+    const ProgressCallback progress = progress_callback_;
+    if (progress) progress(UpstreamProgress::kConnected);
     channel_->EnableWriting();
     HandleWrite();
     return;
@@ -81,6 +82,11 @@ void UpstreamConnection::SetProgressCallback(ProgressCallback callback) {
   progress_callback_ = std::move(callback);
 }
 
+void UpstreamConnection::SuppressCallbacks() noexcept {
+  callback_ = nullptr;
+  progress_callback_ = nullptr;
+}
+
 bool UpstreamConnection::Reusable() const noexcept { return state_ == State::kIdle && reusable_; }
 
 bool UpstreamConnection::HealthyForReuse() noexcept {
@@ -115,12 +121,14 @@ void UpstreamConnection::HandleRead() {
       input_.Append(std::string_view(bytes.data(), static_cast<std::size_t>(count)));
       if (!first_byte_reported_) {
         first_byte_reported_ = true;
-        if (progress_callback_) progress_callback_(UpstreamProgress::kFirstByte);
+        const ProgressCallback progress = progress_callback_;
+        if (progress) progress(UpstreamProgress::kFirstByte);
       }
       const auto parse_result = parser_.Parse(input_);
       if (parser_.HeadersComplete() && !response_header_reported_) {
         response_header_reported_ = true;
-        if (progress_callback_) progress_callback_(UpstreamProgress::kResponseHeader);
+        const ProgressCallback progress = progress_callback_;
+        if (progress) progress(UpstreamProgress::kResponseHeader);
       }
       switch (parse_result) {
       case http::ParseResult::kNeedMoreData:
@@ -161,7 +169,8 @@ void UpstreamConnection::HandleWrite() {
       return;
     }
     state_ = State::kWriting;
-    if (progress_callback_) progress_callback_(UpstreamProgress::kConnected);
+    const ProgressCallback progress = progress_callback_;
+    if (progress) progress(UpstreamProgress::kConnected);
   }
   if (state_ != State::kWriting) return;
 
@@ -186,7 +195,8 @@ void UpstreamConnection::HandleWrite() {
   // The first-byte deadline begins only once the complete serialized request
   // has reached the kernel. A backpressured send must remain a write/connect
   // concern, not be misreported as an origin first-byte timeout.
-  if (progress_callback_) progress_callback_(UpstreamProgress::kRequestWritten);
+  const ProgressCallback progress = progress_callback_;
+  if (progress) progress(UpstreamProgress::kRequestWritten);
   channel_->EnableReading();
 }
 
@@ -200,6 +210,9 @@ void UpstreamConnection::Finish(UpstreamResult result) {
   if (keep_alive) {
     reusable_ = true;
     state_ = State::kIdle;
+    // The exchange is over: drop the transaction-holding progress callback so
+    // an idle pooled connection cannot retain the transaction (R-043).
+    progress_callback_ = nullptr;
     if (channel_) {
       try { channel_->DisableAll(); } catch (...) { Close(); }
     }

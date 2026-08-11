@@ -266,7 +266,7 @@ Route ParseRoute(const YAML::Node &node) {
                                  {"name", "host", "path_prefix", "endpoints", "rate_limit", "burst",
                                   "max_inflight", "connect_timeout_ms", "first_byte_timeout_ms",
                                   "total_timeout_ms", "retry_budget", "circuit_breaker",
-                                  "health_check"},
+                                  "health_check", "balance"},
                                  "route");
   Route route{RequireString(RequireField(fields, "name", "route"), "route name"),
               RequireString(RequireField(fields, "host", "route"), "route host"),
@@ -295,12 +295,32 @@ Route ParseRoute(const YAML::Node &node) {
   if (const auto health = fields.find("health_check"); health != fields.end()) {
     route.health_check = ParseHealthCheck(health->second);
   }
+  if (const auto balance = fields.find("balance"); balance != fields.end()) {
+    const std::string value = RequireString(balance->second, "route balance");
+    if (value == "weighted_round_robin") {
+      route.balance = BalancePolicy::kWeightedRoundRobin;
+    } else if (value == "least_active") {
+      route.balance = BalancePolicy::kLeastActive;
+    } else {
+      Invalid("invalid route balance: " + value);
+    }
+  }
   if (!IsValidRouteHost(route.host)) Invalid("invalid route host");
   if (!IsValidPathPrefix(route.path_prefix)) Invalid("invalid route path_prefix");
   const YAML::Node &endpoints = RequireField(fields, "endpoints", "route");
   if (!endpoints.IsSequence() || endpoints.size() == 0) Invalid("empty or invalid endpoints");
   route.endpoints.reserve(endpoints.size());
   for (const auto &endpoint : endpoints) route.endpoints.push_back(ParseEndpoint(endpoint));
+  // Address + port is the logical identity of every runtime state within a
+  // route; a duplicate would make health/breaker/active lookups ambiguous.
+  for (std::size_t first = 0; first < route.endpoints.size(); ++first) {
+    for (std::size_t second = first + 1; second < route.endpoints.size(); ++second) {
+      if (route.endpoints[first].address == route.endpoints[second].address &&
+          route.endpoints[first].port == route.endpoints[second].port) {
+        Invalid("duplicate endpoint address and port");
+      }
+    }
+  }
   return route;
 }
 

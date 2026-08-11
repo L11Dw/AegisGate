@@ -91,8 +91,10 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
                                    std::shared_ptr<resilience::RouteAdmission> admission,
                                    net::TimerQueue *timers, UpstreamPolicy policy,
                                    std::shared_ptr<observability::Metrics> metrics,
-                                   std::string route_name, AttemptProvider attempt_provider)
+                                   std::string route_name, AttemptProvider attempt_provider,
+                                   std::optional<std::weak_ptr<void>> gateway_lifetime)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
+      gateway_lifetime_(std::move(gateway_lifetime)),
       endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
       metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
       timers_(timers), attempt_provider_(std::move(attempt_provider)),
@@ -115,17 +117,26 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         std::shared_ptr<resilience::RouteAdmission> admission,
                         net::TimerQueue *timers, UpstreamPolicy policy,
                         std::shared_ptr<observability::Metrics> metrics, std::string route_name,
-                        AttemptProvider attempt_provider) {
+                        AttemptProvider attempt_provider,
+                        std::optional<std::weak_ptr<void>> gateway_lifetime) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
       loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
       timers, std::move(policy), std::move(metrics), std::move(route_name),
-      std::move(attempt_provider)));
+      std::move(attempt_provider), std::move(gateway_lifetime)));
   transaction->Begin();
   return transaction;
 }
 
 void ProxyTransaction::Begin() {
+  // The gateway may already be down (e.g. an expired lifetime token passed to
+  // Start): touch nothing of it — no metrics, no admission slot, no timers_,
+  // no provider, no connect.  The transaction stays terminal and its RAII
+  // members release nothing.
+  if (GatewayDown()) {
+    finished_ = true;
+    return;
+  }
   if (metrics_) {
     try {
       metric_request_ = metrics_->BeginRequest(route_name_);
@@ -148,6 +159,10 @@ void ProxyTransaction::Begin() {
 }
 
 bool ProxyTransaction::StartUpstream() {
+  // The owning gateway may have been destroyed while this attempt was queued
+  // or retried; nothing of the gateway (timers, provider, pool wiring) may be
+  // touched then.  Returning false reuses the "no candidate" terminal path.
+  if (GatewayDown()) return false;
   CancelAttemptDeadlines();
   ++generation_;
   connected_ = false;
@@ -156,14 +171,19 @@ bool ProxyTransaction::StartUpstream() {
   // (freshly per retry).  No candidate means do not connect.
   breaker_link_.reset();
   if (attempt_provider_) {
-    const auto selection = attempt_provider_();
+    auto selection = attempt_provider_();
     if (!selection.has_value()) {
       // No candidate is not a new attempt: the previous attempt's guard and
-      // accounting stay as they are.
+      // accounting stay as they are (the old attempt already released its
+      // active slot at its terminal point before the retry was queued).
       return false;
     }
     endpoint_ = *selection->endpoint;
     breaker_link_ = selection->link;
+    // Install the new attempt's active slot.  The previous slot is already
+    // empty (released at the old attempt's terminal), so this move-assignment
+    // releases nothing.
+    active_reservation_ = std::move(selection->active);
     attempt_accounted_ = false;
   } else {
     attempt_accounted_ = false;
@@ -226,7 +246,9 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
     // This attempt failed inside the safe retry window; account it once
     // before starting the replacement.  Both UpstreamConnection::Finish and
     // UpstreamPool::Complete are still executing their callback stack, so
-    // the replacement starts after this epoll batch.
+    // the replacement starts after this epoll batch.  The ended attempt's
+    // active slot returns before the replacement is queued.
+    active_reservation_.Release();
     if (client_lifetime_.lock()) AccountFailure();
     const auto self = shared_from_this();
     loop_.QueueAfterCurrentBatch([self] {
@@ -242,6 +264,7 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   finished_ = true;
   CancelDeadlines();
   reservation_.reset();
+  active_reservation_.Release();
   // UpstreamConnection can complete synchronously from Start().  Do not
   // destroy that object while its Start()/Finish() stack frame is active.
   if (!starting_upstream_) upstream_.reset();
@@ -315,6 +338,7 @@ void ProxyTransaction::FinishFailure() {
   ++generation_;
   CancelDeadlines();
   reservation_.reset();
+  active_reservation_.Release();
   // The upstream exchange already completed with a terminal failure, so its
   // descriptor is closed; only the owned object remains to be released.  When
   // Start() finished synchronously on its own stack frame, releasing here
@@ -333,6 +357,7 @@ void ProxyTransaction::FinishFailure() {
 
 void ProxyTransaction::HandleProgress(net::UpstreamProgress progress) {
   if (finished_) return;
+  if (GatewayDown()) return;  // the gateway's TimerQueue may be gone
   if (progress == net::UpstreamProgress::kConnected) {
     connected_ = true;
     if (timers_ && connect_timer_ != 0) (void)timers_->Cancel(connect_timer_);
@@ -379,6 +404,7 @@ void ProxyTransaction::ArmTotalDeadline() {
 }
 
 void ProxyTransaction::CancelDeadlines() {
+  if (GatewayDown()) return;  // the gateway's TimerQueue is destroyed
   if (!timers_) return;
   CancelAttemptDeadlines();
   if (total_timer_ != 0) (void)timers_->Cancel(total_timer_);
@@ -386,6 +412,7 @@ void ProxyTransaction::CancelDeadlines() {
 }
 
 void ProxyTransaction::CancelAttemptDeadlines() {
+  if (GatewayDown()) return;  // the gateway's TimerQueue is destroyed
   if (!timers_) return;
   for (auto *timer : {&connect_timer_, &first_byte_timer_}) {
     if (*timer != 0) (void)timers_->Cancel(*timer);
@@ -443,6 +470,7 @@ void ProxyTransaction::FinishGatewayTimeout() {
   ++generation_;
   CancelDeadlines();
   reservation_.reset();
+  active_reservation_.Release();
   CompleteMetric(504);
   if (pool_ && active_connection_) (void)pool_->Cancel(active_connection_);
   active_connection_ = nullptr;

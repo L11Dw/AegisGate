@@ -17,6 +17,7 @@
 #include "aegisgate/observability/Metrics.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/resilience/InflightLimiter.h"
+#include "aegisgate/routing/ActiveReservation.h"
 
 namespace aegisgate::net {
 class ClientConnection;
@@ -55,10 +56,13 @@ public:
     resilience::CircuitBreaker::RequestPermit permit;
   };
   // The outcome of choosing one upstream attempt: an eligible endpoint plus
-  // its breaker link (absent when the route has no breaker).
+  // its breaker link (absent when the route has no breaker) plus the active
+  // slot it holds.  The reservation is released exactly once when the attempt
+  // terminates; a selection is only constructed when an attempt starts.
   struct AttemptSelection {
     const config::Endpoint *endpoint;
     std::optional<BreakerLink> link;
+    routing::ActiveReservation active;
   };
   // Chooses the endpoint for the initial attempt and for every retry, so
   // unhealthy or open candidates are never connected to.  nullopt means no
@@ -72,7 +76,8 @@ public:
                         std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
         net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
         std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {},
-        AttemptProvider attempt_provider = {});
+        AttemptProvider attempt_provider = {},
+        std::optional<std::weak_ptr<void>> gateway_lifetime = std::nullopt);
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -84,9 +89,15 @@ private:
                    std::shared_ptr<resilience::RouteAdmission> admission,
                    net::TimerQueue *timers, UpstreamPolicy policy,
                    std::shared_ptr<observability::Metrics> metrics, std::string route_name,
-                   AttemptProvider attempt_provider);
+                   AttemptProvider attempt_provider,
+                   std::optional<std::weak_ptr<void>> gateway_lifetime);
 
   void Begin();
+  // True when the owning gateway has been destroyed.  nullopt (no gateway)
+  // means the caller guarantees the timers/provider lifetime.
+  [[nodiscard]] bool GatewayDown() const noexcept {
+    return gateway_lifetime_.has_value() && gateway_lifetime_->expired();
+  }
   [[nodiscard]] bool StartUpstream();
   void FinishNoEndpoint();
   void HandleProgress(net::UpstreamProgress progress);
@@ -112,6 +123,7 @@ private:
   net::EventLoop &loop_;
   net::ClientConnection *client_;
   std::weak_ptr<void> client_lifetime_;
+  std::optional<std::weak_ptr<void>> gateway_lifetime_;
   std::uint16_t upstream_port_;
   std::optional<config::Endpoint> endpoint_;
   http::HttpRequest request_;
@@ -121,6 +133,10 @@ private:
   std::string route_name_;
   observability::Metrics::RequestHandle metric_request_;
   std::optional<BreakerLink> breaker_link_;
+  // One active-attempt slot per upstream attempt: acquired by the provider,
+  // released at the attempt's terminal point (see the design lifecycle
+  // matrix).  Release is idempotent; an empty guard is a safe no-op.
+  routing::ActiveReservation active_reservation_;
   // One-shot guard: each upstream attempt may account its outcome at most
   // once, even when the retry fallback terminates the same attempt.
   bool attempt_accounted_ = false;

@@ -1,5 +1,6 @@
 #include "aegisgate/proxy/UpstreamPool.h"
 
+#include <cassert>
 #include <stdexcept>
 #include <utility>
 
@@ -55,6 +56,35 @@ bool UpstreamPool::Cancel(net::UpstreamConnection *connection) noexcept {
   active->second->Close();
   active_.erase(active);
   return true;
+}
+
+void UpstreamPool::CancelAll() noexcept {
+  // Contract: callable only from the EventLoop owner thread (the gateway
+  // teardown path runs on that thread as well).  A non-owner call would race
+  // on dispatching_event_ and active_; debug builds reject it outright.
+  assert(loop_.IsOwnerThread());
+  // Take ownership of every active exchange immediately and suppress both
+  // callbacks (logical cancellation: no terminal result, no progress event,
+  // and the response callback's captured transaction is released via RAII).
+  auto pending = std::make_shared<std::vector<Connection>>();
+  for (auto &[connection, owned] : active_) {
+    (void)connection;
+    pending->push_back(std::move(owned));
+  }
+  active_.clear();
+  for (auto &connection : *pending) connection->SuppressCallbacks();
+  // Closing inside a Channel::HandleEvent stack would destroy the currently
+  // dispatching Channel; defer the actual Close to the end of this epoll batch
+  // (the deferred closure owns the connections).  Outside a callback stack the
+  // close is safe immediately.
+  if (loop_.IsDispatchingEvent()) {
+    loop_.QueueAfterCurrentBatch([pending] {
+      for (auto &connection : *pending) connection->Close();
+      pending->clear();
+    });
+  } else {
+    for (auto &connection : *pending) connection->Close();
+  }
 }
 
 std::size_t UpstreamPool::IdleCount(const config::Endpoint &endpoint) const noexcept {

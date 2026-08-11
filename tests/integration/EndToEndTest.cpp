@@ -448,5 +448,65 @@ TEST(EndToEndTest, AllEndpointsUnavailableServesUnique503WithInflightZero) {
   EXPECT_NE(metrics.find("aegisgate_inflight_requests 0\n"), std::string::npos);
 }
 
+TEST(EndToEndTest, LeastActiveSelectsBackendWithFewestInFlight) {
+  // The slow backend holds its request for 400ms; with equal weights the
+  // rotation would send the third request back to it, but least-active keeps
+  // it on the fast backend while the slow attempt is still in flight.
+  std::string slow_error;
+  std::string fast_error;
+  BackendRunner slow(mock::MockBackendOptions{.status = 503,
+                                              .delay = std::chrono::milliseconds(400)},
+                     slow_error);
+  BackendRunner fast(mock::MockBackendOptions{.status = 200}, fast_error);
+  config::Route route = Route("least", "least.e2e.test", Endpoint(slow.port()));
+  route.balance = config::BalancePolicy::kLeastActive;
+  route.endpoints.push_back(Endpoint(fast.port()));
+  route.first_byte_timeout_ms = 800;
+  std::string error;
+  std::string slow_response;
+  std::string fast_response;
+  std::string third_response;
+  std::string metrics;
+  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+    constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: least.e2e.test\r\n\r\n";
+    constexpr std::string_view slow_expected =
+        "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n";
+    constexpr std::string_view fast_expected =
+        "HTTP/1.1 200 Mock Response\r\nContent-Length: 0\r\n\r\n";
+    net::Socket slow_client = net::Socket::ConnectLoopback(port);
+    if (WriteAll(slow_client.Fd(), request, TestDeadline(), error)) {
+      // The first request occupies the slow endpoint's active slot; both
+      // follow-up requests must land on the fast endpoint.
+      net::Socket fast_client = net::Socket::ConnectLoopback(port);
+      if (error.empty() && WriteAll(fast_client.Fd(), request, TestDeadline(), error)) {
+        fast_response = ReadExact(fast_client.Fd(), fast_expected.size(), TestDeadline(), error);
+      }
+      if (error.empty() && WriteAll(fast_client.Fd(), request, TestDeadline(), error)) {
+        third_response = ReadExact(fast_client.Fd(), fast_expected.size(), TestDeadline(), error);
+      }
+      slow_response = ReadExact(slow_client.Fd(), slow_expected.size(), TestDeadline(), error);
+    }
+    constexpr std::string_view metrics_request = "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n";
+    if (error.empty() && WriteAll(slow_client.Fd(), metrics_request, TestDeadline(), error)) {
+      metrics = ReadUntil(slow_client.Fd(), "aegisgate_inflight_requests 0\n", TestDeadline(), error);
+    }
+    if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_EQ(slow_response, "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_EQ(fast_response, "HTTP/1.1 200 Mock Response\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_EQ(third_response, "HTTP/1.1 200 Mock Response\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_NE(metrics.find("aegisgate_requests_total{route=\"least\",status=\"200\",upstream=\"127.0.0.1:" +
+                         std::to_string(fast.port()) + "\"} 2\n"),
+            std::string::npos);
+  EXPECT_NE(metrics.find("aegisgate_requests_total{route=\"least\",status=\"503\",upstream=\"127.0.0.1:" +
+                         std::to_string(slow.port()) + "\"} 1\n"),
+            std::string::npos);
+  slow.Stop();
+  fast.Stop();
+  EXPECT_TRUE(slow_error.empty()) << slow_error;
+  EXPECT_TRUE(fast_error.empty()) << fast_error;
+}
+
 } // namespace
 } // namespace aegisgate::integration

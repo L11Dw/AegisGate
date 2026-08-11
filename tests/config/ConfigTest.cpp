@@ -405,4 +405,91 @@ TEST(ConfigTest, DefaultsToDisabledWithoutHealthOrBreakerConfig) {
   EXPECT_FALSE(route.circuit_breaker.has_value());
   EXPECT_FALSE(route.health_check.has_value());
 }
+
+TEST(ConfigTest, AcceptsLeastActiveBalancePolicy) {
+  const Config config = LoadFromYaml(R"yaml(
+routes:
+  - name: least
+    host: la.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+    balance: least_active
+)yaml");
+  ASSERT_EQ(config.routes.size(), 1U);
+  EXPECT_EQ(config.routes.front().balance, BalancePolicy::kLeastActive);
+}
+
+TEST(ConfigTest, DefaultsToWeightedRoundRobinWithoutBalance) {
+  const Config config = LoadFromYaml(kValidConfig);
+  EXPECT_EQ(config.routes.front().balance, BalancePolicy::kWeightedRoundRobin);
+}
+
+TEST(ConfigTest, AcceptsExplicitWeightedRoundRobin) {
+  const Config config = LoadFromYaml(R"yaml(
+routes:
+  - name: wrr
+    host: wrr.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+    balance: weighted_round_robin
+)yaml");
+  EXPECT_EQ(config.routes.front().balance, BalancePolicy::kWeightedRoundRobin);
+}
+
+// Guard test: unknown and mixed-case balance values must keep rejecting startup
+// once "balance" becomes a known field.  Initially green because unknown route
+// fields are already rejected today.
+TEST(ConfigTest, RejectsUnknownAndMixedCaseBalance) {
+  const auto invalid = [](std::string_view extra) {
+    return LoadFromYaml(std::string(R"yaml(
+routes:
+  - name: bad
+    host: bad.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+)yaml") + std::string(extra));
+  };
+  EXPECT_THROW(invalid("    balance: Least_Active\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    balance: round_robin\n"), std::invalid_argument);
+}
+
+TEST(ConfigTest, RejectsDuplicateEndpointsInRoute) {
+  const auto load = [] {
+    return LoadFromYaml(R"yaml(
+routes:
+  - name: dup
+    host: dup.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+)yaml");
+  };
+  EXPECT_THROW(load(), std::invalid_argument);
+}
 } // namespace aegisgate::config

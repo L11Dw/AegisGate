@@ -50,6 +50,11 @@ public:
   void Start(const http::HttpRequest &request);
   void SetResponseCallback(ResponseCallback callback);
   void SetProgressCallback(ProgressCallback callback);
+  // Logically cancels the exchange: both callbacks are cleared so neither a
+  // terminal result nor a progress event is delivered (the response callback
+  // may hold a transaction's shared_ptr).  Safe to call from inside either
+  // callback's stack because invocation sites copy the callback first.
+  void SuppressCallbacks() noexcept;
   void Close() noexcept;
   [[nodiscard]] bool Reusable() const noexcept;
   // Re-probes an idle descriptor immediately before a pool lends it. Any EOF,

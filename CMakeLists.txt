@@ -21,6 +21,7 @@ add_library(aegisgate STATIC
     src/net/UpstreamConnection.cpp
     src/proxy/ProxyTransaction.cpp
     src/proxy/UpstreamPool.cpp
+    src/routing/ActiveReservation.cpp
     src/routing/RouteTable.cpp
     src/routing/WeightedRoundRobin.cpp
     src/resilience/InflightLimiter.cpp
