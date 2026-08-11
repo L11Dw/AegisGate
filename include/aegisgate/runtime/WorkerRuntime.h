@@ -49,18 +49,31 @@ public:
   // throwing task is absorbed so the dispatch loop and the stop decision
   // survive it.
   [[nodiscard]] bool Post(std::function<void()> task);
+  // Posts a task that receives the worker's own EventLoop reference when it
+  // runs, so loop-attached objects (TimerQueue, Channels) can be constructed
+  // and destroyed on their owner thread.  Same acceptance rules as Post().
+  [[nodiscard]] bool PostWithLoop(std::function<void(net::EventLoop &)> task);
 
 private:
+  struct Task {
+    std::function<void()> plain;
+    std::function<void(net::EventLoop &)> with_loop;
+    Task() = default;
+    explicit Task(std::function<void()> value) : plain(std::move(value)) {}
+    explicit Task(std::function<void(net::EventLoop &)> value) : with_loop(std::move(value)) {}
+  };
+
   void Run();
   void HandleWake(net::EventLoop &loop);
-  void DrainQueue();
+  void DrainQueue(net::EventLoop &loop);
+  [[nodiscard]] bool PostTask(Task task);
 
   std::size_t task_capacity_;
   // Owned by this object; written by the worker thread only during stop.
   // -1 means closed.  Exchanged atomically so close is exactly once.
   std::atomic<int> wake_fd_;
   std::mutex queue_mutex_;
-  std::deque<std::function<void()>> tasks_;
+  std::deque<Task> tasks_;
   std::atomic_bool started_{false};
   std::atomic_bool stopping_{false};
   std::atomic<std::thread::id> owner_thread_{};

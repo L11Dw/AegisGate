@@ -79,6 +79,9 @@ struct Route {
 
 struct Config {
   std::vector<Route> routes;
+  // Number of I/O workers.  One preserves the pre-M3-D single-loop behavior;
+  // zero or an absurdly large value is rejected at parse time.
+  std::uint32_t workers = 1;
 };
 
 // Parses the fixed startup configuration schema.  Any malformed or unsupported

@@ -11,6 +11,7 @@ add_executable(aegisgate_tests
     proxy/ProxyTransactionTest.cpp
     proxy/UpstreamPoolTest.cpp
     runtime/WorkerRuntimeTest.cpp
+    runtime/WorkerSetTest.cpp
     gateway/GatewayTest.cpp
     config/ConfigTest.cpp
     routing/ActiveReservationTest.cpp

@@ -329,11 +329,17 @@ Route ParseRoute(const YAML::Node &node) {
 Config LoadFromYaml(std::string_view yaml) {
   try {
     const YAML::Node document = YAML::Load(std::string(yaml));
-    const auto top_level = ReadObject(document, {"routes"}, "top-level");
+    const auto top_level = ReadObject(document, {"routes", "workers"}, "top-level");
     const YAML::Node &routes = RequireField(top_level, "routes", "top-level");
     if (!routes.IsSequence() || routes.size() == 0) Invalid("empty or invalid routes");
 
     Config config;
+    // 1 preserves the single-loop behavior; a workers field of zero or more
+    // than 1024 would be a misconfiguration (thread explosion).
+    config.workers = 1;
+    if (const auto worker = top_level.find("workers"); worker != top_level.end()) {
+      config.workers = RequirePositiveUnsigned(worker->second, "workers", 1024);
+    }
     config.routes.reserve(routes.size());
     std::unordered_set<std::string> names;
     std::unordered_set<std::string> match_keys;

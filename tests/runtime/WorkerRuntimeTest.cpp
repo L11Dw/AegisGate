@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "aegisgate/net/EventLoop.h"
 #include "aegisgate/runtime/WorkerRuntime.h"
 
 #include "../support/WakeFd.h"
@@ -272,6 +273,74 @@ TEST(WorkerRuntimeTest, PostsFromMultipleThreadsAllExecute) {
 
 TEST(WorkerRuntimeTest, RejectsZeroTaskCapacity) {
   EXPECT_THROW(WorkerRuntime(0), std::invalid_argument);
+}
+
+// A loop-bound task receives the worker's own EventLoop reference and runs on
+// the worker thread, so loop-attached objects (TimerQueue, Channels) can be
+// constructed and destroyed on their owner thread.
+TEST(WorkerRuntimeTest, PostWithLoopRunsOnWorkerLoop) {
+  std::array<int, 2> done{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, done.data()), 0);
+  std::string error;
+  std::mutex mutex;
+  bool ran = false;
+  bool ran_on_loop_owner = false;
+  std::thread::id looped_id{};
+  std::thread::id plain_id{};
+  WorkerRuntime worker;
+  worker.Start();
+  ASSERT_TRUE(worker.PostWithLoop([&](net::EventLoop &loop) {
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      ran = true;
+      ran_on_loop_owner = loop.IsOwnerThread();
+      looped_id = std::this_thread::get_id();
+    }
+    (void)test::SignalWakeFd(done[1], 'd', error);
+  }));
+  ASSERT_TRUE(WaitFor(done[0], POLLIN, TestDeadline()));
+  char byte = '\0';
+  ASSERT_EQ(::read(done[0], &byte, 1), 1);
+  // A plain task runs on the same worker thread as the loop-bound task.
+  ASSERT_TRUE(worker.Post([&] {
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      plain_id = std::this_thread::get_id();
+    }
+    (void)test::SignalWakeFd(done[1], 'd', error);
+  }));
+  ASSERT_TRUE(WaitFor(done[0], POLLIN, TestDeadline()));
+  ASSERT_EQ(::read(done[0], &byte, 1), 1);
+  worker.Stop();
+  EXPECT_TRUE(error.empty()) << error;
+  {
+    std::lock_guard<std::mutex> guard(mutex);
+    EXPECT_TRUE(ran);
+    EXPECT_TRUE(ran_on_loop_owner);
+    EXPECT_EQ(plain_id, looped_id);
+  }
+  EXPECT_EQ(::close(done[0]), 0);
+  EXPECT_EQ(::close(done[1]), 0);
+}
+
+TEST(WorkerRuntimeTest, RejectsLoopTaskWhenFullOrStopped) {
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  WorkerRuntime worker(/*task_capacity=*/1);
+  EXPECT_FALSE(worker.PostWithLoop([](net::EventLoop &) {}));  // before start
+  worker.Start();
+  // Fill the single slot with a blocking plain task, then the loop task must
+  // be rejected without displacing it.
+  ASSERT_TRUE(worker.Post([&] {
+    char release = '\0';
+    (void)::read(gate[0], &release, 1);
+  }));
+  EXPECT_FALSE(worker.PostWithLoop([](net::EventLoop &) {}));
+  EXPECT_FALSE(worker.Post([] {}));
+  ASSERT_EQ(::write(gate[1], "r", 1), 1);
+  worker.Stop();
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
 }
 
 } // namespace

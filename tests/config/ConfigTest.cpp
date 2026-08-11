@@ -471,6 +471,36 @@ routes:
   EXPECT_THROW(invalid("    balance: round_robin\n"), std::invalid_argument);
 }
 
+TEST(ConfigTest, DefaultsWorkersToOne) {
+  const Config config = LoadFromYaml(kValidConfig);
+  EXPECT_EQ(config.workers, 1U);
+}
+
+TEST(ConfigTest, LoadsExplicitWorkers) {
+  const std::string yaml = std::string("workers: 4\n") + std::string(kValidConfig);
+  const Config config = LoadFromYaml(yaml);
+  EXPECT_EQ(config.workers, 4U);
+}
+
+TEST(ConfigTest, RejectsZeroAndHugeWorkers) {
+  EXPECT_THROW(static_cast<void>(LoadFromYaml(std::string("workers: 0\n") + std::string(kValidConfig))),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(LoadFromYaml(std::string("workers: 1025\n") + std::string(kValidConfig))),
+               std::invalid_argument);
+}
+
+TEST(ConfigTest, RejectsNonNumericWorkers) {
+  EXPECT_THROW(static_cast<void>(LoadFromYaml(std::string("workers: many\n") + std::string(kValidConfig))),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(LoadFromYaml(std::string("workers: -1\n") + std::string(kValidConfig))),
+               std::invalid_argument);
+}
+
+TEST(ConfigTest, RejectsUnknownTopLevelFields) {
+  EXPECT_THROW(static_cast<void>(LoadFromYaml(std::string("threads: 2\n") + std::string(kValidConfig))),
+               std::invalid_argument);
+}
+
 TEST(ConfigTest, RejectsDuplicateEndpointsInRoute) {
   const auto load = [] {
     return LoadFromYaml(R"yaml(

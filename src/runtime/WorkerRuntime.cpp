@@ -72,6 +72,15 @@ std::thread::id WorkerRuntime::WorkerThreadId() const noexcept {
 
 bool WorkerRuntime::Post(std::function<void()> task) {
   if (!task) return false;
+  return PostTask(Task(std::move(task)));
+}
+
+bool WorkerRuntime::PostWithLoop(std::function<void(net::EventLoop &)> task) {
+  if (!task) return false;
+  return PostTask(Task(std::move(task)));
+}
+
+bool WorkerRuntime::PostTask(Task task) {
   if (!started_.load(std::memory_order_acquire)) return false;
   const std::uint64_t wake = 1;
   std::lock_guard<std::mutex> guard(queue_mutex_);
@@ -129,7 +138,7 @@ void WorkerRuntime::HandleWake(net::EventLoop &loop) {
       break;  // EAGAIN/EWOULDBLOCK: no pending wake
     }
   }
-  DrainQueue();
+  DrainQueue(loop);
   {
     std::lock_guard<std::mutex> guard(queue_mutex_);
     if (stopping_.load(std::memory_order_relaxed) && tasks_.empty()) {
@@ -138,9 +147,9 @@ void WorkerRuntime::HandleWake(net::EventLoop &loop) {
   }
 }
 
-void WorkerRuntime::DrainQueue() {
+void WorkerRuntime::DrainQueue(net::EventLoop &loop) {
   for (;;) {
-    std::function<void()> task;
+    Task task;
     {
       std::lock_guard<std::mutex> guard(queue_mutex_);
       if (tasks_.empty()) return;
@@ -148,7 +157,11 @@ void WorkerRuntime::DrainQueue() {
       tasks_.pop_front();
     }
     try {
-      task();
+      if (task.with_loop) {
+        task.with_loop(loop);
+      } else {
+        task.plain();
+      }
     } catch (...) {
       // A control task must never break the worker's dispatch loop or its
       // stop decision; the exception is absorbed here.
