@@ -100,12 +100,12 @@ void Metrics::RecordImmediate(std::string_view route, int status, std::string_vi
 void Metrics::SetActiveConnections(std::size_t count) noexcept { state_->active_connections = count; }
 
 void Metrics::SetCircuitState(std::string_view route, std::string_view upstream,
-                              std::string_view state) noexcept {
+                              std::string_view state) {
   state_->circuit_states[{std::string(route), std::string(upstream)}] = std::string(state);
 }
 
 void Metrics::SetUpstreamHealth(std::string_view route, std::string_view upstream,
-                                bool healthy) noexcept {
+                                bool healthy) {
   state_->upstream_health[{std::string(route), std::string(upstream)}] = healthy;
 }
 

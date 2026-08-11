@@ -61,7 +61,10 @@ std::size_t Gateway::ClientCount() const noexcept { return clients_.size(); }
 std::string Gateway::MetricsText() {
   // Refresh the route x endpoint protection state, then render everything
   // through Metrics so label escaping and exposition stay centralized.
-  for (const config::Route &route : routes_.Config().routes) {
+  // State refresh is best-effort: allocation failure in observability must
+  // never break serving /metrics.
+  try {
+    for (const config::Route &route : routes_.Config().routes) {
     for (const config::Endpoint &endpoint : route.endpoints) {
       const std::string upstream = endpoint.host + ":" + std::to_string(endpoint.port);
       if (const resilience::CircuitBreaker *breaker = routes_.BreakerFor(route, endpoint)) {
@@ -77,6 +80,8 @@ std::string Gateway::MetricsText() {
         metrics_->SetUpstreamHealth(route.name, upstream, state->Healthy());
       }
     }
+  }
+  } catch (...) {
   }
   return metrics_->RenderPrometheus();
 }

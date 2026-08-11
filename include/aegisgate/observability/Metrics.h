@@ -30,9 +30,9 @@ public:
   // (closed/open/half_open); rendering emits one-hot gauges with escaped
   // labels so exposition stays valid.
   void SetCircuitState(std::string_view route, std::string_view upstream,
-                       std::string_view state) noexcept;
+                       std::string_view state);
   void SetUpstreamHealth(std::string_view route, std::string_view upstream,
-                         bool healthy) noexcept;
+                         bool healthy);
   void SetActiveConnections(std::size_t count) noexcept;
   [[nodiscard]] std::string RenderPrometheus() const;
 
