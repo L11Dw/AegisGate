@@ -91,11 +91,12 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
                                    std::shared_ptr<resilience::RouteAdmission> admission,
                                    net::TimerQueue *timers, UpstreamPolicy policy,
                                    std::shared_ptr<observability::Metrics> metrics,
-                                   std::string route_name)
+                                   std::string route_name, AttemptProvider attempt_provider)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
       metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
-      timers_(timers), policy_(std::move(policy)) {}
+      timers_(timers), attempt_provider_(std::move(attempt_provider)),
+      policy_(std::move(policy)) {}
 
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
@@ -113,11 +114,13 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         std::shared_ptr<UpstreamPool> pool,
                         std::shared_ptr<resilience::RouteAdmission> admission,
                         net::TimerQueue *timers, UpstreamPolicy policy,
-                        std::shared_ptr<observability::Metrics> metrics, std::string route_name) {
+                        std::shared_ptr<observability::Metrics> metrics, std::string route_name,
+                        AttemptProvider attempt_provider) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
       loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
-      timers, std::move(policy), std::move(metrics), std::move(route_name)));
+      timers, std::move(policy), std::move(metrics), std::move(route_name),
+      std::move(attempt_provider)));
   transaction->Begin();
   return transaction;
 }
@@ -139,14 +142,32 @@ void ProxyTransaction::Begin() {
     }
   }
   ArmTotalDeadline();
-  StartUpstream();
+  if (!StartUpstream()) {
+    FinishNoEndpoint();
+  }
 }
 
-void ProxyTransaction::StartUpstream() {
+bool ProxyTransaction::StartUpstream() {
   CancelAttemptDeadlines();
   ++generation_;
   connected_ = false;
   response_header_received_ = false;
+  // The provider chooses an eligible endpoint and issues the attempt permit
+  // (freshly per retry).  No candidate means do not connect.
+  breaker_link_.reset();
+  if (attempt_provider_) {
+    const auto selection = attempt_provider_();
+    if (!selection.has_value()) {
+      // No candidate is not a new attempt: the previous attempt's guard and
+      // accounting stay as they are.
+      return false;
+    }
+    endpoint_ = *selection->endpoint;
+    breaker_link_ = selection->link;
+    attempt_accounted_ = false;
+  } else {
+    attempt_accounted_ = false;
+  }
   ArmConnectDeadline();
   const auto self = shared_from_this();
   try {
@@ -160,7 +181,7 @@ void ProxyTransaction::StartUpstream() {
                        self->HandleUpstream(result, std::move(response));
                      }, [self](net::UpstreamProgress progress) { self->HandleProgress(progress); });
       starting_upstream_ = false;
-      return;
+      return true;
     }
     upstream_ = std::make_unique<net::UpstreamConnection>(
         loop_, upstream_port_, [self](net::UpstreamResult result, http::HttpResponse response) {
@@ -180,6 +201,7 @@ void ProxyTransaction::StartUpstream() {
     starting_upstream_ = false;
     HandleUpstream(net::UpstreamResult::kConnectError, {});
   }
+  return true;
 }
 
 void ProxyTransaction::HandleAdmissionRejected() {
@@ -201,10 +223,11 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   if (finished_) return;
   active_connection_ = nullptr;
   if (RetryableFailure(result)) {
-    // Both UpstreamConnection::Finish and UpstreamPool::Complete are still
-    // executing their callback stack. Starting the replacement after this
-    // epoll batch prevents destruction/reuse of that owner from invalidating
-    // the callback's current frame.
+    // This attempt failed inside the safe retry window; account it once
+    // before starting the replacement.  Both UpstreamConnection::Finish and
+    // UpstreamPool::Complete are still executing their callback stack, so
+    // the replacement starts after this epoll batch.
+    if (client_lifetime_.lock()) AccountFailure();
     const auto self = shared_from_this();
     loop_.QueueAfterCurrentBatch([self] {
       if (self->finished_) return;
@@ -228,11 +251,59 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   if (!client_lifetime) {
     return;
   }
+  // A 5xx answer is an endpoint failure for the breaker; 4xx and success
+  // responses are healthy answers.
+  if (response.status >= 500) {
+    AccountFailure();
+  } else {
+    AccountSuccess();
+  }
   const auto self = shared_from_this();
 
   try {
     StripHopByHopHeaders(response);
     client_->SendResponse(response);
+  } catch (const std::logic_error &) {
+  } catch (const std::system_error &) {
+  }
+}
+
+void ProxyTransaction::AccountSuccess() noexcept {
+  if (!breaker_link_.has_value() || attempt_accounted_) return;
+  attempt_accounted_ = true;
+  try {
+    breaker_link_->breaker->RecordSuccess(resilience::CircuitBreaker::Clock::now(),
+                                          breaker_link_->permit);
+  } catch (...) {
+    // Breaker accounting is best-effort; forwarding remains primary.
+  }
+}
+
+void ProxyTransaction::AccountFailure() noexcept {
+  if (!breaker_link_.has_value() || attempt_accounted_) return;
+  attempt_accounted_ = true;
+  try {
+    breaker_link_->breaker->RecordFailure(resilience::CircuitBreaker::Clock::now(),
+                                          breaker_link_->permit);
+  } catch (...) {
+  }
+}
+
+void ProxyTransaction::FinishNoEndpoint() {
+  if (finished_) return;
+  finished_ = true;
+  ++generation_;
+  CancelDeadlines();
+  reservation_.reset();
+  // No upstream was ever connected, so the 503 carries no upstream label.
+  try {
+    metric_request_.Complete(503, {}, false, "no_healthy_endpoint");
+  } catch (...) {
+  }
+  if (!client_lifetime_.lock()) return;
+  const auto self = shared_from_this();
+  try {
+    client_->SendResponse(http::HttpResponse{503, "Service Unavailable", {}, ""});
   } catch (const std::logic_error &) {
   } catch (const std::system_error &) {
   }
@@ -251,6 +322,7 @@ void ProxyTransaction::FinishFailure() {
   if (!starting_upstream_) upstream_.reset();
   CompleteMetric(502);
   if (!client_lifetime_.lock()) return;
+  AccountFailure();
   const auto self = shared_from_this();
   try {
     client_->SendResponse(http::HttpResponse{502, "Bad Gateway", {}, ""});
@@ -327,9 +399,12 @@ void ProxyTransaction::HandleDeadline(std::uint64_t generation) {
 }
 
 bool ProxyTransaction::RetryableFailure(net::UpstreamResult result) const noexcept {
+  // With an attempt provider the retry candidate set is decided at runtime
+  // (healthy and not open); without one the static retry_endpoints apply.
   return !response_header_received_ && retries_ == 0 && policy_.retry_budget != 0 &&
          (request_.method == "GET" || request_.method == "HEAD") &&
-         result != net::UpstreamResult::kSuccess && HasRetryAlternative();
+         result != net::UpstreamResult::kSuccess &&
+         (attempt_provider_ || HasRetryAlternative());
 }
 
 bool ProxyTransaction::HasRetryAlternative() const noexcept {
@@ -345,15 +420,20 @@ bool ProxyTransaction::HasRetryAlternative() const noexcept {
 }
 
 bool ProxyTransaction::StartRetry() {
+  if (attempt_provider_) {
+    if (!StartUpstream()) return false;
+    ++retries_;
+    return true;
+  }
   if (!endpoint_) return false;
   const auto next = std::find_if(policy_.retry_endpoints.begin(), policy_.retry_endpoints.end(),
                                  [this](const config::Endpoint &candidate) {
     return candidate.address != endpoint_->address || candidate.port != endpoint_->port;
   });
   if (next == policy_.retry_endpoints.end()) return false;
-  ++retries_;
   *endpoint_ = *next;
-  StartUpstream();
+  if (!StartUpstream()) return false;
+  ++retries_;
   return true;
 }
 
@@ -369,14 +449,16 @@ void ProxyTransaction::FinishGatewayTimeout() {
   if (upstream_) upstream_->Close();
   upstream_.reset();
   if (!client_lifetime_.lock()) return;
+  AccountFailure();
   const auto self = shared_from_this();
   try { client_->SendResponse(http::HttpResponse{504, "Gateway Timeout", {}, ""}); }
   catch (const std::logic_error &) {} catch (const std::system_error &) {}
 }
 
-void ProxyTransaction::CompleteMetric(int status, bool rate_limited) noexcept {
+void ProxyTransaction::CompleteMetric(int status, bool rate_limited,
+                                     std::string_view reason) noexcept {
   try {
-    metric_request_.Complete(status, UpstreamLabel(), rate_limited);
+    metric_request_.Complete(status, UpstreamLabel(), rate_limited, reason);
   } catch (...) {
     // Metrics are best-effort; forwarding and lifetime cleanup remain primary.
   }

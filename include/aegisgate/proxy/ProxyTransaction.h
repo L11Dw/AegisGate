@@ -3,7 +3,10 @@
 #include <cstdint>
 #include <chrono>
 #include <functional>
+#include <string_view>
 #include <memory>
+#include <functional>
+#include <string_view>
 #include <optional>
 #include <vector>
 
@@ -12,6 +15,7 @@
 #include "aegisgate/net/UpstreamConnection.h"
 #include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/observability/Metrics.h"
+#include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/resilience/InflightLimiter.h"
 
 namespace aegisgate::net {
@@ -42,12 +46,33 @@ public:
   Start(net::EventLoop &loop, net::ClientConnection &client, std::uint16_t upstream_port,
         http::HttpRequest request,
         std::shared_ptr<resilience::RouteAdmission> admission = nullptr);
+  // One breaker link per upstream attempt: the non-owning breaker owned by
+  // the route table (lives at least as long as the gateway) plus the permit
+  // this attempt was admitted with.  nullopt means the route has no breaker
+  // and outcomes are not accounted.
+  struct BreakerLink {
+    resilience::CircuitBreaker *breaker;
+    resilience::CircuitBreaker::RequestPermit permit;
+  };
+  // The outcome of choosing one upstream attempt: an eligible endpoint plus
+  // its breaker link (absent when the route has no breaker).
+  struct AttemptSelection {
+    const config::Endpoint *endpoint;
+    std::optional<BreakerLink> link;
+  };
+  // Chooses the endpoint for the initial attempt and for every retry, so
+  // unhealthy or open candidates are never connected to.  nullopt means no
+  // eligible candidate remains; the initial call terminates with a unique
+  // 503 and a retry call terminates the transaction.
+  using AttemptProvider = std::function<std::optional<AttemptSelection>()>;
+
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
         http::HttpRequest request, std::shared_ptr<UpstreamPool> pool,
                         std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
         net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
-        std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {});
+        std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {},
+        AttemptProvider attempt_provider = {});
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -58,10 +83,12 @@ private:
                    std::shared_ptr<UpstreamPool> pool,
                    std::shared_ptr<resilience::RouteAdmission> admission,
                    net::TimerQueue *timers, UpstreamPolicy policy,
-                   std::shared_ptr<observability::Metrics> metrics, std::string route_name);
+                   std::shared_ptr<observability::Metrics> metrics, std::string route_name,
+                   AttemptProvider attempt_provider);
 
   void Begin();
-  void StartUpstream();
+  [[nodiscard]] bool StartUpstream();
+  void FinishNoEndpoint();
   void HandleProgress(net::UpstreamProgress progress);
   void ArmConnectDeadline();
   void ArmFirstByteDeadline();
@@ -74,9 +101,12 @@ private:
   [[nodiscard]] bool StartRetry();
   void FinishFailure();
   void FinishGatewayTimeout();
+  void AccountSuccess() noexcept;
+  void AccountFailure() noexcept;
   void HandleAdmissionRejected();
   void HandleUpstream(net::UpstreamResult result, http::HttpResponse response);
-  void CompleteMetric(int status, bool rate_limited = false) noexcept;
+  void CompleteMetric(int status, bool rate_limited = false,
+                     std::string_view reason = {}) noexcept;
   [[nodiscard]] std::string UpstreamLabel() const;
 
   net::EventLoop &loop_;
@@ -90,9 +120,14 @@ private:
   std::shared_ptr<observability::Metrics> metrics_;
   std::string route_name_;
   observability::Metrics::RequestHandle metric_request_;
+  std::optional<BreakerLink> breaker_link_;
+  // One-shot guard: each upstream attempt may account its outcome at most
+  // once, even when the retry fallback terminates the same attempt.
+  bool attempt_accounted_ = false;
   std::unique_ptr<net::UpstreamConnection> upstream_;
   std::shared_ptr<UpstreamPool> pool_;
   net::TimerQueue *timers_ = nullptr;
+  AttemptProvider attempt_provider_;
   UpstreamPolicy policy_;
   net::UpstreamConnection *active_connection_ = nullptr;
   net::TimerQueue::TimerId connect_timer_ = 0;

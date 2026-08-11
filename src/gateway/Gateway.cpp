@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #include <unistd.h>
@@ -26,6 +27,24 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
       acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)) {
   state_->owner = this;
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
+  for (const config::Route &route : routes_.Config().routes) {
+    if (!route.health_check.has_value()) continue;
+    const auto &settings = *route.health_check;
+    for (const config::Endpoint &endpoint : route.endpoints) {
+      health_checkers_.push_back(std::make_unique<health::HealthChecker>(
+          loop_, *timers_, endpoint,
+          health::HealthCheckConfig{std::chrono::milliseconds(settings.interval_ms),
+                                    std::chrono::milliseconds(settings.timeout_ms)},
+          [this, &route, &endpoint](bool healthy) {
+            // The table owns the state for the lifetime of this gateway; the
+            // checker's generation guards stale callbacks after Stop().
+            if (health::EndpointHealth *state = routes_.HealthFor(route, endpoint)) {
+              state->RecordCheckResult(healthy);
+            }
+          }));
+      health_checkers_.back()->Start();
+    }
+  }
 }
 
 Gateway::~Gateway() {
@@ -39,7 +58,33 @@ std::uint16_t Gateway::port() const { return acceptor_->port(); }
 
 std::size_t Gateway::ClientCount() const noexcept { return clients_.size(); }
 
-std::string Gateway::MetricsText() const { return metrics_->RenderPrometheus(); }
+std::string Gateway::MetricsText() {
+  // Refresh the route x endpoint protection state, then render everything
+  // through Metrics so label escaping and exposition stay centralized.
+  // State refresh is best-effort: allocation failure in observability must
+  // never break serving /metrics.
+  try {
+    for (const config::Route &route : routes_.Config().routes) {
+    for (const config::Endpoint &endpoint : route.endpoints) {
+      const std::string upstream = endpoint.host + ":" + std::to_string(endpoint.port);
+      if (const resilience::CircuitBreaker *breaker = routes_.BreakerFor(route, endpoint)) {
+        const char *state = "closed";
+        switch (breaker->StateNow()) {
+        case resilience::CircuitBreaker::State::kOpen: state = "open"; break;
+        case resilience::CircuitBreaker::State::kHalfOpen: state = "half_open"; break;
+        case resilience::CircuitBreaker::State::kClosed: break;
+        }
+        metrics_->SetCircuitState(route.name, upstream, state);
+      }
+      if (const health::EndpointHealth *state = routes_.HealthFor(route, endpoint)) {
+        metrics_->SetUpstreamHealth(route.name, upstream, state->Healthy());
+      }
+    }
+  }
+  } catch (...) {
+  }
+  return metrics_->RenderPrometheus();
+}
 
 void Gateway::Accept(int fd) {
   // Acceptor closes fd if its callback throws.  Once a ClientConnection owns
@@ -75,7 +120,7 @@ void Gateway::Accept(int fd) {
 void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpRequest &request) {
   if (request.method == "GET" && request.target == "/metrics") {
     client.SendResponse(http::HttpResponse{200, "OK", {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
-                                           metrics_->RenderPrometheus()});
+                                           MetricsText()});
     return;
   }
   const config::Route *route = routes_.Match(request.Header("host"), request.target);
@@ -84,21 +129,33 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
     client.SendResponse(http::HttpResponse{404, "Not Found", {}, ""});
     return;
   }
-  const config::Endpoint *endpoint = routes_.NextEndpoint(*route);
-  if (endpoint == nullptr) {
-    try { metrics_->RecordImmediate(route->name, 502); } catch (...) {}
-    client.SendResponse(http::HttpResponse{502, "Bad Gateway", {}, ""});
-    return;
-  }
   proxy::UpstreamPolicy policy;
   policy.connect_timeout = std::chrono::milliseconds(route->connect_timeout_ms);
   policy.first_byte_timeout = std::chrono::milliseconds(route->first_byte_timeout_ms);
   policy.total_timeout = std::chrono::milliseconds(route->total_timeout_ms);
   policy.retry_budget = route->retry_budget;
-  policy.retry_endpoints = route->endpoints;
-  (void)proxy::ProxyTransaction::Start(loop_, client, *endpoint, request, upstream_pool_,
-                                       routes_.AdmissionFor(*route), timers_.get(), std::move(policy),
-                                       metrics_, route->name);
+  // The provider chooses the endpoint for the initial attempt and every
+  // retry (eligible means healthy and not refused by its breaker) and issues
+  // the attempt permit; no candidate ever connects.  Tried endpoints are
+  // tracked so a repeated weighted choice cannot loop.
+  (void)proxy::ProxyTransaction::Start(
+      loop_, client, route->endpoints.front(), request, upstream_pool_,
+      routes_.AdmissionFor(*route), timers_.get(), std::move(policy), metrics_, route->name,
+      [this, route, tried = std::unordered_set<const config::Endpoint *>{}]() mutable
+          -> std::optional<proxy::ProxyTransaction::AttemptSelection> {
+        for (std::size_t attempts = 0; attempts < route->endpoints.size(); ++attempts) {
+          const config::Endpoint *candidate = routes_.NextEndpoint(*route);
+          if (candidate == nullptr || !tried.insert(candidate).second) continue;
+          if (!routes_.Eligible(*route, *candidate)) continue;
+          std::optional<proxy::ProxyTransaction::BreakerLink> link;
+          if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, *candidate)) {
+            link = proxy::ProxyTransaction::BreakerLink{
+                breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
+          }
+          return proxy::ProxyTransaction::AttemptSelection{candidate, std::move(link)};
+        }
+        return std::nullopt;
+      });
 }
 
 void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,

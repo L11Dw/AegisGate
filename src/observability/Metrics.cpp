@@ -17,11 +17,13 @@ struct RequestKey {
   std::string route;
   int status{};
   std::string upstream;
+  std::string reason;
 
   [[nodiscard]] bool operator<(const RequestKey &other) const noexcept {
     if (route != other.route) return route < other.route;
     if (status != other.status) return status < other.status;
-    return upstream < other.upstream;
+    if (upstream != other.upstream) return upstream < other.upstream;
+    return reason < other.reason;
   }
 };
 
@@ -46,7 +48,8 @@ std::string EscapeLabel(std::string_view value) {
 }
 
 void Record(Metrics::State &state, std::string_view route, int status,
-            std::string_view upstream, bool rate_limited, double seconds);
+            std::string_view upstream, bool rate_limited, double seconds,
+            std::string_view reason = {});
 
 } // namespace
 
@@ -54,6 +57,8 @@ struct Metrics::State {
   std::map<RequestKey, std::uint64_t> requests;
   std::map<std::string, std::uint64_t> rate_limited;
   std::map<std::string, Histogram> duration;
+  std::map<std::pair<std::string, std::string>, std::string> circuit_states;
+  std::map<std::pair<std::string, std::string>, bool> upstream_health;
   std::size_t active_connections{};
   std::size_t inflight{};
 };
@@ -61,8 +66,10 @@ struct Metrics::State {
 namespace {
 
 void Record(Metrics::State &state, std::string_view route, int status,
-            std::string_view upstream, bool rate_limited, double seconds) {
-  ++state.requests[RequestKey{std::string(route), status, std::string(upstream)}];
+            std::string_view upstream, bool rate_limited, double seconds,
+            std::string_view reason) {
+  ++state.requests[RequestKey{std::string(route), status, std::string(upstream),
+                              std::string(reason)}];
   if (rate_limited) ++state.rate_limited[std::string(route)];
   Histogram &histogram = state.duration[std::string(route)];
   ++histogram.count;
@@ -86,11 +93,21 @@ Metrics::RequestHandle Metrics::BeginRequest(std::string_view route) {
 }
 
 void Metrics::RecordImmediate(std::string_view route, int status, std::string_view upstream,
-                              bool rate_limited) {
-  Record(*state_, route, status, upstream, rate_limited, 0.0);
+                              bool rate_limited, std::string_view reason) {
+  Record(*state_, route, status, upstream, rate_limited, 0.0, reason);
 }
 
 void Metrics::SetActiveConnections(std::size_t count) noexcept { state_->active_connections = count; }
+
+void Metrics::SetCircuitState(std::string_view route, std::string_view upstream,
+                              std::string_view state) {
+  state_->circuit_states[{std::string(route), std::string(upstream)}] = std::string(state);
+}
+
+void Metrics::SetUpstreamHealth(std::string_view route, std::string_view upstream,
+                                bool healthy) {
+  state_->upstream_health[{std::string(route), std::string(upstream)}] = healthy;
+}
 
 std::string Metrics::RenderPrometheus() const {
   std::ostringstream output;
@@ -98,7 +115,25 @@ std::string Metrics::RenderPrometheus() const {
   for (const auto &[key, count] : state_->requests) {
     output << "aegisgate_requests_total{route=\"" << EscapeLabel(key.route)
            << "\",status=\"" << key.status << "\",upstream=\""
-           << EscapeLabel(key.upstream) << "\"} " << count << '\n';
+           << EscapeLabel(key.upstream) << "\"";
+    if (!key.reason.empty()) {
+      output << ",reason=\"" << EscapeLabel(key.reason) << "\"";
+    }
+    output << "} " << count << '\n';
+  }
+  output << "# TYPE aegisgate_circuit_state gauge\n";
+  for (const auto &[key, state] : state_->circuit_states) {
+    for (const char *candidate : {"closed", "open", "half_open"}) {
+      output << "aegisgate_circuit_state{route=\"" << EscapeLabel(key.first)
+             << "\",upstream=\"" << EscapeLabel(key.second) << "\",state=\"" << candidate
+             << "\"} " << (state == candidate ? "1" : "0") << '\n';
+    }
+  }
+  output << "# TYPE aegisgate_upstream_health gauge\n";
+  for (const auto &[key, healthy] : state_->upstream_health) {
+    output << "aegisgate_upstream_health{route=\"" << EscapeLabel(key.first)
+           << "\",upstream=\"" << EscapeLabel(key.second) << "\"} " << (healthy ? "1" : "0")
+           << '\n';
   }
   output << "# TYPE aegisgate_request_duration_seconds histogram\n";
   output << std::setprecision(17);
@@ -149,10 +184,11 @@ Metrics::RequestHandle &Metrics::RequestHandle::operator=(RequestHandle &&other)
 }
 
 void Metrics::RequestHandle::Complete(int status, std::string_view upstream,
-                                      bool rate_limited) {
+                                      bool rate_limited, std::string_view reason) {
   if (!state_) return;
   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
-  Record(*state_, route_, status, upstream, rate_limited, seconds < 0.0 ? 0.0 : seconds);
+  Record(*state_, route_, status, upstream, rate_limited, seconds < 0.0 ? 0.0 : seconds,
+         reason);
   Release();
 }
 

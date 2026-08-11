@@ -1,5 +1,6 @@
 #include "aegisgate/routing/RouteTable.h"
 
+#include <chrono>
 #include <string_view>
 #include <utility>
 
@@ -45,11 +46,78 @@ bool PrefixMatches(std::string_view path, std::string_view prefix) {
 
 RouteTable::RouteTable(config::Config config) : config_(std::move(config)) {
   admissions_.reserve(config_.routes.size());
+  endpoint_states_.reserve(config_.routes.size());
   const auto now = resilience::TokenBucket::Clock::now();
   for (const config::Route &route : config_.routes) {
     admissions_.push_back(std::make_shared<resilience::RouteAdmission>(route, now));
     selectors_.emplace_back(route.endpoints);
+    std::vector<EndpointState> states;
+    states.reserve(route.endpoints.size());
+    for (std::size_t index = 0; index < route.endpoints.size(); ++index) {
+      EndpointState state;
+      if (route.health_check.has_value()) {
+        state.health = std::make_unique<health::EndpointHealth>();
+      }
+      if (route.circuit_breaker.has_value()) {
+        const auto &breaker = *route.circuit_breaker;
+        state.breaker = std::make_unique<resilience::CircuitBreaker>(
+            resilience::CircuitBreakerConfig{
+                std::chrono::seconds(breaker.window_seconds), breaker.min_requests,
+                breaker.failure_threshold_permille, std::chrono::seconds(breaker.open_seconds),
+                breaker.half_open_probes},
+            now);
+      }
+      states.push_back(std::move(state));
+    }
+    endpoint_states_.push_back(std::move(states));
   }
+}
+
+std::size_t RouteTable::RouteIndex(const config::Route &route) const noexcept {
+  for (std::size_t index = 0; index < config_.routes.size(); ++index) {
+    if (&config_.routes[index] == &route) return index;
+  }
+  return config_.routes.size();
+}
+
+health::EndpointHealth *RouteTable::HealthFor(const config::Route &route,
+                                              const config::Endpoint &endpoint) const noexcept {
+  const std::size_t route_index = RouteIndex(route);
+  if (route_index == config_.routes.size()) return nullptr;
+  // The weighted selector returns copies, so identify the endpoint by its
+  // address + port (its logical health identity) rather than by pointer.
+  for (std::size_t index = 0; index < config_.routes[route_index].endpoints.size(); ++index) {
+    const config::Endpoint &candidate = config_.routes[route_index].endpoints[index];
+    if (candidate.address == endpoint.address && candidate.port == endpoint.port) {
+      return endpoint_states_[route_index][index].health.get();
+    }
+  }
+  return nullptr;
+}
+
+resilience::CircuitBreaker *RouteTable::BreakerFor(const config::Route &route,
+                                                   const config::Endpoint &endpoint) const noexcept {
+  const std::size_t route_index = RouteIndex(route);
+  if (route_index == config_.routes.size()) return nullptr;
+  for (std::size_t index = 0; index < config_.routes[route_index].endpoints.size(); ++index) {
+    const config::Endpoint &candidate = config_.routes[route_index].endpoints[index];
+    if (candidate.address == endpoint.address && candidate.port == endpoint.port) {
+      return endpoint_states_[route_index][index].breaker.get();
+    }
+  }
+  return nullptr;
+}
+
+bool RouteTable::Eligible(const config::Route &route,
+                          const config::Endpoint &endpoint) const noexcept {
+  const health::EndpointHealth *health = HealthFor(route, endpoint);
+  if (health != nullptr && !health->Healthy()) return false;
+  const resilience::CircuitBreaker *breaker = BreakerFor(route, endpoint);
+  if (breaker != nullptr &&
+      breaker->RefusesSelection(resilience::CircuitBreaker::Clock::now())) {
+    return false;
+  }
+  return true;
 }
 
 const config::Route *RouteTable::Match(std::string_view host, std::string_view target) const noexcept {

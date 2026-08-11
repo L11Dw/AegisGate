@@ -312,4 +312,97 @@ TEST(ConfigTest, EnforcesOriginFormPathPrefixSyntax) {
 }
 
 } // namespace
+
+TEST(ConfigTest, LoadsCircuitBreakerAndHealthCheckSettings) {
+  const Config config = LoadFromYaml(R"yaml(
+routes:
+  - name: guarded
+    host: guarded.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+    circuit_breaker:
+      window_seconds: 10
+      min_requests: 5
+      failure_threshold: 0.5
+      open_seconds: 5
+      half_open_probes: 2
+    health_check:
+      interval_ms: 1000
+      timeout_ms: 200
+)yaml");
+
+  ASSERT_EQ(config.routes.size(), 1U);
+  const Route &route = config.routes.front();
+  ASSERT_TRUE(route.circuit_breaker.has_value());
+  EXPECT_EQ(route.circuit_breaker->window_seconds, 10U);
+  EXPECT_EQ(route.circuit_breaker->min_requests, 5U);
+  EXPECT_EQ(route.circuit_breaker->failure_threshold_permille, 500U);
+  EXPECT_EQ(route.circuit_breaker->open_seconds, 5U);
+  EXPECT_EQ(route.circuit_breaker->half_open_probes, 2U);
+  ASSERT_TRUE(route.health_check.has_value());
+  EXPECT_EQ(route.health_check->interval_ms, 1000U);
+  EXPECT_EQ(route.health_check->timeout_ms, 200U);
+}
+
+TEST(ConfigTest, ParsesThresholdFractionsToPermille) {
+  const Config config = LoadFromYaml(R"yaml(
+routes:
+  - name: fractions
+    host: f.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+    circuit_breaker:
+      window_seconds: 10
+      min_requests: 5
+      failure_threshold: 0.05
+      open_seconds: 5
+      half_open_probes: 1
+)yaml");
+  EXPECT_EQ(config.routes.front().circuit_breaker->failure_threshold_permille, 50U);
+}
+
+TEST(ConfigTest, RejectsInvalidCircuitBreakerAndHealthCheckSettings) {
+  const auto invalid = [](std::string_view extra) {
+    return LoadFromYaml(std::string(R"yaml(
+routes:
+  - name: bad
+    host: bad.demo.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 100
+    max_inflight: 32
+)yaml") + std::string(extra));
+  };
+  EXPECT_THROW(invalid("    circuit_breaker:\n      window_seconds: 0\n      min_requests: 5\n      failure_threshold: 0.5\n      open_seconds: 5\n      half_open_probes: 1\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    circuit_breaker:\n      window_seconds: 10\n      min_requests: 5\n      failure_threshold: 1.0\n      open_seconds: 5\n      half_open_probes: 1\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    circuit_breaker:\n      window_seconds: 10\n      min_requests: 5\n      failure_threshold: 0\n      open_seconds: 5\n      half_open_probes: 1\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    circuit_breaker:\n      window_seconds: 10\n      min_requests: 5\n      failure_threshold: 0.0000\n      open_seconds: 5\n      half_open_probes: 1\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    circuit_breaker:\n      window_seconds: 10\n      min_requests: 5\n      failure_threshold: 0.5\n      open_seconds: 5\n      half_open_probes: 0\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    circuit_breaker:\n      window_seconds: 10\n      min_requests: 5\n      failure_threshold: 0.5\n      open_seconds: 5\n      half_open_probes: 1\n      unexpected: 1\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    health_check:\n      interval_ms: 0\n      timeout_ms: 200\n"), std::invalid_argument);
+  EXPECT_THROW(invalid("    health_check:\n      interval_ms: 1000\n"), std::invalid_argument);
+}
+
+TEST(ConfigTest, DefaultsToDisabledWithoutHealthOrBreakerConfig) {
+  const Config config = LoadFromYaml(kValidConfig);
+  const Route &route = config.routes.front();
+  EXPECT_FALSE(route.circuit_breaker.has_value());
+  EXPECT_FALSE(route.health_check.has_value());
+}
 } // namespace aegisgate::config
