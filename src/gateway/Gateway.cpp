@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #include <unistd.h>
@@ -26,6 +27,24 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
       acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)) {
   state_->owner = this;
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
+  for (const config::Route &route : routes_.Config().routes) {
+    if (!route.health_check.has_value()) continue;
+    const auto &settings = *route.health_check;
+    for (const config::Endpoint &endpoint : route.endpoints) {
+      health_checkers_.push_back(std::make_unique<health::HealthChecker>(
+          loop_, *timers_, endpoint,
+          health::HealthCheckConfig{std::chrono::milliseconds(settings.interval_ms),
+                                    std::chrono::milliseconds(settings.timeout_ms)},
+          [this, &route, &endpoint](bool healthy) {
+            // The table owns the state for the lifetime of this gateway; the
+            // checker's generation guards stale callbacks after Stop().
+            if (health::EndpointHealth *state = routes_.HealthFor(route, endpoint)) {
+              state->RecordCheckResult(healthy);
+            }
+          }));
+      health_checkers_.back()->Start();
+    }
+  }
 }
 
 Gateway::~Gateway() {
@@ -84,10 +103,22 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
     client.SendResponse(http::HttpResponse{404, "Not Found", {}, ""});
     return;
   }
-  const config::Endpoint *endpoint = routes_.NextEndpoint(*route);
+  // Pick the first eligible endpoint (healthy and not refused by its
+  // breaker), trying each table endpoint at most once so a repeated weighted
+  // choice cannot loop.  No candidate means every endpoint is unhealthy or
+  // open: fail with a single 503, never connect and never retry.
+  const config::Endpoint *endpoint = nullptr;
+  std::unordered_set<const config::Endpoint *> tried;
+  for (std::size_t attempts = 0; attempts < route->endpoints.size(); ++attempts) {
+    const config::Endpoint *candidate = routes_.NextEndpoint(*route);
+    if (candidate == nullptr || !tried.insert(candidate).second) break;
+    if (!routes_.Eligible(*route, *candidate)) continue;
+    endpoint = candidate;
+    break;
+  }
   if (endpoint == nullptr) {
-    try { metrics_->RecordImmediate(route->name, 502); } catch (...) {}
-    client.SendResponse(http::HttpResponse{502, "Bad Gateway", {}, ""});
+    try { metrics_->RecordImmediate(route->name, 503); } catch (...) {}
+    client.SendResponse(http::HttpResponse{503, "Service Unavailable", {}, ""});
     return;
   }
   proxy::UpstreamPolicy policy;

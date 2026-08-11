@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "aegisgate/config/Config.h"
+#include "aegisgate/health/HealthChecker.h"
 #include "aegisgate/http/HttpRequestParser.h"
 #include "aegisgate/routing/RouteTable.h"
 
@@ -43,6 +44,8 @@ public:
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText() const;
+  // Test access to the immutable route table and its route x endpoint state.
+  [[nodiscard]] routing::RouteTable &Routes() noexcept { return routes_; }
 
 private:
   struct State {
@@ -64,6 +67,7 @@ private:
   std::shared_ptr<proxy::UpstreamPool> upstream_pool_;
   std::unique_ptr<net::TimerQueue> timers_;
   std::unique_ptr<net::Acceptor> acceptor_;
+  std::vector<std::unique_ptr<health::HealthChecker>> health_checkers_;
   std::unordered_map<std::uint64_t, std::unique_ptr<net::ClientConnection>> clients_;
   std::uint64_t next_client_identifier_ = 1;
 };

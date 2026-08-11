@@ -860,5 +860,204 @@ TEST(GatewayTest, ForwardsHeadRequestWithoutWaitingForBody) {
   EXPECT_EQ(::close(wake_fds[1]), 0);
 }
 
+
+TEST(GatewayTest, SkipsUnhealthyEndpointWith503) {
+  net::Socket upstream_listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1},
+                                  upstream_listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {endpoint}, 10, 10, 4};
+  route.health_check = config::HealthCheckSettings{1000, 200};
+  const config::Config config{{route}};
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  // The backend answers the health check with 503, then signals completion.
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(upstream_listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, 54, TestDeadline(), backend_error);
+    constexpr std::string_view unhealthy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    if (!WriteAll(fd, unhealthy, TestDeadline(), backend_error)) {}
+    (void)::close(fd);
+    if (::write(wake_fds[1], "c", 1) != 1 && backend_error.empty()) backend_error = "check wake failed";
+  });
+  loop.Loop();  // First pass: the health check completes and marks unhealthy.
+  backend.join();
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_NE(matched, nullptr);
+  health::EndpointHealth *state = gateway.Routes().HealthFor(*matched, matched->endpoints.front());
+  ASSERT_NE(state, nullptr);
+  EXPECT_FALSE(state->Healthy());
+
+  std::string client_error;
+  std::string client_response;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    constexpr std::string_view expected = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    client_response = ReadExact(socket.Fd(), expected.size(), TestDeadline(), client_error);
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();  // Second pass: the request is answered with 503, no connect.
+  client.join();
+
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_EQ(client_response, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+  pollfd descriptor{upstream_listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "503 opened an upstream connection";
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+TEST(GatewayTest, SkipsOpenEndpointWithoutConnecting) {
+  net::Socket upstream_listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1},
+                                  upstream_listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {endpoint}, 10, 10, 4};
+  route.circuit_breaker = config::CircuitBreakerSettings{10, 5, 500, 5, 1};
+  const config::Config config{{route}};
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_NE(matched, nullptr);
+  auto *breaker = gateway.Routes().BreakerFor(*matched, matched->endpoints.front());
+  ASSERT_NE(breaker, nullptr);
+  const auto now = std::chrono::steady_clock::now();
+  for (int i = 0; i < 5; ++i) {
+    const auto at = now + std::chrono::milliseconds(i);
+    breaker->RecordFailure(at, breaker->Select(at));
+  }
+  EXPECT_TRUE(breaker->RefusesSelection(now + std::chrono::milliseconds(10)));
+
+  std::string client_error;
+  std::string client_response;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    constexpr std::string_view expected = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    client_response = ReadExact(socket.Fd(), expected.size(), TestDeadline(), client_error);
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_EQ(client_response, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+  pollfd descriptor{upstream_listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "503 opened an upstream connection";
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+TEST(GatewayTest, RouteIsolatedBreakerState) {
+  net::Socket upstream_listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1},
+                                  upstream_listener.BoundPort(), 1};
+  config::Route route_a{"a", "a.test", "/", {endpoint}, 10, 10, 4};
+  route_a.circuit_breaker = config::CircuitBreakerSettings{10, 5, 500, 5, 1};
+  config::Route route_b{"b", "b.test", "/", {endpoint}, 10, 10, 4};
+  route_b.circuit_breaker = config::CircuitBreakerSettings{10, 5, 500, 5, 1};
+  const config::Config config{{route_a, route_b}};
+
+  std::string upstream_error;
+  std::thread upstream([&] {
+    const int fd = AcceptUntil(upstream_listener, TestDeadline(), upstream_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, 57, TestDeadline(), upstream_error);
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (!WriteAll(fd, response, TestDeadline(), upstream_error)) {}
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  // Open route a's breaker; route b shares the same endpoint but keeps its
+  // own state.
+  const config::Route *matched_a = gateway.Routes().Match("a.test", "/x");
+  ASSERT_NE(matched_a, nullptr);
+  auto *breaker_a = gateway.Routes().BreakerFor(*matched_a, matched_a->endpoints.front());
+  ASSERT_NE(breaker_a, nullptr);
+  const auto now = std::chrono::steady_clock::now();
+  for (int i = 0; i < 5; ++i) {
+    const auto at = now + std::chrono::milliseconds(i);
+    breaker_a->RecordFailure(at, breaker_a->Select(at));
+  }
+
+  std::string client_error;
+  std::string a_response;
+  std::string b_response;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
+    constexpr std::string_view request_a = "GET /a HTTP/1.1\r\nHost: a.test\r\n\r\n";
+    constexpr std::string_view service_unavailable = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+    if (WriteAll(socket.Fd(), request_a, TestDeadline(), client_error)) {
+      a_response = ReadExact(socket.Fd(), service_unavailable.size(), TestDeadline(), client_error);
+    }
+    constexpr std::string_view request_b = "GET /b HTTP/1.1\r\nHost: b.test\r\n\r\n";
+    constexpr std::string_view ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (client_error.empty() && WriteAll(socket.Fd(), request_b, TestDeadline(), client_error)) {
+      b_response = ReadExact(socket.Fd(), ok.size(), TestDeadline(), client_error);
+    }
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+  upstream.join();
+
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_TRUE(upstream_error.empty()) << upstream_error;
+  EXPECT_EQ(a_response, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_EQ(b_response, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
 } // namespace
 } // namespace aegisgate::gateway

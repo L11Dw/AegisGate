@@ -60,6 +60,16 @@ public:
   // quota cannot stall.
   [[nodiscard]] RequestPermit Select(Clock::time_point now);
   [[nodiscard]] State StateNow() const noexcept { return state_; }
+  // Read-only selection refusal, without Select()'s half-open transition or
+  // probe side effects: Open before its window elapses, or half-open with the
+  // probe quota exhausted.
+  [[nodiscard]] bool RefusesSelection(Clock::time_point now) const noexcept {
+    if (state_ == State::kOpen && now < open_until_) return true;
+    if (state_ == State::kHalfOpen && half_open_issued_ >= config_.half_open_probes) {
+      return true;
+    }
+    return false;
+  }
 
 private:
   struct Bucket {
