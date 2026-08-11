@@ -44,7 +44,9 @@ void EventLoop::Loop() {
       if (registration == registrations_.end()) {
         continue;
       }
+      dispatching_event_ = true;
       registration->second->HandleEvent(active_events[index].events);
+      dispatching_event_ = false;
       if (quit_) {
         break;
       }

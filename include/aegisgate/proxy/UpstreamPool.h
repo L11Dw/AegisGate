@@ -36,9 +36,13 @@ public:
   // Aborts an active exchange. It suppresses its response callback and cannot
   // return the descriptor to idle storage.
   [[nodiscard]] bool Cancel(net::UpstreamConnection *connection) noexcept;
-  // Idempotent shutdown: closes and removes every active exchange and
-  // suppresses its response callback, so transactions held by those callbacks
-  // terminate via RAII.  Idle connections are closed by the normal destructor.
+  // Idempotent shutdown: logically cancels every active exchange (callbacks
+  // suppressed, transactions released via RAII) and closes its descriptor.
+  // When called from inside a Channel callback stack the actual Close is
+  // deferred to the end of the current epoll batch (the deferred closure owns
+  // the connections); otherwise it closes synchronously.  Must be called on
+  // the EventLoop thread or while the loop is idle.  Idle connections are
+  // closed by the normal destructor.
   void CancelAll() noexcept;
   [[nodiscard]] std::size_t IdleCount(const config::Endpoint &endpoint) const noexcept;
 

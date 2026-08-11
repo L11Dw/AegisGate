@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <memory>
@@ -1337,6 +1338,128 @@ TEST(ProxyTransactionTest, CancelAllTerminatesInFlightTransaction) {
   EXPECT_EQ(::close(client_sockets[1]), 0);
   EXPECT_EQ(::close(gate[0]), 0);
   EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+// R-043 red test: a successful keep-alive exchange must not retain the
+// transaction through the idle connection's progress callback (the
+// transaction holds the pool, forming a strong-reference cycle).  The
+// transaction's weak reference must expire and the connection must still be
+// reusable from the idle pool.
+TEST(ProxyTransactionTest, KeepAliveReuseDoesNotRetainTransaction) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  constexpr std::string_view request =
+      "GET / HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string backend_error;
+  std::atomic_int accepted = 0;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    ++accepted;
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    for (int index = 0; index != 2; ++index) {
+      (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+      if (backend_error.empty() &&
+          ::write(fd, response.data(), response.size()) != static_cast<ssize_t>(response.size())) {
+        backend_error = "failed to write response";
+      }
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  const config::Route route{"limited", "test", "/", {}, 10, 10, 4};
+  const auto admission = std::make_shared<resilience::RouteAdmission>(
+      route, std::chrono::steady_clock::now());
+
+  // Request 1 on its own client connection.
+  std::array<int, 2> first_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, first_sockets.data()), 0);
+  std::weak_ptr<ProxyTransaction> first_transaction;
+  net::ClientConnection first_client(loop, first_sockets[0],
+                                     [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.connect_timeout = std::chrono::seconds(1);
+    policy.first_byte_timeout = std::chrono::seconds(1);
+    policy.total_timeout = std::chrono::seconds(2);
+    policy.retry_budget = 0;
+    first_transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission,
+                                                &timers, std::move(policy));
+  });
+  first_client.Start();
+  constexpr std::string_view inbound = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(first_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  std::string peer_error;
+  std::thread peer([&] {
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const auto received = ReadExactUntil(first_sockets[1], response.size(), TestDeadline(), peer_error);
+    if (!received) return;
+    peer_error = ::write(wake_sockets[1], "q", 1) == 1 ? "" : "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(peer_error.empty()) << peer_error;
+  // The keep-alive exchange completed; the transaction must not be retained
+  // by the idle connection's progress callback.
+  EXPECT_TRUE(first_transaction.expired()) << "transaction retained after keep-alive";
+
+  // Request 2 must reuse the same upstream connection from the idle pool.
+  std::array<int, 2> second_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, second_sockets.data()), 0);
+  net::ClientConnection second_client(loop, second_sockets[0],
+                                      [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.connect_timeout = std::chrono::seconds(1);
+    policy.first_byte_timeout = std::chrono::seconds(1);
+    policy.total_timeout = std::chrono::seconds(2);
+    policy.retry_budget = 0;
+    (void)ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission, &timers,
+                                  std::move(policy));
+  });
+  second_client.Start();
+  ASSERT_EQ(::write(second_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  std::string second_peer_error;
+  std::thread second_peer([&] {
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const auto received = ReadExactUntil(second_sockets[1], response.size(), TestDeadline(), second_peer_error);
+    if (!received) return;
+    second_peer_error = ::write(wake_sockets[1], "q", 1) == 1 ? "" : "failed to wake event loop";
+  });
+  loop.Loop();
+  second_peer.join();
+  backend.join();
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(second_peer_error.empty()) << second_peer_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_EQ(accepted, 1) << "second request did not reuse the idle connection";
+  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  first_client.Close();
+  second_client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(first_sockets[1]), 0);
+  EXPECT_EQ(::close(second_sockets[1]), 0);
   EXPECT_EQ(::close(wake_sockets[0]), 0);
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }

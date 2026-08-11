@@ -308,5 +308,69 @@ TEST(UpstreamPoolTest, DiscardsAnIdleConnectionClosedAfterItsResponseBeforeBorro
   EXPECT_EQ(accepted, 2);
 }
 
+// R-042 red test: CancelAll() must never destroy the Channel whose
+// Channel::HandleEvent stack is currently executing.  The progress callback
+// fires CancelAll from inside that stack; the response callback must be
+// suppressed, the descriptor must still end up closed, and ASan must stay
+// clean.
+TEST(UpstreamPoolTest, CancelAllInsideProgressCallbackIsSafe) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint = LoopbackEndpoint(listener.BoundPort());
+  const std::string expected = http::SerializeRequest(Request());
+  std::array<int, 2> wake{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake.data()), 0);
+  std::string server_error;
+  std::thread server([&] {
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    const int fd = AcceptUntil(listener, deadline);
+    if (fd < 0) { server_error = "accept timed out"; return; }
+    std::string received;
+    if (!ReadExactUntil(fd, &received, expected.size(), deadline) || received != expected) {
+      server_error = "request mismatch";
+      (void)::close(fd);
+      if (::write(wake[1], "q", 1) != 1) server_error = "wake failed";
+      return;
+    }
+    // The pool must close the descriptor once CancelAll takes effect.
+    pollfd descriptor{fd, POLLHUP | POLLIN, 0};
+    const bool saw_eof = ::poll(&descriptor, 1, 5000) > 0;
+    (void)::close(fd);
+    if (!saw_eof) server_error = "no EOF after cancel";
+    if (::write(wake[1], "q", 1) != 1 && server_error.empty()) server_error = "wake failed";
+  });
+
+  net::EventLoop loop;
+  UpstreamPool pool(loop);
+  net::Channel wake_channel(loop, wake[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  int callbacks = 0;
+  bool callback_error = false;
+  pool.Execute(endpoint, Request(),
+               [&](net::UpstreamResult, http::HttpResponse) {
+                 // Suppressed: CancelAll must not deliver a terminal result.
+                 callback_error = true;
+                 ++callbacks;
+               },
+               [&](net::UpstreamProgress progress) {
+                 if (progress == net::UpstreamProgress::kConnected) {
+                   pool.CancelAll();  // inside this connection's callback stack
+                 }
+               });
+  loop.Loop();
+  server.join();
+  wake_channel.Remove();
+  (void)::close(wake[0]);
+  (void)::close(wake[1]);
+
+  EXPECT_FALSE(callback_error);
+  EXPECT_EQ(callbacks, 0);
+  EXPECT_TRUE(server_error.empty()) << server_error;
+}
+
 } // namespace
 } // namespace aegisgate::proxy
