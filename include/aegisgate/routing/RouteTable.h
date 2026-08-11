@@ -46,9 +46,11 @@ public:
   // (R-041).  Returns nullopt for a Route from another table.
   [[nodiscard]] std::optional<std::size_t> NextWeightedIndex(const config::Route &route) const noexcept;
 
-  // route x endpoint runtime state.  Both take pointers that belong to this
-  // table (as returned by Match/NextEndpoint) and return nullptr for routes
-  // from another table or routes that did not enable the feature.
+  // route x endpoint runtime state.  Both identify the endpoint by its
+  // address + port content (the logical identity; the weighted selector
+  // returns copies of the configured endpoints), so any Endpoint value with
+  // the same address/port works.  Returns nullptr for routes from another
+  // table or routes that did not enable the feature.
   [[nodiscard]] health::EndpointHealth *HealthFor(const config::Route &route,
                                                   const config::Endpoint &endpoint) const noexcept;
   [[nodiscard]] resilience::CircuitBreaker *BreakerFor(const config::Route &route,
