@@ -91,11 +91,11 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
                                    std::shared_ptr<resilience::RouteAdmission> admission,
                                    net::TimerQueue *timers, UpstreamPolicy policy,
                                    std::shared_ptr<observability::Metrics> metrics,
-                                   std::string route_name, BreakerProvider breaker_provider)
+                                   std::string route_name, AttemptProvider attempt_provider)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
       metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
-      timers_(timers), breaker_provider_(std::move(breaker_provider)),
+      timers_(timers), attempt_provider_(std::move(attempt_provider)),
       policy_(std::move(policy)) {}
 
 std::shared_ptr<ProxyTransaction>
@@ -115,12 +115,12 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         std::shared_ptr<resilience::RouteAdmission> admission,
                         net::TimerQueue *timers, UpstreamPolicy policy,
                         std::shared_ptr<observability::Metrics> metrics, std::string route_name,
-                        BreakerProvider breaker_provider) {
+                        AttemptProvider attempt_provider) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
       loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
       timers, std::move(policy), std::move(metrics), std::move(route_name),
-      std::move(breaker_provider)));
+      std::move(attempt_provider)));
   transaction->Begin();
   return transaction;
 }
@@ -142,18 +142,25 @@ void ProxyTransaction::Begin() {
     }
   }
   ArmTotalDeadline();
-  StartUpstream();
+  if (!StartUpstream()) {
+    FinishNoEndpoint();
+  }
 }
 
-void ProxyTransaction::StartUpstream() {
+bool ProxyTransaction::StartUpstream() {
   CancelAttemptDeadlines();
   ++generation_;
   connected_ = false;
   response_header_received_ = false;
-  // Each upstream attempt carries its own breaker link; a retry to a
-  // different endpoint obtains a fresh permit from that endpoint's breaker.
-  if (endpoint_.has_value() && breaker_provider_) {
-    breaker_link_ = breaker_provider_(*endpoint_);
+  // The provider chooses an eligible endpoint and issues the attempt permit
+  // (freshly per retry).  No candidate means do not connect.
+  if (attempt_provider_) {
+    const auto selection = attempt_provider_();
+    if (!selection.has_value()) {
+      return false;
+    }
+    endpoint_ = *selection->endpoint;
+    breaker_link_ = selection->link;
   }
   ArmConnectDeadline();
   const auto self = shared_from_this();
@@ -168,7 +175,7 @@ void ProxyTransaction::StartUpstream() {
                        self->HandleUpstream(result, std::move(response));
                      }, [self](net::UpstreamProgress progress) { self->HandleProgress(progress); });
       starting_upstream_ = false;
-      return;
+      return true;
     }
     upstream_ = std::make_unique<net::UpstreamConnection>(
         loop_, upstream_port_, [self](net::UpstreamResult result, http::HttpResponse response) {
@@ -188,6 +195,7 @@ void ProxyTransaction::StartUpstream() {
     starting_upstream_ = false;
     HandleUpstream(net::UpstreamResult::kConnectError, {});
   }
+  return true;
 }
 
 void ProxyTransaction::HandleAdmissionRejected() {
@@ -270,6 +278,26 @@ void ProxyTransaction::AccountFailure() noexcept {
     breaker_link_->breaker->RecordFailure(resilience::CircuitBreaker::Clock::now(),
                                           breaker_link_->permit);
   } catch (...) {
+  }
+}
+
+void ProxyTransaction::FinishNoEndpoint() {
+  if (finished_) return;
+  finished_ = true;
+  ++generation_;
+  CancelDeadlines();
+  reservation_.reset();
+  // No upstream was ever connected, so the 503 carries no upstream label.
+  try {
+    metric_request_.Complete(503, {}, false, "no_healthy_endpoint");
+  } catch (...) {
+  }
+  if (!client_lifetime_.lock()) return;
+  const auto self = shared_from_this();
+  try {
+    client_->SendResponse(http::HttpResponse{503, "Service Unavailable", {}, ""});
+  } catch (const std::logic_error &) {
+  } catch (const std::system_error &) {
   }
 }
 
@@ -363,9 +391,12 @@ void ProxyTransaction::HandleDeadline(std::uint64_t generation) {
 }
 
 bool ProxyTransaction::RetryableFailure(net::UpstreamResult result) const noexcept {
+  // With an attempt provider the retry candidate set is decided at runtime
+  // (healthy and not open); without one the static retry_endpoints apply.
   return !response_header_received_ && retries_ == 0 && policy_.retry_budget != 0 &&
          (request_.method == "GET" || request_.method == "HEAD") &&
-         result != net::UpstreamResult::kSuccess && HasRetryAlternative();
+         result != net::UpstreamResult::kSuccess &&
+         (attempt_provider_ || HasRetryAlternative());
 }
 
 bool ProxyTransaction::HasRetryAlternative() const noexcept {
@@ -381,6 +412,10 @@ bool ProxyTransaction::HasRetryAlternative() const noexcept {
 }
 
 bool ProxyTransaction::StartRetry() {
+  if (attempt_provider_) {
+    ++retries_;
+    return StartUpstream();
+  }
   if (!endpoint_) return false;
   const auto next = std::find_if(policy_.retry_endpoints.begin(), policy_.retry_endpoints.end(),
                                  [this](const config::Endpoint &candidate) {
@@ -389,8 +424,7 @@ bool ProxyTransaction::StartRetry() {
   if (next == policy_.retry_endpoints.end()) return false;
   ++retries_;
   *endpoint_ = *next;
-  StartUpstream();
-  return true;
+  return StartUpstream();
 }
 
 void ProxyTransaction::FinishGatewayTimeout() {
@@ -411,9 +445,10 @@ void ProxyTransaction::FinishGatewayTimeout() {
   catch (const std::logic_error &) {} catch (const std::system_error &) {}
 }
 
-void ProxyTransaction::CompleteMetric(int status, bool rate_limited) noexcept {
+void ProxyTransaction::CompleteMetric(int status, bool rate_limited,
+                                     std::string_view reason) noexcept {
   try {
-    metric_request_.Complete(status, UpstreamLabel(), rate_limited);
+    metric_request_.Complete(status, UpstreamLabel(), rate_limited, reason);
   } catch (...) {
     // Metrics are best-effort; forwarding and lifetime cleanup remain primary.
   }

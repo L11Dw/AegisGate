@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <chrono>
 #include <functional>
+#include <string_view>
 #include <memory>
 #include <functional>
+#include <string_view>
 #include <optional>
 #include <vector>
 
@@ -46,15 +48,23 @@ public:
         std::shared_ptr<resilience::RouteAdmission> admission = nullptr);
   // One breaker link per upstream attempt: the non-owning breaker owned by
   // the route table (lives at least as long as the gateway) plus the permit
-  // this attempt was admitted with.  A retry to another endpoint obtains a
-  // fresh link.  nullopt means the route has no breaker and outcomes are not
-  // accounted.
+  // this attempt was admitted with.  nullopt means the route has no breaker
+  // and outcomes are not accounted.
   struct BreakerLink {
     resilience::CircuitBreaker *breaker;
     resilience::CircuitBreaker::RequestPermit permit;
   };
-  using BreakerProvider =
-      std::function<std::optional<BreakerLink>(const config::Endpoint &)>;
+  // The outcome of choosing one upstream attempt: an eligible endpoint plus
+  // its breaker link (absent when the route has no breaker).
+  struct AttemptSelection {
+    const config::Endpoint *endpoint;
+    std::optional<BreakerLink> link;
+  };
+  // Chooses the endpoint for the initial attempt and for every retry, so
+  // unhealthy or open candidates are never connected to.  nullopt means no
+  // eligible candidate remains; the initial call terminates with a unique
+  // 503 and a retry call terminates the transaction.
+  using AttemptProvider = std::function<std::optional<AttemptSelection>()>;
 
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
@@ -62,7 +72,7 @@ public:
                         std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
         net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
         std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {},
-        BreakerProvider breaker_provider = {});
+        AttemptProvider attempt_provider = {});
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -74,10 +84,11 @@ private:
                    std::shared_ptr<resilience::RouteAdmission> admission,
                    net::TimerQueue *timers, UpstreamPolicy policy,
                    std::shared_ptr<observability::Metrics> metrics, std::string route_name,
-                   BreakerProvider breaker_provider);
+                   AttemptProvider attempt_provider);
 
   void Begin();
-  void StartUpstream();
+  [[nodiscard]] bool StartUpstream();
+  void FinishNoEndpoint();
   void HandleProgress(net::UpstreamProgress progress);
   void ArmConnectDeadline();
   void ArmFirstByteDeadline();
@@ -94,7 +105,8 @@ private:
   void AccountFailure() noexcept;
   void HandleAdmissionRejected();
   void HandleUpstream(net::UpstreamResult result, http::HttpResponse response);
-  void CompleteMetric(int status, bool rate_limited = false) noexcept;
+  void CompleteMetric(int status, bool rate_limited = false,
+                     std::string_view reason = {}) noexcept;
   [[nodiscard]] std::string UpstreamLabel() const;
 
   net::EventLoop &loop_;
@@ -112,7 +124,7 @@ private:
   std::unique_ptr<net::UpstreamConnection> upstream_;
   std::shared_ptr<UpstreamPool> pool_;
   net::TimerQueue *timers_ = nullptr;
-  BreakerProvider breaker_provider_;
+  AttemptProvider attempt_provider_;
   UpstreamPolicy policy_;
   net::UpstreamConnection *active_connection_ = nullptr;
   net::TimerQueue::TimerId connect_timer_ = 0;

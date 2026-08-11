@@ -1059,5 +1059,81 @@ TEST(GatewayTest, RouteIsolatedBreakerState) {
   EXPECT_EQ(::close(wake_fds[1]), 0);
 }
 
+
+TEST(GatewayTest, RetrySkipsOpenCandidateWithoutConnecting) {
+  net::Socket first_listener = net::Socket::ListenLoopback();
+  net::Socket open_listener = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_listener.BoundPort(), 1};
+  const config::Endpoint open_endpoint{"127.0.0.1", {127, 0, 0, 1}, open_listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {first, open_endpoint}, 10, 10, 4};
+  route.circuit_breaker = config::CircuitBreakerSettings{10, 5, 500, 5, 1};
+  route.retry_budget = 1;
+  const config::Config config{{route}};
+
+  // The first endpoint accepts and immediately closes: a retryable EOF.
+  std::string first_error;
+  std::thread first_backend([&] {
+    const int fd = AcceptUntil(first_listener, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, 53, TestDeadline(), first_error);
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  // Drive the second endpoint's breaker open.
+  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_NE(matched, nullptr);
+  auto *breaker = gateway.Routes().BreakerFor(*matched, matched->endpoints[1]);
+  ASSERT_NE(breaker, nullptr);
+  const auto now = std::chrono::steady_clock::now();
+  for (int i = 0; i < 5; ++i) {
+    const auto at = now + std::chrono::milliseconds(i);
+    breaker->RecordFailure(at, breaker->Select(at));
+  }
+
+  std::string client_error;
+  std::string client_response;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    constexpr std::string_view expected = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    client_response = ReadExact(socket.Fd(), expected.size(), TestDeadline(), client_error);
+    pollfd descriptor{socket.Fd(), POLLIN | POLLHUP, 0};
+    if (client_error.empty() && ::poll(&descriptor, 1, 100) != 0) {
+      client_error = "received bytes after terminal 502";
+    }
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+  first_backend.join();
+
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_EQ(client_response, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+  // The open candidate must never have been connected to.
+  pollfd descriptor{open_listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "retry connected to an open endpoint";
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
 } // namespace
 } // namespace aegisgate::gateway
