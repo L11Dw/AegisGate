@@ -486,19 +486,29 @@ TEST(EndToEndTest, AllEndpointsUnavailableServesUnique503WithInflightZero) {
   std::string error;
   std::string metrics;
   std::string recovered_metrics;
-  RunGateway(config::Config{{route}}, [&](gateway::Gateway &, std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &gateway, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
+    const config::Route *matched = gateway.Routes().Match("guarded.e2e.test", "/");
+    if (error.empty() && matched == nullptr) error = "route not matched";
     constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: guarded.e2e.test\r\n\r\n";
     constexpr std::string_view upstream_fail = "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n";
     constexpr std::string_view gateway_fail = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
     // One failing request opens the breaker (min_requests=1).
-    if (WriteAll(client.Fd(), request, TestDeadline(), error)) {
+    if (error.empty() && WriteAll(client.Fd(), request, TestDeadline(), error)) {
       if (ReadExact(client.Fd(), upstream_fail.size(), TestDeadline(), error) != upstream_fail) {
         if (error.empty()) error = "expected upstream 503";
       }
     }
     if (!error.empty() && error == "unexpected EOF or read error") {
       error += " (first response)";
+    }
+    // Deterministic barrier: the coordinator processes the first failure on its
+    // own loop asynchronously, so the client waits for the breaker to open
+    // before the second request relies on the open state (no timing guess).
+    if (error.empty() &&
+        !WaitForBreakerState(gateway, *matched, matched->endpoints.front(),
+                             resilience::CircuitBreaker::State::kOpen, TestDeadline())) {
+      error = "breaker did not open after the failing request";
     }
     // Open: the gateway answers 503 without connecting or retrying.
     if (error.empty() && WriteAll(client.Fd(), request, TestDeadline(), error)) {
