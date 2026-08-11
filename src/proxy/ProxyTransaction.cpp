@@ -208,8 +208,12 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
     const auto self = shared_from_this();
     loop_.QueueAfterCurrentBatch([self] {
       if (self->finished_) return;
-      if (!self->StartRetry()) self->HandleUpstream(net::UpstreamResult::kReadError, {});
+      if (!self->StartRetry()) self->FinishFailure();
     });
+    return;
+  }
+  if (result != net::UpstreamResult::kSuccess) {
+    FinishFailure();
     return;
   }
   finished_ = true;
@@ -219,7 +223,7 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   // destroy that object while its Start()/Finish() stack frame is active.
   if (!starting_upstream_) upstream_.reset();
 
-  CompleteMetric(result == net::UpstreamResult::kSuccess ? response.status : 502);
+  CompleteMetric(response.status);
   const auto client_lifetime = client_lifetime_.lock();
   if (!client_lifetime) {
     return;
@@ -227,12 +231,29 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   const auto self = shared_from_this();
 
   try {
-    if (result == net::UpstreamResult::kSuccess) {
-      StripHopByHopHeaders(response);
-      client_->SendResponse(response);
-    } else {
-      client_->SendResponse(http::HttpResponse{502, "Bad Gateway", {}, ""});
-    }
+    StripHopByHopHeaders(response);
+    client_->SendResponse(response);
+  } catch (const std::logic_error &) {
+  } catch (const std::system_error &) {
+  }
+}
+
+void ProxyTransaction::FinishFailure() {
+  if (finished_) return;
+  finished_ = true;
+  ++generation_;
+  CancelDeadlines();
+  reservation_.reset();
+  // The upstream exchange already completed with a terminal failure, so its
+  // descriptor is closed; only the owned object remains to be released.  When
+  // Start() finished synchronously on its own stack frame, releasing here
+  // would destroy that frame's owner, so it stays deferred.
+  if (!starting_upstream_) upstream_.reset();
+  CompleteMetric(502);
+  if (!client_lifetime_.lock()) return;
+  const auto self = shared_from_this();
+  try {
+    client_->SendResponse(http::HttpResponse{502, "Bad Gateway", {}, ""});
   } catch (const std::logic_error &) {
   } catch (const std::system_error &) {
   }
@@ -308,7 +329,19 @@ void ProxyTransaction::HandleDeadline(std::uint64_t generation) {
 bool ProxyTransaction::RetryableFailure(net::UpstreamResult result) const noexcept {
   return !response_header_received_ && retries_ == 0 && policy_.retry_budget != 0 &&
          (request_.method == "GET" || request_.method == "HEAD") &&
-         result != net::UpstreamResult::kSuccess;
+         result != net::UpstreamResult::kSuccess && HasRetryAlternative();
+}
+
+bool ProxyTransaction::HasRetryAlternative() const noexcept {
+  // Retrying only makes sense when a different endpoint can be attempted;
+  // otherwise the request fails fast with a single terminal 502 instead of
+  // re-entering the retry decision forever.
+  if (!endpoint_) return false;
+  return std::any_of(policy_.retry_endpoints.begin(), policy_.retry_endpoints.end(),
+                     [this](const config::Endpoint &candidate) {
+                       return candidate.address != endpoint_->address ||
+                              candidate.port != endpoint_->port;
+                     });
 }
 
 bool ProxyTransaction::StartRetry() {

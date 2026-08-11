@@ -70,7 +70,9 @@ private:
   void CancelDeadlines();
   void HandleDeadline(std::uint64_t generation);
   [[nodiscard]] bool RetryableFailure(net::UpstreamResult result) const noexcept;
+  [[nodiscard]] bool HasRetryAlternative() const noexcept;
   [[nodiscard]] bool StartRetry();
+  void FinishFailure();
   void FinishGatewayTimeout();
   void HandleAdmissionRejected();
   void HandleUpstream(net::UpstreamResult result, http::HttpResponse response);

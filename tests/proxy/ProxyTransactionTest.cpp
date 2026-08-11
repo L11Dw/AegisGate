@@ -531,5 +531,74 @@ TEST(ProxyTransactionTest, CancelsAllDeadlinesAfterARetrySucceeds) {
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
+
+TEST(ProxyTransactionTest, DoesNotRetryWithoutADifferentCandidate) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const std::uint16_t port = listener.BoundPort();
+  listener.Close();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+
+  std::weak_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.connect_timeout = std::chrono::seconds(1);
+    policy.first_byte_timeout = std::chrono::seconds(1);
+    policy.total_timeout = std::chrono::seconds(2);
+    policy.retry_budget = 1;
+    policy.retry_endpoints = {endpoint};
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr, nullptr,
+                                          std::move(policy));
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET /retry HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    const auto received = ReadExactUntil(client_sockets[1], response.size(), TestDeadline(), peer_result.error);
+    if (!received) return;
+    peer_result.received = *received;
+    pollfd descriptor{client_sockets[1], POLLIN | POLLHUP, 0};
+    if (::poll(&descriptor, 1, 100) != 0) {
+      peer_result.error = "received bytes after terminal 502";
+      return;
+    }
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  LoopWatchdog watchdog(wake_sockets[1]);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_TRUE(peer_result.wire_ok);
+  EXPECT_TRUE(transaction.expired());
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
 } // namespace
 } // namespace aegisgate::proxy
