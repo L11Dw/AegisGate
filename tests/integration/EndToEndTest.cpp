@@ -17,6 +17,8 @@
 #include "aegisgate/config/Config.h"
 #include "aegisgate/gateway/Gateway.h"
 #include "aegisgate/mock/MockBackend.h"
+
+#include "../support/WakeFd.h"
 #include "aegisgate/net/Channel.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
@@ -81,10 +83,11 @@ std::string ReadUntil(int fd, std::string_view needle, Deadline deadline, std::s
 
 class BackendRunner {
 public:
-  explicit BackendRunner(mock::MockBackendOptions options) {
+  explicit BackendRunner(mock::MockBackendOptions options, std::string &error)
+      : error_(&error) {
     auto ready = std::make_shared<std::promise<std::pair<std::uint16_t, int>>>();
     auto future = ready->get_future();
-    thread_ = std::thread([options, ready] {
+    thread_ = std::thread([options, ready, this] {
       try {
         std::array<int, 2> wake{};
         if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake.data()) != 0) {
@@ -92,7 +95,10 @@ public:
         }
         net::EventLoop loop;
         net::Channel channel(loop, wake[0]);
-        channel.SetReadCallback([&] { char byte = '\0'; (void)::read(wake[0], &byte, 1); loop.Quit(); });
+        channel.SetReadCallback([&] {
+          (void)test::ConsumeWakeFd(wake[0], 'q', *error_);
+          loop.Quit();
+        });
         channel.EnableReading();
         mock::MockBackend backend(loop, options, "127.0.0.1", 0);
         backend.Start();
@@ -110,8 +116,15 @@ public:
     wake_ = wake;
   }
 
-  ~BackendRunner() {
-    if (wake_ >= 0) (void)::write(wake_, "q", 1);
+  ~BackendRunner() { Stop(); }
+
+  // Signals the worker to exit, joins it, and makes later Stop() calls
+  // idempotent so the caller can assert the error state afterwards.
+  void Stop() {
+    if (wake_ >= 0) {
+      (void)test::SignalWakeFd(wake_, 'q', *error_);
+      wake_ = -1;
+    }
     if (thread_.joinable()) thread_.join();
   }
 
@@ -121,6 +134,7 @@ private:
   std::thread thread_;
   std::uint16_t port_ = 0;
   int wake_ = -1;
+  std::string *error_ = nullptr;
 };
 
 config::Endpoint Endpoint(std::uint16_t port) { return {"127.0.0.1", {127, 0, 0, 1}, port, 1}; }
@@ -155,8 +169,10 @@ void RunGateway(config::Config config, Client client) {
 }
 
 TEST(EndToEndTest, ForwardsNormalAnd5xxMockResultsAndExportsMetrics) {
-  BackendRunner normal(mock::MockBackendOptions{.status = 200});
-  BackendRunner fault(mock::MockBackendOptions{.status = 503});
+  std::string normal_error;
+  std::string fault_error;
+  BackendRunner normal(mock::MockBackendOptions{.status = 200}, normal_error);
+  BackendRunner fault(mock::MockBackendOptions{.status = 503}, fault_error);
   std::string error;
   std::string normal_response;
   std::string fault_response;
@@ -180,11 +196,17 @@ TEST(EndToEndTest, ForwardsNormalAnd5xxMockResultsAndExportsMetrics) {
   EXPECT_EQ(fault_response, "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n");
   EXPECT_NE(metrics.find("aegisgate_requests_total{route=\"normal\",status=\"200\""), std::string::npos);
   EXPECT_NE(metrics.find("aegisgate_requests_total{route=\"fault\",status=\"503\""), std::string::npos);
+  normal.Stop();
+  fault.Stop();
+  EXPECT_TRUE(normal_error.empty()) << normal_error;
+  EXPECT_TRUE(fault_error.empty()) << fault_error;
 }
 
 TEST(EndToEndTest, MapsResetAndDelayedMocksTo502And504) {
-  BackendRunner reset(mock::MockBackendOptions{.reset = true});
-  BackendRunner delayed(mock::MockBackendOptions{.delay = std::chrono::milliseconds(400)});
+  std::string reset_error;
+  std::string delayed_error;
+  BackendRunner reset(mock::MockBackendOptions{.reset = true}, reset_error);
+  BackendRunner delayed(mock::MockBackendOptions{.delay = std::chrono::milliseconds(400)}, delayed_error);
   std::string error;
   std::string reset_response;
   std::string delayed_response;
@@ -203,11 +225,17 @@ TEST(EndToEndTest, MapsResetAndDelayedMocksTo502And504) {
   EXPECT_TRUE(error.empty()) << error;
   EXPECT_EQ(reset_response, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
   EXPECT_EQ(delayed_response, "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n");
+  reset.Stop();
+  delayed.Stop();
+  EXPECT_TRUE(reset_error.empty()) << reset_error;
+  EXPECT_TRUE(delayed_error.empty()) << delayed_error;
 }
 
 TEST(EndToEndTest, EnforcesRateAndInflightAdmissionAgainstRealMocks) {
-  BackendRunner fast(mock::MockBackendOptions{.status = 200});
-  BackendRunner slow(mock::MockBackendOptions{.delay = std::chrono::milliseconds(400)});
+  std::string fast_error;
+  std::string slow_error;
+  BackendRunner fast(mock::MockBackendOptions{.status = 200}, fast_error);
+  BackendRunner slow(mock::MockBackendOptions{.delay = std::chrono::milliseconds(400)}, slow_error);
   std::string error;
   std::string rate_first;
   std::string rate_second;
@@ -233,6 +261,10 @@ TEST(EndToEndTest, EnforcesRateAndInflightAdmissionAgainstRealMocks) {
   EXPECT_EQ(rate_first, "HTTP/1.1 200 Mock Response\r\nContent-Length: 0\r\n\r\n");
   EXPECT_EQ(rate_second, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n");
   EXPECT_EQ(inflight_second, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n");
+  fast.Stop();
+  slow.Stop();
+  EXPECT_TRUE(fast_error.empty()) << fast_error;
+  EXPECT_TRUE(slow_error.empty()) << slow_error;
 }
 
 } // namespace

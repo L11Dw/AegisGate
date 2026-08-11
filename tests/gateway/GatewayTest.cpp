@@ -19,6 +19,8 @@
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
 
+#include "../support/WakeFd.h"
+
 namespace aegisgate::gateway {
 namespace {
 
@@ -700,25 +702,25 @@ TEST(GatewayTest, DoesNotStartFirstByteDeadlineUntilLargeRequestIsFullyWritten) 
     std::string request = "POST /blocked HTTP/1.1\r\nHost: gateway.test\r\nContent-Length: " +
                           std::to_string(kBodySize) + "\r\n\r\n" + std::string(kBodySize, 'x');
     if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     char accepted = '\0';
     if (::read(gate[0], &accepted, 1) != 1 || accepted != 'a') {
       client_error = "accept gate read failed";
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     pollfd descriptor{socket.Fd(), POLLIN | POLLHUP, 0};
     if (::poll(&descriptor, 1, 300) != 0) {
       client_error = "first-byte timeout armed before blocked write drained";
-      (void)::write(gate[0], "d", 1);
-      (void)::write(wake_fds[1], "q", 1);
+      if (::write(gate[0], "d", 1) != 1 && client_error.empty()) client_error = "drain gate write failed";
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     if (::write(gate[0], "d", 1) != 1) {
       client_error = "drain gate write failed";
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -766,12 +768,12 @@ TEST(GatewayTest, RecordsActualUnmatchedOutcomeAndServesPrometheusEndpoint) {
     if (!WriteAll(socket.Fd(), missing, TestDeadline(), client_error) ||
         ReadExact(socket.Fd(), missing_response.size(), TestDeadline(), client_error) !=
             missing_response) {
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     constexpr std::string_view metrics = "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n";
     if (!WriteAll(socket.Fd(), metrics, TestDeadline(), client_error)) {
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     metrics_response = ReadUntilContains(socket.Fd(), "aegisgate_inflight_requests 0\n",
