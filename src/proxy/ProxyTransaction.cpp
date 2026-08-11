@@ -9,10 +9,11 @@
 #include <unordered_set>
 #include <utility>
 
+#include "aegisgate/health/Coordinator.h"
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/proxy/UpstreamPool.h"
-#include "aegisgate/resilience/RouteAdmission.h"
+
 
 namespace aegisgate::proxy {
 namespace {
@@ -88,21 +89,23 @@ void StripHopByHopHeaders(http::HttpResponseHead &head) {
 
 ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                                    std::uint16_t upstream_port, http::HttpRequest request,
-                                   std::shared_ptr<resilience::RouteAdmission> admission)
+                                   std::optional<resilience::GlobalAdmission::Reservation> reservation)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
-      upstream_port_(upstream_port), request_(std::move(request)), admission_(std::move(admission)) {}
+      upstream_port_(upstream_port), request_(std::move(request)),
+      reservation_(std::move(reservation)) {}
 
 ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                                    config::Endpoint endpoint, http::HttpRequest request,
                                    std::shared_ptr<UpstreamPool> pool,
-                                   std::shared_ptr<resilience::RouteAdmission> admission,
+                                   std::optional<resilience::GlobalAdmission::Reservation> reservation,
                                    net::TimerQueue *timers, UpstreamPolicy policy,
                                    std::shared_ptr<observability::Metrics> metrics,
                                    std::string route_name, AttemptProvider attempt_provider,
                                    std::optional<std::weak_ptr<void>> gateway_lifetime)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       gateway_lifetime_(std::move(gateway_lifetime)),
-      endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
+      endpoint_(std::move(endpoint)), request_(std::move(request)),
+      reservation_(std::move(reservation)),
       metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
       timers_(timers), attempt_provider_(std::move(attempt_provider)),
       policy_(std::move(policy)) {}
@@ -110,9 +113,9 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         std::uint16_t upstream_port, http::HttpRequest request,
-                        std::shared_ptr<resilience::RouteAdmission> admission) {
+                        std::optional<resilience::GlobalAdmission::Reservation> reservation) {
   const auto transaction = std::shared_ptr<ProxyTransaction>(
-      new ProxyTransaction(loop, client, upstream_port, std::move(request), std::move(admission)));
+      new ProxyTransaction(loop, client, upstream_port, std::move(request), std::move(reservation)));
   transaction->Begin();
   return transaction;
 }
@@ -121,16 +124,16 @@ std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         config::Endpoint endpoint, http::HttpRequest request,
                         std::shared_ptr<UpstreamPool> pool,
-                        std::shared_ptr<resilience::RouteAdmission> admission,
+                        std::optional<resilience::GlobalAdmission::Reservation> reservation,
                         net::TimerQueue *timers, UpstreamPolicy policy,
                         std::shared_ptr<observability::Metrics> metrics, std::string route_name,
                         AttemptProvider attempt_provider,
                         std::optional<std::weak_ptr<void>> gateway_lifetime) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
-      loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
-      timers, std::move(policy), std::move(metrics), std::move(route_name),
-      std::move(attempt_provider), std::move(gateway_lifetime)));
+      loop, client, std::move(endpoint), std::move(request), std::move(pool),
+      std::move(reservation), timers, std::move(policy), std::move(metrics),
+      std::move(route_name), std::move(attempt_provider), std::move(gateway_lifetime)));
   transaction->Begin();
   return transaction;
 }
@@ -152,13 +155,9 @@ void ProxyTransaction::Begin() {
       metrics_.reset();
     }
   }
-  if (admission_) {
-    reservation_ = admission_->TryAcquire(resilience::TokenBucket::Clock::now());
-    if (!reservation_) {
-      HandleAdmissionRejected();
-      return;
-    }
-  }
+  // The global admission (in-flight slot plus one lease token) was acquired
+  // by the worker data plane before this transaction started; the reservation
+  // is released exactly once at the terminal path or by RAII.
   // Wire the downstream stream notifications.  Both callbacks hold only a
   // weak reference so a live connection cannot retain a finished transaction;
   // every terminal path clears them via ClearClientStreamCallbacks().
@@ -244,22 +243,6 @@ bool ProxyTransaction::StartUpstream() {
     HandleUpstream(net::UpstreamResult::kConnectError, {});
   }
   return true;
-}
-
-void ProxyTransaction::HandleAdmissionRejected() {
-  if (finished_) return;
-  finished_ = true;
-  CancelDeadlines();
-  CompleteMetric(429, true);
-  const auto client_lifetime = client_lifetime_.lock();
-  if (!client_lifetime) return;
-  ClearClientStreamCallbacks();
-  const auto self = shared_from_this();
-  try {
-    client_->SendResponse(http::HttpResponse{429, "Too Many Requests", {}, ""});
-  } catch (const std::logic_error &) {
-  } catch (const std::system_error &) {
-  }
 }
 
 void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResponse response) {
@@ -455,22 +438,19 @@ void ProxyTransaction::ClearClientStreamCallbacks() noexcept {
 void ProxyTransaction::AccountSuccess() noexcept {
   if (!breaker_link_.has_value() || attempt_accounted_) return;
   attempt_accounted_ = true;
-  try {
-    breaker_link_->breaker->RecordSuccess(resilience::CircuitBreaker::Clock::now(),
-                                          breaker_link_->permit);
-  } catch (...) {
-    // Breaker accounting is best-effort; forwarding remains primary.
-  }
+  const BreakerLink &link = *breaker_link_;
+  (void)link.coordinator->PostResult(
+      {link.route_index, link.endpoint_index, link.permit, true});
 }
 
 void ProxyTransaction::AccountFailure() noexcept {
   if (!breaker_link_.has_value() || attempt_accounted_) return;
   attempt_accounted_ = true;
-  try {
-    breaker_link_->breaker->RecordFailure(resilience::CircuitBreaker::Clock::now(),
-                                          breaker_link_->permit);
-  } catch (...) {
-  }
+  const BreakerLink &link = *breaker_link_;
+  // A dropped submission (coordinator queue full or stopping) loses one
+  // accounting sample at most; it is never double-applied.
+  (void)link.coordinator->PostResult(
+      {link.route_index, link.endpoint_index, link.permit, false});
 }
 
 void ProxyTransaction::FinishNoEndpoint() {

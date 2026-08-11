@@ -15,8 +15,8 @@
 #include "aegisgate/net/UpstreamConnection.h"
 #include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/observability/Metrics.h"
-#include "aegisgate/resilience/CircuitBreaker.h"
-#include "aegisgate/resilience/InflightLimiter.h"
+#include "aegisgate/health/CoordinatorState.h"
+#include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/routing/ActiveReservation.h"
 
 namespace aegisgate::net {
@@ -24,9 +24,9 @@ class ClientConnection;
 class EventLoop;
 } // namespace aegisgate::net
 
-namespace aegisgate::resilience {
-class RouteAdmission;
-} // namespace aegisgate::resilience
+namespace aegisgate::health {
+class Coordinator;
+} // namespace aegisgate::health
 
 namespace aegisgate::proxy {
 
@@ -46,14 +46,16 @@ public:
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, std::uint16_t upstream_port,
         http::HttpRequest request,
-        std::shared_ptr<resilience::RouteAdmission> admission = nullptr);
-  // One breaker link per upstream attempt: the non-owning breaker owned by
-  // the route table (lives at least as long as the gateway) plus the permit
-  // this attempt was admitted with.  nullopt means the route has no breaker
-  // and outcomes are not accounted.
+        std::optional<resilience::GlobalAdmission::Reservation> reservation = std::nullopt);
+  // One breaker link per upstream attempt: the C1' coordinator handle plus
+  // the permit this attempt was admitted with.  The coordinator validates the
+  // permit (generation, probe id) on its own loop; nullopt means the route
+  // has no breaker and outcomes are not accounted.
   struct BreakerLink {
-    resilience::CircuitBreaker *breaker;
-    resilience::CircuitBreaker::RequestPermit permit;
+    std::shared_ptr<health::Coordinator> coordinator;
+    std::size_t route_index;
+    std::size_t endpoint_index;
+    health::AttemptPermit permit;
   };
   // The outcome of choosing one upstream attempt: an eligible endpoint plus
   // its breaker link (absent when the route has no breaker) plus the active
@@ -73,7 +75,7 @@ public:
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
         http::HttpRequest request, std::shared_ptr<UpstreamPool> pool,
-                        std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
+        std::optional<resilience::GlobalAdmission::Reservation> reservation = std::nullopt,
         net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
         std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {},
         AttemptProvider attempt_provider = {},
@@ -82,11 +84,11 @@ public:
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                    std::uint16_t upstream_port, http::HttpRequest request,
-                   std::shared_ptr<resilience::RouteAdmission> admission);
+                   std::optional<resilience::GlobalAdmission::Reservation> reservation);
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                    config::Endpoint endpoint, http::HttpRequest request,
                    std::shared_ptr<UpstreamPool> pool,
-                   std::shared_ptr<resilience::RouteAdmission> admission,
+                   std::optional<resilience::GlobalAdmission::Reservation> reservation,
                    net::TimerQueue *timers, UpstreamPolicy policy,
                    std::shared_ptr<observability::Metrics> metrics, std::string route_name,
                    AttemptProvider attempt_provider,
@@ -123,7 +125,6 @@ private:
   void FinishGatewayTimeout();
   void AccountSuccess() noexcept;
   void AccountFailure() noexcept;
-  void HandleAdmissionRejected();
   void HandleUpstream(net::UpstreamResult result, http::HttpResponse response);
   void CompleteMetric(int status, bool rate_limited = false,
                      std::string_view reason = {}) noexcept;
@@ -136,8 +137,9 @@ private:
   std::uint16_t upstream_port_;
   std::optional<config::Endpoint> endpoint_;
   http::HttpRequest request_;
-  std::shared_ptr<resilience::RouteAdmission> admission_;
-  std::optional<resilience::InflightLimiter::Reservation> reservation_;
+  // Pre-acquired by the caller (worker data plane) from the global
+  // admission; released exactly once at the terminal path or by RAII.
+  std::optional<resilience::GlobalAdmission::Reservation> reservation_;
   std::shared_ptr<observability::Metrics> metrics_;
   std::string route_name_;
   observability::Metrics::RequestHandle metric_request_;

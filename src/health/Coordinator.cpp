@@ -169,7 +169,18 @@ void Coordinator::ScheduleArm(std::size_t route, std::size_t endpoint) {
   timer_id = loop_data_->timers->ScheduleAfter(
       until - now, [this, route, endpoint] {
         loop_data_->arm_timers[route][endpoint] = 0;
-        state_->ArmHalfOpen(route, endpoint, Clock::now());
+        const auto fired_at = Clock::now();
+        if (state_->IsOpen(route, endpoint)) {
+          if (fired_at < state_->OpenUntil(route, endpoint)) {
+            // The timer can fire a few microseconds before the open window
+            // elapses (ScheduleArm computes until - now with a now captured
+            // slightly after Open()): re-arm instead of dropping the
+            // transition, or the breaker would stay open forever.
+            ScheduleArm(route, endpoint);
+            return;
+          }
+          state_->ArmHalfOpen(route, endpoint, fired_at);
+        }
         Publish();
       });
 }

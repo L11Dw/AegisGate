@@ -28,15 +28,17 @@ public:
   ActiveReservation &operator=(ActiveReservation &&other) noexcept;
   ~ActiveReservation();
 
-  // True while the owning table is still alive and this guard holds a slot.
+  // True while the owning state is still alive and this guard holds a slot.
   explicit operator bool() const noexcept { return !state_.expired(); }
   void Release() noexcept;
 
-private:
-  friend class RouteTable;
+  // Public so worker-local selection state (per-worker active counters) can
+  // hand out reservations; the weak state keeps the release safe after the
+  // owning worker state was destroyed.
   explicit ActiveReservation(std::weak_ptr<State> state) noexcept
       : state_(std::move(state)) {}
 
+private:
   std::weak_ptr<State> state_;
 };
 
