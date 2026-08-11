@@ -224,4 +224,24 @@ TEST(CircuitBreakerTest, LargeTimeJumpVoidsOldSamples) {
   EXPECT_EQ(breaker.Select(later + std::chrono::milliseconds(1)).selection,
             Selection::kAllowed);
 }
+
+TEST(CircuitBreakerTest, HalfOpenWaitsForFullProbeQuota) {
+  const auto now = Clock::now();
+  CircuitBreaker breaker(Config(5, 500, 2), now);
+  for (int i = 0; i < 5; ++i) {
+    const auto at = now + std::chrono::milliseconds(i);
+    breaker.RecordFailure(at, breaker.Select(at));
+  }
+  // Probe 1 succeeds before probe 2 is even issued: the breaker must stay
+  // half-open until the configured quota of probes has completed.
+  const auto first = breaker.Select(now + std::chrono::milliseconds(60));
+  ASSERT_EQ(first.selection, Selection::kProbe);
+  breaker.RecordSuccess(now + std::chrono::milliseconds(70), first);
+  EXPECT_EQ(breaker.StateNow(), State::kHalfOpen);
+  const auto second = breaker.Select(now + std::chrono::milliseconds(71));
+  EXPECT_EQ(second.selection, Selection::kProbe);
+  breaker.RecordSuccess(now + std::chrono::milliseconds(72), second);
+  EXPECT_EQ(breaker.StateNow(), State::kClosed);
+}
+
 } // namespace aegisgate::resilience

@@ -32,7 +32,9 @@ void CircuitBreaker::RecordSuccess(Clock::time_point now, const RequestPermit &p
       return;
     }
     ++half_open_completed_;
-    if (half_open_completed_ == half_open_issued_) {
+    // Only the full configured probe quota closes the breaker: a probe that
+    // succeeds before the remaining probes are even issued must not close it.
+    if (half_open_completed_ == config_.half_open_probes) {
       Close();
     }
     return;
