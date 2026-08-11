@@ -51,15 +51,19 @@ int AcceptBlocking(const net::Socket &listener, Deadline deadline) {
 }
 
 // One loopback backend answering each accepted connection from a sequence of
-// responses; an empty response sleeps past the check timeout.  All I/O
-// failures are recorded into the caller's error string (mutex-protected) and
-// asserted by the main thread after Stop(); no GTest assertions run on the
-// worker thread.
+// responses; an empty response holds the connection open without writing (a
+// slow backend) until the worker observes the stop signal.  All I/O failures
+// are recorded into the caller's error string (mutex-protected) and asserted
+// by the main thread after Stop(); no GTest assertions run on the worker
+// thread, and no fixed sleeps pace the worker.
 class SequencedBackend {
 public:
   explicit SequencedBackend(std::vector<std::string> responses, std::string &error)
       : listener_(net::Socket::ListenLoopback()), responses_(std::move(responses)),
         error_(&error) {
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop_fds_.data()) != 0) {
+      throw std::system_error(errno, std::generic_category(), "socketpair backend stop");
+    }
     thread_ = std::thread([this] { Serve(); });
   }
 
@@ -68,7 +72,11 @@ public:
     listener_.Close();
   }
 
+  // Signals the worker to release any held connection and exit, then joins.
   void Stop() {
+    if (stop_fds_[1] >= 0) {
+      (void)test::SignalWakeFd(stop_fds_[1], 's', *error_);
+    }
     if (thread_.joinable()) thread_.join();
   }
 
@@ -78,6 +86,11 @@ private:
   void Fail(std::string message) {
     std::lock_guard<std::mutex> guard(mutex_);
     error_->append(std::move(message)).append("; ");
+  }
+
+  bool StopRequested() {
+    pollfd descriptor{stop_fds_[0], POLLIN, 0};
+    return ::poll(&descriptor, 1, 3000) > 0;
   }
 
   void Serve() {
@@ -92,7 +105,12 @@ private:
         Fail("read failed");
       }
       if (response.empty()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        // A slow backend: hold the connection without writing until the main
+        // thread signals the check has timed out.
+        if (StopRequested()) {
+          char byte = '\0';
+          (void)::read(stop_fds_[0], &byte, 1);
+        }
       } else if (::write(fd, response.data(), response.size()) !=
                  static_cast<ssize_t>(response.size())) {
         Fail("write failed");
@@ -105,6 +123,7 @@ private:
   std::vector<std::string> responses_;
   std::string *error_;
   std::mutex mutex_;
+  std::array<int, 2> stop_fds_{-1, -1};
   std::thread thread_;
 };
 
