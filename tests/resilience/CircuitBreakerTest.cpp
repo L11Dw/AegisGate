@@ -195,4 +195,33 @@ TEST(CircuitBreakerTest, RejectsInvalidConfiguration) {
   EXPECT_THROW(CircuitBreaker(Config(5, 500, 0), now), std::invalid_argument);
 }
 
+
+TEST(CircuitBreakerTest, SubMillisecondWindowAdvancesWithoutSpinning) {
+  // A 1ms window must not truncate the bucket width to zero (which would
+  // spin); the width is computed in Clock::duration.
+  CircuitBreakerConfig config{std::chrono::milliseconds(1), 5, 500, kOpen, 1};
+  const auto now = Clock::now();
+  CircuitBreaker breaker(config, now);
+  for (int i = 0; i < 5; ++i) {
+    const auto at = now + std::chrono::microseconds(100) * i;
+    breaker.RecordFailure(at, breaker.Select(at));
+  }
+  EXPECT_EQ(breaker.StateNow(), State::kOpen);
+}
+
+TEST(CircuitBreakerTest, LargeTimeJumpVoidsOldSamples) {
+  const auto now = Clock::now();
+  CircuitBreaker breaker(Config(), now);
+  for (int i = 0; i < 4; ++i) {
+    const auto at = now + std::chrono::milliseconds(i);
+    breaker.RecordFailure(at, breaker.Select(at));
+  }
+  // A jump far past the whole window must clear the statistics instead of
+  // counting the aged-out failures.
+  const auto later = now + std::chrono::seconds(10);
+  breaker.RecordSuccess(later, breaker.Select(later));
+  EXPECT_EQ(breaker.StateNow(), State::kClosed);
+  EXPECT_EQ(breaker.Select(later + std::chrono::milliseconds(1)).selection,
+            Selection::kAllowed);
+}
 } // namespace aegisgate::resilience
