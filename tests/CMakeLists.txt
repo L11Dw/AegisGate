@@ -12,6 +12,7 @@ add_executable(aegisgate_tests
     proxy/UpstreamPoolTest.cpp
     gateway/GatewayTest.cpp
     config/ConfigTest.cpp
+    routing/ActiveReservationTest.cpp
     routing/RouteTableTest.cpp
     routing/WeightedRoundRobinTest.cpp
     resilience/TokenBucketTest.cpp

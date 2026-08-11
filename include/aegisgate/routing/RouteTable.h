@@ -4,9 +4,12 @@
 #include "aegisgate/health/EndpointHealth.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/resilience/RouteAdmission.h"
+#include "aegisgate/routing/ActiveReservation.h"
 #include "aegisgate/routing/WeightedRoundRobin.h"
 
 #include <memory>
+#include <optional>
+#include <set>
 #include <string_view>
 #include <vector>
 
@@ -51,12 +54,33 @@ public:
   [[nodiscard]] bool Eligible(const config::Route &route,
                               const config::Endpoint &endpoint) const noexcept;
 
+  // Least-active selection: advances the route's weighted rotation cursor
+  // exactly once, then two-pass scans its endpoints in cyclic order from the
+  // cursor owner (eligible, untried only), returning the table-owned index of
+  // the endpoint with the fewest active attempts.  Active values outrank
+  // weights; weights resolve ties only.  Returns nullopt when no candidate
+  // remains.
+  [[nodiscard]] std::optional<std::size_t>
+  NextLeastActiveIndex(const config::Route &route,
+                       const std::set<std::size_t> &tried) const noexcept;
+
+  // Active-attempt slot state for a table-owned route x endpoint.  Identity is
+  // the endpoint's address + port content; a Route from another table or an
+  // unknown endpoint yields 0 / an empty reservation.
+  [[nodiscard]] std::uint32_t ActiveFor(const config::Route &route,
+                                        const config::Endpoint &endpoint) const noexcept;
+  [[nodiscard]] ActiveReservation AcquireActive(const config::Route &route,
+                                                const config::Endpoint &endpoint) noexcept;
+
 private:
   struct EndpointState {
     std::unique_ptr<health::EndpointHealth> health;
     std::unique_ptr<resilience::CircuitBreaker> breaker;
+    std::shared_ptr<ActiveReservation::State> active;
   };
   [[nodiscard]] std::size_t RouteIndex(const config::Route &route) const noexcept;
+  [[nodiscard]] std::size_t EndpointIndex(std::size_t route_index,
+                                          const config::Endpoint &endpoint) const noexcept;
 
   config::Config config_;
   std::vector<std::shared_ptr<resilience::RouteAdmission>> admissions_;
