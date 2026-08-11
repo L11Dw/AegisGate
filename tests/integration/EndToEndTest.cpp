@@ -764,13 +764,13 @@ TEST(EndToEndTest, ClientDisconnectStopsUpstreamRead) {
       (void)::write(wake, "q", 1);
       return;
     }
-    // Read a little to start the response stream, then reset the connection.
-    std::array<char, 1024> first{};
+    // Wait for the response head to reach the kernel (the stream is
+    // committed), then reset the connection WITHOUT reading: the gateway's
+    // downstream write stays pending, so the reset is observable there and
+    // must cancel the upstream exchange.
     pollfd descriptor{client.Fd(), POLLIN | POLLHUP, 0};
     if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
       if (error.empty()) error = "no response bytes arrived";
-    } else {
-      (void)::read(client.Fd(), first.data(), first.size());
     }
     struct linger reset = {1, 0};
     (void)::setsockopt(client.Fd(), SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
