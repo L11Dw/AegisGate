@@ -1251,9 +1251,14 @@ TEST(ProxyTransactionTest, CancelAllTerminatesInFlightTransaction) {
       return;
     }
     // Never respond and never close: CancelAll must terminate the exchange.
+    // A poll hit alone is not EOF: recv() must return 0.
     pollfd descriptor{fd, POLLHUP | POLLIN, 0};
-    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0 &&
-        backend_error.empty()) {
+    bool saw_eof = false;
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) > 0) {
+      char byte = '\0';
+      saw_eof = ::recv(fd, &byte, 1, 0) == 0;
+    }
+    if (!saw_eof && backend_error.empty()) {
       backend_error = "pool did not close the in-flight connection";
     }
     (void)::close(fd);

@@ -1468,11 +1468,15 @@ TEST(GatewayTest, LeastActiveSkipsUnhealthyAndOpen) {
   EXPECT_EQ(::close(wake_fds[1]), 0);
 }
 
-// R-040 red test: the gateway is destroyed while the first attempt's EOF is
-// pending but unprocessed.  The queued retry task and every late upstream
-// event must never touch the destroyed gateway (timers_ / provider captures);
-// no retry connect may happen and the transaction must terminate cleanly.
-TEST(GatewayTest, GatewayDestructionBeforeQueuedRetryIsSafe) {
+// R-040 regression: the gateway is destroyed while the first attempt's EOF is
+// pending but unprocessed.  Every late upstream event must never touch the
+// destroyed gateway (timers_ / provider captures); no retry connect may happen
+// and the transaction must terminate cleanly.  Note: this covers "EOF
+// unprocessed at destruction"; a retry task already queued but not yet drained
+// cannot be observed in the current EventLoop (batch-end drain is
+// unconditional), so that window is defended by the GatewayDown checks rather
+// than by a dedicated test.
+TEST(GatewayTest, GatewayDestructionWithPendingUpstreamEofIsSafe) {
   net::Socket first_listener = net::Socket::ListenLoopback();
   net::Socket second_listener = net::Socket::ListenLoopback();
   const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_listener.BoundPort(), 1};
@@ -1731,10 +1735,15 @@ TEST(GatewayTest, GatewayDestructionTerminatesInFlightAttempt) {
       return;
     }
     // Never respond and never close on our own: the gateway's shutdown must
-    // terminate the exchange.  Observe the gateway closing the connection.
+    // terminate the exchange.  A poll hit alone is not EOF: recv() must
+    // return 0 to prove the gateway closed the connection.
     pollfd descriptor{fd, POLLHUP | POLLIN, 0};
-    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0 &&
-        backend_error.empty()) {
+    bool saw_eof = false;
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) > 0) {
+      char byte = '\0';
+      saw_eof = ::recv(fd, &byte, 1, 0) == 0;
+    }
+    if (!saw_eof && backend_error.empty()) {
       backend_error = "gateway did not close the in-flight connection";
     }
     (void)::close(fd);

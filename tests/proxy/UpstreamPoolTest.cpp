@@ -331,9 +331,14 @@ TEST(UpstreamPoolTest, CancelAllInsideProgressCallbackIsSafe) {
       if (::write(wake[1], "q", 1) != 1) server_error = "wake failed";
       return;
     }
-    // The pool must close the descriptor once CancelAll takes effect.
+    // The pool must close the descriptor once CancelAll takes effect.  A poll
+    // hit alone is not EOF: recv() must return 0.
     pollfd descriptor{fd, POLLHUP | POLLIN, 0};
-    const bool saw_eof = ::poll(&descriptor, 1, 5000) > 0;
+    bool saw_eof = false;
+    if (::poll(&descriptor, 1, 5000) > 0) {
+      char byte = '\0';
+      saw_eof = ::recv(fd, &byte, 1, 0) == 0;
+    }
     (void)::close(fd);
     if (!saw_eof) server_error = "no EOF after cancel";
     if (::write(wake[1], "q", 1) != 1 && server_error.empty()) server_error = "wake failed";

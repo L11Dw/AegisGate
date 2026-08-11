@@ -11,6 +11,21 @@
 #include "aegisgate/net/Channel.h"
 
 namespace aegisgate::net {
+namespace {
+
+// Exception-safe scope guard for the loop's boolean state flags.
+class BoolGuard {
+public:
+  explicit BoolGuard(bool &flag) : flag_(flag) { flag_ = true; }
+  ~BoolGuard() { flag_ = false; }
+  BoolGuard(const BoolGuard &) = delete;
+  BoolGuard &operator=(const BoolGuard &) = delete;
+
+private:
+  bool &flag_;
+};
+
+} // namespace
 
 EventLoop::EventLoop()
     : epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)), owner_thread_(std::this_thread::get_id()) {
@@ -27,6 +42,7 @@ EventLoop::~EventLoop() {
 
 void EventLoop::Loop() {
   quit_ = false;
+  BoolGuard in_loop(in_loop_);
   std::array<epoll_event, 16> active_events{};
   while (!quit_) {
     const int event_count = ::epoll_wait(
@@ -44,9 +60,12 @@ void EventLoop::Loop() {
       if (registration == registrations_.end()) {
         continue;
       }
-      dispatching_event_ = true;
-      registration->second->HandleEvent(active_events[index].events);
-      dispatching_event_ = false;
+      {
+        // Reset the flag even when HandleEvent throws: a stale "dispatching"
+        // state would defer every later teardown indefinitely.
+        BoolGuard dispatching(dispatching_event_);
+        registration->second->HandleEvent(active_events[index].events);
+      }
       if (quit_) {
         break;
       }

@@ -1,5 +1,6 @@
 #include "aegisgate/proxy/UpstreamPool.h"
 
+#include <cassert>
 #include <stdexcept>
 #include <utility>
 
@@ -58,6 +59,12 @@ bool UpstreamPool::Cancel(net::UpstreamConnection *connection) noexcept {
 }
 
 void UpstreamPool::CancelAll() noexcept {
+  // Contract: callable only from the EventLoop owner thread, or from any
+  // thread while the loop is fully idle (between Loop() calls — e.g. gateway
+  // teardown in tests).  Calling it from another thread while the loop is
+  // dispatching races on dispatching_event_ and active_; debug builds reject
+  // that outright.
+  assert(loop_.IsOwnerThread() || !loop_.IsLoopRunning());
   // Take ownership of every active exchange immediately and suppress both
   // callbacks (logical cancellation: no terminal result, no progress event,
   // and the response callback's captured transaction is released via RAII).
