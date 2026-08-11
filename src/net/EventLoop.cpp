@@ -13,16 +13,19 @@
 namespace aegisgate::net {
 namespace {
 
-// Exception-safe scope guard for the loop's boolean state flags.
+// Exception-safe scope guard for the loop's boolean state flags.  Restores the
+// previous value so nested Loop()/dispatch scopes cannot clear an outer scope's
+// still-live flag.
 class BoolGuard {
 public:
-  explicit BoolGuard(bool &flag) : flag_(flag) { flag_ = true; }
-  ~BoolGuard() { flag_ = false; }
+  explicit BoolGuard(bool &flag) : flag_(flag), previous_(flag) { flag_ = true; }
+  ~BoolGuard() { flag_ = previous_; }
   BoolGuard(const BoolGuard &) = delete;
   BoolGuard &operator=(const BoolGuard &) = delete;
 
 private:
   bool &flag_;
+  bool previous_;
 };
 
 } // namespace
@@ -42,7 +45,6 @@ EventLoop::~EventLoop() {
 
 void EventLoop::Loop() {
   quit_ = false;
-  BoolGuard in_loop(in_loop_);
   std::array<epoll_event, 16> active_events{};
   while (!quit_) {
     const int event_count = ::epoll_wait(

@@ -23,10 +23,6 @@ public:
   // True while a Channel::HandleEvent callback is on the stack of the dispatch
   // thread.  Readable only on the dispatch thread or while the loop is idle.
   [[nodiscard]] bool IsDispatchingEvent() const noexcept { return dispatching_event_; }
-  // True while Loop() is running (including between batches).  Readable only
-  // by the dispatch thread; other threads may read it only while the loop is
-  // guaranteed idle.
-  [[nodiscard]] bool IsLoopRunning() const noexcept { return in_loop_; }
   [[nodiscard]] bool IsOwnerThread() const noexcept {
     return std::this_thread::get_id() == owner_thread_;
   }
@@ -43,7 +39,6 @@ private:
   std::thread::id owner_thread_;
   bool quit_ = false;
   bool dispatching_event_ = false;
-  bool in_loop_ = false;
   std::uint64_t next_registration_token_ = 1;
   std::unordered_map<std::uint64_t, Channel *> registrations_;
   std::vector<std::function<void()>> deferred_tasks_;

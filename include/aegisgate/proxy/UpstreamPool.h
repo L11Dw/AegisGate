@@ -40,9 +40,9 @@ public:
   // suppressed, transactions released via RAII) and closes its descriptor.
   // When called from inside a Channel callback stack the actual Close is
   // deferred to the end of the current epoll batch (the deferred closure owns
-  // the connections); otherwise it closes synchronously.  Must be called on
-  // the EventLoop thread or while the loop is idle.  Idle connections are
-  // closed by the normal destructor.
+  // the connections); otherwise it closes synchronously.  Must be called only
+  // from the EventLoop owner thread.  Idle connections are closed by the
+  // normal destructor.
   void CancelAll() noexcept;
   [[nodiscard]] std::size_t IdleCount(const config::Endpoint &endpoint) const noexcept;
 

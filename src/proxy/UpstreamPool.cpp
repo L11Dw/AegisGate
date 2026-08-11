@@ -59,12 +59,10 @@ bool UpstreamPool::Cancel(net::UpstreamConnection *connection) noexcept {
 }
 
 void UpstreamPool::CancelAll() noexcept {
-  // Contract: callable only from the EventLoop owner thread, or from any
-  // thread while the loop is fully idle (between Loop() calls — e.g. gateway
-  // teardown in tests).  Calling it from another thread while the loop is
-  // dispatching races on dispatching_event_ and active_; debug builds reject
-  // that outright.
-  assert(loop_.IsOwnerThread() || !loop_.IsLoopRunning());
+  // Contract: callable only from the EventLoop owner thread (the gateway
+  // teardown path runs on that thread as well).  A non-owner call would race
+  // on dispatching_event_ and active_; debug builds reject it outright.
+  assert(loop_.IsOwnerThread());
   // Take ownership of every active exchange immediately and suppress both
   // callbacks (logical cancellation: no terminal result, no progress event,
   // and the response callback's captured transaction is released via RAII).
