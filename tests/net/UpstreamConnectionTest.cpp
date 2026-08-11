@@ -327,6 +327,219 @@ TEST(UpstreamConnectionTest, DrainsLargeRequestAcrossWritableEvents) {
 }
 
 
+// --- streaming (header/body split) mode ---
+
+TEST(UpstreamConnectionTest, EmitsHeadThenSegmentedBody) {
+  Socket listener = Socket::ListenLoopback();
+  const http::HttpRequest request = PostRequest();
+  const std::string expected_request = http::SerializeRequest(request);
+  constexpr std::size_t kBodySize = 768 * 1024;
+  const std::string body(kBodySize, 'b');
+  const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                               std::to_string(kBodySize) + "\r\n\r\n" + body;
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    const std::string received = ReadAllRequest(fd, expected_request.size());
+    ASSERT_EQ(received, expected_request);
+    std::size_t written = 0;
+    while (written < response.size()) {
+      const ssize_t count = ::write(fd, response.data() + written, response.size() - written);
+      ASSERT_GT(count, 0);
+      written += static_cast<std::size_t>(count);
+    }
+    EXPECT_EQ(::close(fd), 0);
+  });
+
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamResult result = UpstreamResult::kReadError;
+  bool head_seen = false;
+  bool body_seen_after_head = true;
+  std::string delivered;
+  delivered.reserve(kBodySize);
+  UpstreamConnection connection(loop, listener.BoundPort(),
+                                [&](UpstreamResult value, http::HttpResponse) {
+    ++callback_count;
+    result = value;
+    loop.Quit();
+  });
+  connection.SetStreamingCallbacks(
+      [&](const http::HttpResponseHead &head) {
+        head_seen = true;
+        EXPECT_EQ(head.status, 200);
+        ASSERT_TRUE(head.content_length.has_value());
+        EXPECT_EQ(*head.content_length, kBodySize);
+      },
+      [&](std::string_view bytes) {
+        body_seen_after_head = body_seen_after_head && head_seen;
+        delivered.append(bytes.data(), bytes.size());
+        return true;
+      });
+  connection.Start(request);
+  loop.Loop();
+  server.join();
+
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_EQ(result, UpstreamResult::kSuccess);
+  EXPECT_TRUE(head_seen);
+  EXPECT_TRUE(body_seen_after_head);
+  EXPECT_EQ(delivered, body);
+}
+
+TEST(UpstreamConnectionTest, PauseStopsReadsAndResumeConsumesResidual) {
+  Socket listener = Socket::ListenLoopback();
+  const http::HttpRequest request = PostRequest();
+  const std::string expected_request = http::SerializeRequest(request);
+  constexpr std::size_t kFirstBody = 512 * 1024;
+  constexpr std::size_t kSecondBody = 512 * 1024;
+  constexpr std::size_t kBodySize = kFirstBody + kSecondBody;
+  const std::string body_first(kFirstBody, 'a');
+  const std::string body_second(kSecondBody, 'b');
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    const std::string received = ReadAllRequest(fd, expected_request.size());
+    ASSERT_EQ(received, expected_request);
+    const std::string header = "HTTP/1.1 200 OK\r\nContent-Length: " +
+                               std::to_string(kBodySize) + "\r\n\r\n";
+    ASSERT_EQ(::write(fd, header.data(), header.size()),
+              static_cast<ssize_t>(header.size()));
+    ASSERT_EQ(::write(fd, body_first.data(), kFirstBody),
+              static_cast<ssize_t>(kFirstBody));
+    // The second half may block until the paused client resumes.
+    std::size_t written = 0;
+    while (written < kSecondBody) {
+      const ssize_t count = ::write(fd, body_second.data() + written, kSecondBody - written);
+      ASSERT_GT(count, 0);
+      written += static_cast<std::size_t>(count);
+    }
+    EXPECT_EQ(::close(fd), 0);
+  });
+
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamResult result = UpstreamResult::kReadError;
+  bool accept_body = false;
+  bool paused_observed = false;
+  std::string delivered;
+  delivered.reserve(kBodySize);
+  UpstreamConnection connection(loop, listener.BoundPort(),
+                                [&](UpstreamResult value, http::HttpResponse) {
+    ++callback_count;
+    result = value;
+    loop.Quit();
+  });
+  connection.SetStreamingCallbacks(
+      [](const http::HttpResponseHead &) {},
+      [&](std::string_view bytes) {
+        if (!accept_body) {
+          paused_observed = true;
+          loop.Quit();
+          return false;  // decline: keep the chunk and pause reading
+        }
+        delivered.append(bytes.data(), bytes.size());
+        return true;
+      });
+  connection.Start(request);
+  loop.Loop();
+
+  EXPECT_TRUE(paused_observed);
+  // While paused the connection must not recv: nothing beyond the declined
+  // chunk can reach the sink, and the input buffer stays bounded.
+  EXPECT_TRUE(delivered.empty());
+  EXPECT_EQ(connection.Reusable(), false);
+  accept_body = true;
+  connection.ResumeReading();
+  // ResumeReading consumes residual input synchronously; when that completes
+  // the exchange, the callback's Quit() cannot stop a not-yet-running loop,
+  // so only pump when events remain.
+  if (callback_count == 0) {
+    loop.Loop();
+  }
+  server.join();
+
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_EQ(result, UpstreamResult::kSuccess);
+  EXPECT_EQ(delivered.size(), kBodySize);
+  EXPECT_EQ(delivered.substr(0, kFirstBody), body_first);
+  EXPECT_EQ(delivered.substr(kFirstBody), body_second);
+}
+
+TEST(UpstreamConnectionTest, DoesNotPoolIncompleteStream) {
+  Socket listener = Socket::ListenLoopback();
+  const http::HttpRequest request = PostRequest();
+  const std::string expected_request = http::SerializeRequest(request);
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    const std::string received = ReadAllRequest(fd, expected_request.size());
+    ASSERT_EQ(received, expected_request);
+    // Declared body is never completed before the peer closes.
+    constexpr std::string_view partial =
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial";
+    ASSERT_EQ(::write(fd, partial.data(), partial.size()),
+              static_cast<ssize_t>(partial.size()));
+    EXPECT_EQ(::close(fd), 0);
+  });
+
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamResult result = UpstreamResult::kReadError;
+  std::string delivered;
+  UpstreamConnection connection(loop, listener.BoundPort(),
+                                [&](UpstreamResult value, http::HttpResponse) {
+    ++callback_count;
+    result = value;
+    loop.Quit();
+  });
+  connection.SetStreamingCallbacks(
+      [](const http::HttpResponseHead &) {},
+      [&](std::string_view bytes) {
+        delivered.append(bytes.data(), bytes.size());
+        return true;
+      });
+  connection.Start(request);
+  loop.Loop();
+  server.join();
+
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_EQ(result, UpstreamResult::kEof);
+  EXPECT_FALSE(connection.Reusable());
+  EXPECT_EQ(delivered, "partial");
+}
+
+TEST(UpstreamConnectionTest, RejectsChunkedBeforeHeadCommit) {
+  Socket listener = Socket::ListenLoopback();
+  const http::HttpRequest request = PostRequest();
+  const std::string expected_request = http::SerializeRequest(request);
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    const std::string received = ReadAllRequest(fd, expected_request.size());
+    ASSERT_EQ(received, expected_request);
+    ASSERT_EQ(::write(fd, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", 48), 48);
+    EXPECT_EQ(::close(fd), 0);
+  });
+
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamResult result = UpstreamResult::kReadError;
+  bool head_committed = false;
+  UpstreamConnection connection(loop, listener.BoundPort(),
+                                [&](UpstreamResult value, http::HttpResponse) {
+    ++callback_count;
+    result = value;
+    loop.Quit();
+  });
+  connection.SetStreamingCallbacks(
+      [&](const http::HttpResponseHead &) { head_committed = true; },
+      [](std::string_view) { return true; });
+  connection.Start(request);
+  loop.Loop();
+  server.join();
+
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_EQ(result, UpstreamResult::kUnsupported);
+  EXPECT_FALSE(head_committed);
+}
+
 TEST(UpstreamConnectionTest, CompletesHeadResponseWithoutBody) {
   Socket listener = Socket::ListenLoopback();
   const http::HttpRequest request{"HEAD", "/", "HTTP/1.1", "", {{"Host", "upstream.test"}}};

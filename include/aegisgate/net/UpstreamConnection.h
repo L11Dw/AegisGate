@@ -37,6 +37,12 @@ class UpstreamConnection {
 public:
   using ResponseCallback = std::function<void(UpstreamResult, http::HttpResponse)>;
   using ProgressCallback = std::function<void(UpstreamProgress)>;
+  // Streaming mode: the header callback fires exactly once after the
+  // validated response head; body bytes are handed to the sink, which must
+  // take ownership of the view before returning (returning false keeps the
+  // chunk in the input buffer and pauses reading).  One mode per exchange.
+  using HeaderCallback = std::function<void(const http::HttpResponseHead &)>;
+  using BodySink = http::HttpResponseParser::BodySink;
 
   UpstreamConnection(EventLoop &loop, std::uint16_t port, ResponseCallback callback);
   UpstreamConnection(EventLoop &loop, config::Endpoint endpoint, ResponseCallback callback);
@@ -50,7 +56,16 @@ public:
   void Start(const http::HttpRequest &request);
   void SetResponseCallback(ResponseCallback callback);
   void SetProgressCallback(ProgressCallback callback);
-  // Logically cancels the exchange: both callbacks are cleared so neither a
+  // Switches this exchange to streaming delivery: the header callback
+  // replaces the terminal response callback for the header phase, and the
+  // sink receives body bytes.  Must be set before Start().
+  void SetStreamingCallbacks(HeaderCallback header_callback, BodySink body_sink);
+  // Stops reading the upstream descriptor (idempotent, safe from any callback
+  // stack).  ResumeReading re-enables reading only in the reading state and
+  // first consumes any residual input before recv()ing again.
+  void PauseReading() noexcept;
+  void ResumeReading() noexcept;
+  // Logically cancels the exchange: all callbacks are cleared so neither a
   // terminal result nor a progress event is delivered (the response callback
   // may hold a transaction's shared_ptr).  Safe to call from inside either
   // callback's stack because invocation sites copy the callback first.
@@ -67,9 +82,15 @@ private:
 
   void HandleRead();
   void HandleWrite();
+  void HandleStreamingRead();
+  // Consumes everything parseable in the input buffer (header phase and body
+  // chunks).  Returns false when processing must stop: a terminal Finish or a
+  // declined sink chunk (which pauses reading to bound the input buffer).
+  [[nodiscard]] bool ConsumeStreamingInput();
   void Finish(UpstreamResult result);
   [[nodiscard]] bool PeerHasClosedOrSentExtraBytes() const noexcept;
   [[nodiscard]] bool ResponseRequestsClose() const noexcept;
+  [[nodiscard]] bool HeadRequestsClose() const noexcept;
 
   EventLoop &loop_;
   std::array<std::uint8_t, 4> address_{127, 0, 0, 1};
@@ -82,10 +103,13 @@ private:
   http::HttpResponseParser parser_;
   ResponseCallback callback_;
   ProgressCallback progress_callback_;
+  HeaderCallback header_callback_;
+  BodySink body_sink_;
   State state_ = State::kIdle;
   bool reusable_ = false;
   bool first_byte_reported_ = false;
   bool response_header_reported_ = false;
+  bool header_reported_ = false;
 };
 
 } // namespace aegisgate::net
