@@ -364,7 +364,8 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
     // The metrics expose the open state (appended after the counters) and
     // the 503 reason; read until the circuit_state line so both are present.
     const std::string circuit_needle = "aegisgate_circuit_state{route=\"guarded\",upstream=\"127.0.0.1:" +
-                                       std::to_string(backend.port()) + "\"} open\n";
+                                       std::to_string(backend.port()) +
+                                       "\",state=\"open\"} 1\n";
     if (error.empty() && WriteAll(client.Fd(), "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n",
                                   TestDeadline(), error)) {
       metrics = ReadUntil(client.Fd(), circuit_needle, TestDeadline(), error);
@@ -398,12 +399,12 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
   EXPECT_TRUE(error.empty()) << error;
   EXPECT_TRUE(backend_error.empty()) << backend_error;
   EXPECT_NE(metrics.find("aegisgate_circuit_state{route=\"guarded\",upstream=\"127.0.0.1:" +
-                         std::to_string(backend.port()) + "\"} open\n"),
+                         std::to_string(backend.port()) + "\",state=\"open\"} 1\n"),
             std::string::npos);
   EXPECT_NE(metrics.find("aegisgate_requests_total{route=\"guarded\",status=\"503\",upstream=\"\",reason=\"no_healthy_endpoint\"} 1\n"),
             std::string::npos);
   EXPECT_NE(recovered_metrics.find("aegisgate_circuit_state{route=\"guarded\",upstream=\"127.0.0.1:" +
-                                   std::to_string(backend.port()) + "\"} closed\n"),
+                                   std::to_string(backend.port()) + "\",state=\"closed\"} 1\n"),
             std::string::npos);
 }
 

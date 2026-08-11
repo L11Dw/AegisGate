@@ -53,4 +53,29 @@ TEST(MetricsTest, RendersReasonLabelForImmediate) {
   EXPECT_NE(text.find("aegisgate_requests_total{route=\"api\",status=\"503\",upstream=\"\",reason=\"no_healthy_endpoint\"} 1\n"),
             std::string::npos);
 }
+
+TEST(MetricsTest, RendersCircuitStateAsOneHotGauge) {
+  Metrics metrics;
+  metrics.SetCircuitState("api", "127.0.0.1:9001", "open");
+  metrics.SetUpstreamHealth("api", "127.0.0.1:9001", false);
+  const std::string text = metrics.RenderPrometheus();
+  EXPECT_NE(text.find("aegisgate_circuit_state{route=\"api\",upstream=\"127.0.0.1:9001\",state=\"open\"} 1\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("aegisgate_circuit_state{route=\"api\",upstream=\"127.0.0.1:9001\",state=\"closed\"} 0\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("aegisgate_circuit_state{route=\"api\",upstream=\"127.0.0.1:9001\",state=\"half_open\"} 0\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("aegisgate_upstream_health{route=\"api\",upstream=\"127.0.0.1:9001\"} 0\n"),
+            std::string::npos);
+}
+
+TEST(MetricsTest, EscapesStateLabels) {
+  Metrics metrics;
+  metrics.SetCircuitState("route\"with\"quote", "up\nstream", "closed");
+  metrics.SetUpstreamHealth("route\"with\"quote", "up\nstream", true);
+  const std::string text = metrics.RenderPrometheus();
+  EXPECT_NE(text.find("route=\"route\\\"with\\\"quote\""), std::string::npos);
+  EXPECT_NE(text.find("upstream=\"up\\nstream\""), std::string::npos);
+}
+
 } // namespace aegisgate::observability

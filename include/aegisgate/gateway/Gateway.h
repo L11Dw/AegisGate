@@ -43,7 +43,7 @@ public:
   void Start();
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
-  [[nodiscard]] std::string MetricsText() const;
+  [[nodiscard]] std::string MetricsText();
   // Test access to the immutable route table and its route x endpoint state.
   [[nodiscard]] routing::RouteTable &Routes() noexcept { return routes_; }
 

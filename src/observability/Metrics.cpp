@@ -57,6 +57,8 @@ struct Metrics::State {
   std::map<RequestKey, std::uint64_t> requests;
   std::map<std::string, std::uint64_t> rate_limited;
   std::map<std::string, Histogram> duration;
+  std::map<std::pair<std::string, std::string>, std::string> circuit_states;
+  std::map<std::pair<std::string, std::string>, bool> upstream_health;
   std::size_t active_connections{};
   std::size_t inflight{};
 };
@@ -97,6 +99,16 @@ void Metrics::RecordImmediate(std::string_view route, int status, std::string_vi
 
 void Metrics::SetActiveConnections(std::size_t count) noexcept { state_->active_connections = count; }
 
+void Metrics::SetCircuitState(std::string_view route, std::string_view upstream,
+                              std::string_view state) noexcept {
+  state_->circuit_states[{std::string(route), std::string(upstream)}] = std::string(state);
+}
+
+void Metrics::SetUpstreamHealth(std::string_view route, std::string_view upstream,
+                                bool healthy) noexcept {
+  state_->upstream_health[{std::string(route), std::string(upstream)}] = healthy;
+}
+
 std::string Metrics::RenderPrometheus() const {
   std::ostringstream output;
   output << "# TYPE aegisgate_requests_total counter\n";
@@ -108,6 +120,20 @@ std::string Metrics::RenderPrometheus() const {
       output << ",reason=\"" << EscapeLabel(key.reason) << "\"";
     }
     output << "} " << count << '\n';
+  }
+  output << "# TYPE aegisgate_circuit_state gauge\n";
+  for (const auto &[key, state] : state_->circuit_states) {
+    for (const char *candidate : {"closed", "open", "half_open"}) {
+      output << "aegisgate_circuit_state{route=\"" << EscapeLabel(key.first)
+             << "\",upstream=\"" << EscapeLabel(key.second) << "\",state=\"" << candidate
+             << "\"} " << (state == candidate ? "1" : "0") << '\n';
+    }
+  }
+  output << "# TYPE aegisgate_upstream_health gauge\n";
+  for (const auto &[key, healthy] : state_->upstream_health) {
+    output << "aegisgate_upstream_health{route=\"" << EscapeLabel(key.first)
+           << "\",upstream=\"" << EscapeLabel(key.second) << "\"} " << (healthy ? "1" : "0")
+           << '\n';
   }
   output << "# TYPE aegisgate_request_duration_seconds histogram\n";
   output << std::setprecision(17);

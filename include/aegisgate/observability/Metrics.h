@@ -26,6 +26,13 @@ public:
   [[nodiscard]] RequestHandle BeginRequest(std::string_view route);
   void RecordImmediate(std::string_view route, int status, std::string_view upstream = {},
                        bool rate_limited = false, std::string_view reason = {});
+  // Route x endpoint protection state.  state is a fixed vocabulary string
+  // (closed/open/half_open); rendering emits one-hot gauges with escaped
+  // labels so exposition stays valid.
+  void SetCircuitState(std::string_view route, std::string_view upstream,
+                       std::string_view state) noexcept;
+  void SetUpstreamHealth(std::string_view route, std::string_view upstream,
+                         bool healthy) noexcept;
   void SetActiveConnections(std::size_t count) noexcept;
   [[nodiscard]] std::string RenderPrometheus() const;
 

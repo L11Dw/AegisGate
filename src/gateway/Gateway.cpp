@@ -58,29 +58,27 @@ std::uint16_t Gateway::port() const { return acceptor_->port(); }
 
 std::size_t Gateway::ClientCount() const noexcept { return clients_.size(); }
 
-std::string Gateway::MetricsText() const {
-  std::string text = metrics_->RenderPrometheus();
-  // Route x endpoint protection state, appended after the counters so the
-  // text stays valid Prometheus exposition.
+std::string Gateway::MetricsText() {
+  // Refresh the route x endpoint protection state, then render everything
+  // through Metrics so label escaping and exposition stay centralized.
   for (const config::Route &route : routes_.Config().routes) {
     for (const config::Endpoint &endpoint : route.endpoints) {
+      const std::string upstream = endpoint.host + ":" + std::to_string(endpoint.port);
       if (const resilience::CircuitBreaker *breaker = routes_.BreakerFor(route, endpoint)) {
-        text += "aegisgate_circuit_state{route=\"" + route.name + "\",upstream=\"" +
-                endpoint.host + ":" + std::to_string(endpoint.port) + "\"} ";
+        const char *state = "closed";
         switch (breaker->StateNow()) {
-        case resilience::CircuitBreaker::State::kClosed: text += "closed\n"; break;
-        case resilience::CircuitBreaker::State::kOpen: text += "open\n"; break;
-        case resilience::CircuitBreaker::State::kHalfOpen: text += "half_open\n"; break;
+        case resilience::CircuitBreaker::State::kOpen: state = "open"; break;
+        case resilience::CircuitBreaker::State::kHalfOpen: state = "half_open"; break;
+        case resilience::CircuitBreaker::State::kClosed: break;
         }
+        metrics_->SetCircuitState(route.name, upstream, state);
       }
       if (const health::EndpointHealth *state = routes_.HealthFor(route, endpoint)) {
-        text += "aegisgate_upstream_health{route=\"" + route.name + "\",upstream=\"" +
-                endpoint.host + ":" + std::to_string(endpoint.port) + "\"} " +
-                (state->Healthy() ? "1\n" : "0\n");
+        metrics_->SetUpstreamHealth(route.name, upstream, state->Healthy());
       }
     }
   }
-  return text;
+  return metrics_->RenderPrometheus();
 }
 
 void Gateway::Accept(int fd) {
