@@ -189,6 +189,14 @@ void ClientConnection::FinishResponse() {
   }
   response_finished_ = true;
   if (!writing_) {
+    // Everything already drained synchronously: this path never re-enters
+    // HandleWrite(), so a Connection: close request must be honored here
+    // (R-048).  With bytes still queued, HandleWrite() applies
+    // close_after_write_ after the final drain instead.
+    if (close_after_write_) {
+      Close();
+      return;
+    }
     ResumeReading();
   }
 }

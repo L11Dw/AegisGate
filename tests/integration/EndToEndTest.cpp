@@ -548,6 +548,43 @@ TEST(EndToEndTest, LeastActiveSelectsBackendWithFewestInFlight) {
 
 // --- M3-C streaming end to end ---
 
+TEST(EndToEndTest, ConnectionCloseRequestClosesAfterStreamingResponse) {
+  std::string backend_error;
+  SequencedBackend backend({"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"}, backend_error);
+  std::string error;
+  std::string received;
+  RunGateway(config::Config{{Route("close", "close.e2e.test", Endpoint(backend.port()))}},
+             [&](std::uint16_t port, int wake) {
+    net::Socket client = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view request =
+        "GET / HTTP/1.1\r\nHost: close.e2e.test\r\nConnection: close\r\n\r\n";
+    constexpr std::string_view expected = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (WriteAll(client.Fd(), request, TestDeadline(), error)) {
+      received = ReadExact(client.Fd(), expected.size(), TestDeadline(), error);
+    }
+    // R-048: the Connection: close connection must close after the full
+    // streamed response.  This small response drains synchronously, so the
+    // close must happen in FinishResponse() (no pending write re-enters
+    // HandleWrite()).
+    if (error.empty()) {
+      pollfd descriptor{client.Fd(), POLLIN | POLLHUP, 0};
+      if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+        error = "connection stayed open after a Connection: close response";
+      } else {
+        std::array<char, 8> extra{};
+        if (::read(client.Fd(), extra.data(), extra.size()) != 0) {
+          error = "expected EOF after Connection: close response";
+        }
+      }
+    }
+    if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  backend.Stop();
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_EQ(received, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+}
+
 TEST(EndToEndTest, StreamsLargeResponseUnderSlowClient) {
   net::Socket listener = net::Socket::ListenLoopback();
   constexpr std::size_t kBodySize = 128 * 1024;
