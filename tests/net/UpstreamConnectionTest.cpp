@@ -326,5 +326,112 @@ TEST(UpstreamConnectionTest, DrainsLargeRequestAcrossWritableEvents) {
   EXPECT_EQ(result, UpstreamResult::kSuccess);
 }
 
+
+TEST(UpstreamConnectionTest, CompletesHeadResponseWithoutBody) {
+  Socket listener = Socket::ListenLoopback();
+  const http::HttpRequest request{"HEAD", "/", "HTTP/1.1", "", {{"Host", "upstream.test"}}};
+  const std::string expected_request = http::SerializeRequest(request);
+  std::string received_request;
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    received_request = ReadAllRequest(fd, expected_request.size());
+    const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+    ASSERT_EQ(::write(fd, response.data(), response.size()),
+              static_cast<ssize_t>(response.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(::close(fd), 0);
+  });
+
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamResult result = UpstreamResult::kReadError;
+  http::HttpResponse response;
+  UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult value, http::HttpResponse parsed) {
+    ++callback_count;
+    result = value;
+    response = std::move(parsed);
+    loop.Quit();
+  });
+  connection.Start(request);
+  loop.Loop();
+  server.join();
+
+  EXPECT_EQ(received_request, expected_request);
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_EQ(result, UpstreamResult::kSuccess);
+  EXPECT_EQ(response.status, 200);
+  EXPECT_EQ(response.body_mode, http::ResponseBodyMode::kSuppressedWithKnownLength);
+  ASSERT_TRUE(response.content_length.has_value());
+  EXPECT_EQ(*response.content_length, 5U);
+  EXPECT_TRUE(response.body.empty());
+}
+
+TEST(UpstreamConnectionTest, HeadResponseWithSameBatchResidualBodyIsNotReusable) {
+  Socket listener = Socket::ListenLoopback();
+  const http::HttpRequest request{"HEAD", "/", "HTTP/1.1", "", {{"Host", "upstream.test"}}};
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    (void)ReadAllRequest(fd, http::SerializeRequest(request).size());
+    // A compliant HEAD answer plus an illegal same-batch body.
+    const std::string wire = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    ASSERT_EQ(::write(fd, wire.data(), wire.size()), static_cast<ssize_t>(wire.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(::close(fd), 0);
+  });
+
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamResult result = UpstreamResult::kReadError;
+  UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult value, http::HttpResponse) {
+    ++callback_count;
+    result = value;
+    loop.Quit();
+  });
+  connection.Start(request);
+  loop.Loop();
+  server.join();
+
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_EQ(result, UpstreamResult::kSuccess);
+  // The residual body stayed in the input buffer, so the connection must
+  // never be reusable: the keep-alive path requires ReadableBytes() == 0.
+  EXPECT_FALSE(connection.Reusable());
+}
+
+TEST(UpstreamConnectionTest, HeadIdleConnectionWithLateResidualFailsHealthProbe) {
+  Socket listener = Socket::ListenLoopback();
+  const http::HttpRequest request{"HEAD", "/", "HTTP/1.1", "", {{"Host", "upstream.test"}}};
+  std::thread server([&] {
+    const int fd = AcceptBlocking(listener);
+    (void)ReadAllRequest(fd, http::SerializeRequest(request).size());
+    const std::string headers = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+    ASSERT_EQ(::write(fd, headers.data(), headers.size()),
+              static_cast<ssize_t>(headers.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // The residual body arrives only after the connection went idle.
+    ASSERT_EQ(::write(fd, "hello", 5), 5);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(::close(fd), 0);
+  });
+
+  EventLoop loop;
+  int callback_count = 0;
+  UpstreamConnection connection(loop, listener.BoundPort(), [&](UpstreamResult, http::HttpResponse) {
+    ++callback_count;
+    loop.Quit();
+  });
+  connection.Start(request);
+  loop.Loop();
+
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_TRUE(connection.Reusable());
+  // Wait for the residual bytes to reach the kernel receive buffer, then the
+  // borrow-time probe must observe them and close the connection.
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  EXPECT_FALSE(connection.HealthyForReuse());
+  EXPECT_FALSE(connection.Reusable());
+  server.join();
+}
+
 } // namespace
 } // namespace aegisgate::net

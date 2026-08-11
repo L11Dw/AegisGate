@@ -149,3 +149,66 @@ TEST(HttpResponseParserTest, ResetAllowsReuseAfterTerminalResult) {
 }
 
 } // namespace
+
+TEST(HttpResponseParserTest, CompletesHeadResponseWithKnownLength) {
+  Buffer input;
+  HttpResponseParser parser;
+  parser.Reset(true);
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kComplete);
+  const auto &response = parser.Response();
+  EXPECT_EQ(response.body_mode, aegisgate::http::ResponseBodyMode::kSuppressedWithKnownLength);
+  ASSERT_TRUE(response.content_length.has_value());
+  EXPECT_EQ(*response.content_length, 5U);
+  EXPECT_TRUE(response.body.empty());
+  EXPECT_TRUE(input.ReadableView().empty());
+}
+
+TEST(HttpResponseParserTest, CompletesHeadResponseWithZeroContentLength) {
+  Buffer input;
+  HttpResponseParser parser;
+  parser.Reset(true);
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kComplete);
+  const auto &response = parser.Response();
+  EXPECT_EQ(response.body_mode, aegisgate::http::ResponseBodyMode::kSuppressedWithKnownLength);
+  ASSERT_TRUE(response.content_length.has_value());
+  EXPECT_EQ(*response.content_length, 0U);
+}
+
+TEST(HttpResponseParserTest, CompletesHeadResponseWithoutContentLength) {
+  Buffer input;
+  HttpResponseParser parser;
+  parser.Reset(true);
+  input.Append("HTTP/1.1 200 OK\r\n\r\n");
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kComplete);
+  const auto &response = parser.Response();
+  EXPECT_EQ(response.body_mode, aegisgate::http::ResponseBodyMode::kSuppressedWithUnknownLength);
+  EXPECT_FALSE(response.content_length.has_value());
+  EXPECT_TRUE(response.body.empty());
+}
+
+TEST(HttpResponseParserTest, HeadConsumesOnlyHeaderLeavingResidualBody) {
+  Buffer input;
+  HttpResponseParser parser;
+  parser.Reset(true);
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kComplete);
+  // The suppressed body must stay in the buffer so a dirty connection can
+  // never be reused or lent out.
+  EXPECT_EQ(input.ReadableView(), "hello");
+  EXPECT_TRUE(parser.Response().body.empty());
+}
+
+TEST(HttpResponseParserTest, GetStillAwaitsBodyAfterReset) {
+  Buffer input;
+  HttpResponseParser parser;
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+
+  EXPECT_EQ(parser.Parse(input), ParseResult::kNeedMoreData);
+  EXPECT_EQ(parser.Response().body_mode, aegisgate::http::ResponseBodyMode::kNormal);
+}

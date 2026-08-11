@@ -205,11 +205,29 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
       return result_;
     }
     content_length = 0;
-  } else if (!has_content_length) {
+  } else if (!has_content_length && !response_to_head_) {
     result_ = ParseResult::kError;
     return result_;
   }
   headers_complete_ = true;
+  if (response_to_head_) {
+    // A HEAD response never carries a body: it completes at the end of the
+    // headers, carrying the declared entity length without consuming any
+    // bytes beyond the header area.  Any bytes already buffered past the
+    // headers stay in the input so a dirty connection cannot be reused.
+    if (!bodyless) {
+      if (has_content_length) {
+        parsed.body_mode = ResponseBodyMode::kSuppressedWithKnownLength;
+        parsed.content_length = content_length;
+      } else {
+        parsed.body_mode = ResponseBodyMode::kSuppressedWithUnknownLength;
+      }
+    }
+    response_ = std::move(parsed);
+    input.Retrieve(cursor);
+    result_ = ParseResult::kComplete;
+    return result_;
+  }
   if (bytes.size() - cursor < content_length) return result_;
 
   parsed.body = bytes.substr(cursor, content_length);
@@ -223,9 +241,10 @@ const HttpResponse &HttpResponseParser::Response() const noexcept { return respo
 
 bool HttpResponseParser::HeadersComplete() const noexcept { return headers_complete_; }
 
-void HttpResponseParser::Reset() {
+void HttpResponseParser::Reset(bool response_to_head) {
   result_ = ParseResult::kNeedMoreData;
   headers_complete_ = false;
+  response_to_head_ = response_to_head;
   response_ = HttpResponse{};
 }
 

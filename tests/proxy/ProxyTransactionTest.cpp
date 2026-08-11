@@ -23,6 +23,8 @@
 #include "aegisgate/proxy/UpstreamPool.h"
 #include "aegisgate/resilience/RouteAdmission.h"
 
+#include "../support/WakeFd.h"
+
 namespace aegisgate::proxy {
 namespace {
 
@@ -102,13 +104,15 @@ struct WorkerResult {
 
 class LoopWatchdog {
 public:
-  explicit LoopWatchdog(int wake_fd) : wake_fd_(wake_fd) {
+  explicit LoopWatchdog(int wake_fd, std::string &error) : wake_fd_(wake_fd), error_(&error) {
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop_fds_.data()) != 0) {
       throw std::system_error(errno, std::generic_category(), "socketpair watchdog");
     }
     thread_ = std::thread([this] {
       pollfd descriptor{stop_fds_[0], POLLIN, 0};
-      if (::poll(&descriptor, 1, 5000) == 0) (void)::write(wake_fd_, "t", 1);
+      if (::poll(&descriptor, 1, 5000) == 0) {
+        (void)test::SignalWakeFd(wake_fd_, 't', *error_);
+      }
     });
   }
 
@@ -119,12 +123,13 @@ public:
   }
 
   void Stop() {
-    (void)::write(stop_fds_[1], "s", 1);
+    (void)test::SignalWakeFd(stop_fds_[1], 's', *error_);
     thread_.join();
   }
 
 private:
   int wake_fd_;
+  std::string *error_;
   std::array<int, 2> stop_fds_{};
   std::thread thread_;
 };
@@ -170,7 +175,8 @@ TEST(ProxyTransactionTest, RejectsRouteAdmissionBeforeStartingUpstream) {
     peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
     if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
   });
-  LoopWatchdog watchdog(wake_sockets[1]);
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
   loop.Loop();
   watchdog.Stop();
   peer.join();
@@ -178,6 +184,7 @@ TEST(ProxyTransactionTest, RejectsRouteAdmissionBeforeStartingUpstream) {
   pollfd descriptor{listener.Fd(), POLLIN, 0};
   EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "rejected request opened an upstream connection";
   EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
   EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
   EXPECT_EQ(peer_result.received, expected);
   EXPECT_TRUE(peer_result.wire_ok);
@@ -260,13 +267,15 @@ TEST(ProxyTransactionTest, ForwardsPostAndSegmentedResponseToClient) {
     peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
     if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
   });
-  LoopWatchdog watchdog(wake_sockets[1]);
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
   loop.Loop();
   watchdog.Stop();
   peer.join();
   server.join();
 
   EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
   EXPECT_TRUE(request_callback_called);
   EXPECT_TRUE(transaction.expired());
   // The upstream completion terminates the transaction before downstream I/O
@@ -354,12 +363,14 @@ TEST(ProxyTransactionTest, MapsUpstreamFailuresToExactBadGateway) {
       peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
       if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
     });
-    LoopWatchdog watchdog(wake_sockets[1]);
+    std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
     loop.Loop();
     watchdog.Stop();
     peer.join();
     if (server.joinable()) server.join();
     EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
     EXPECT_TRUE(server_result.error.empty()) << server_result.error;
     EXPECT_TRUE(server_result.wire_ok || failure == Failure::kConnect);
     if (failure == Failure::kEof) {
@@ -425,12 +436,14 @@ TEST(ProxyTransactionTest, DoesNotDereferenceClientDestroyedAfterRequestCallback
       });
   client->Start();
   ASSERT_EQ(::write(client_sockets[1], request.data(), request.size()), static_cast<ssize_t>(request.size()));
-  LoopWatchdog watchdog(wake_sockets[1]);
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
   loop.Loop();
   watchdog.Stop();
   server.join();
 
   EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
   EXPECT_TRUE(server_result.error.empty()) << server_result.error;
   EXPECT_EQ(server_result.received, expected_upstream_request);
   EXPECT_TRUE(server_result.wire_ok);
@@ -509,7 +522,8 @@ TEST(ProxyTransactionTest, CancelsAllDeadlinesAfterARetrySucceeds) {
     peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
     if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
   });
-  LoopWatchdog watchdog(wake_sockets[1]);
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
   loop.Loop();
   watchdog.Stop();
   peer.join();
@@ -517,6 +531,7 @@ TEST(ProxyTransactionTest, CancelsAllDeadlinesAfterARetrySucceeds) {
   second_backend.join();
 
   EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
   EXPECT_TRUE(first_error.empty()) << first_error;
   EXPECT_TRUE(second_error.empty()) << second_error;
   EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
@@ -584,12 +599,14 @@ TEST(ProxyTransactionTest, DoesNotRetryWithoutADifferentCandidate) {
     peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
     if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
   });
-  LoopWatchdog watchdog(wake_sockets[1]);
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
   loop.Loop();
   watchdog.Stop();
   peer.join();
 
   EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
   EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
   EXPECT_EQ(peer_result.received, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
   EXPECT_TRUE(peer_result.wire_ok);

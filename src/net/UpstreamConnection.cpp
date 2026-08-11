@@ -30,7 +30,7 @@ void UpstreamConnection::Start(const http::HttpRequest &request) {
   reusable_ = false;
   input_.RetrieveAll();
   output_.RetrieveAll();
-  parser_.Reset();
+  parser_.Reset(request.method == "HEAD");
   first_byte_reported_ = false;
   response_header_reported_ = false;
 

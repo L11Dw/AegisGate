@@ -19,6 +19,8 @@
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
 
+#include "../support/WakeFd.h"
+
 namespace aegisgate::gateway {
 namespace {
 
@@ -700,25 +702,25 @@ TEST(GatewayTest, DoesNotStartFirstByteDeadlineUntilLargeRequestIsFullyWritten) 
     std::string request = "POST /blocked HTTP/1.1\r\nHost: gateway.test\r\nContent-Length: " +
                           std::to_string(kBodySize) + "\r\n\r\n" + std::string(kBodySize, 'x');
     if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     char accepted = '\0';
     if (::read(gate[0], &accepted, 1) != 1 || accepted != 'a') {
       client_error = "accept gate read failed";
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     pollfd descriptor{socket.Fd(), POLLIN | POLLHUP, 0};
     if (::poll(&descriptor, 1, 300) != 0) {
       client_error = "first-byte timeout armed before blocked write drained";
-      (void)::write(gate[0], "d", 1);
-      (void)::write(wake_fds[1], "q", 1);
+      if (::write(gate[0], "d", 1) != 1 && client_error.empty()) client_error = "drain gate write failed";
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     if (::write(gate[0], "d", 1) != 1) {
       client_error = "drain gate write failed";
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
@@ -766,12 +768,12 @@ TEST(GatewayTest, RecordsActualUnmatchedOutcomeAndServesPrometheusEndpoint) {
     if (!WriteAll(socket.Fd(), missing, TestDeadline(), client_error) ||
         ReadExact(socket.Fd(), missing_response.size(), TestDeadline(), client_error) !=
             missing_response) {
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     constexpr std::string_view metrics = "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n";
     if (!WriteAll(socket.Fd(), metrics, TestDeadline(), client_error)) {
-      (void)::write(wake_fds[1], "q", 1);
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
       return;
     }
     metrics_response = ReadUntilContains(socket.Fd(), "aegisgate_inflight_requests 0\n",
@@ -786,6 +788,73 @@ TEST(GatewayTest, RecordsActualUnmatchedOutcomeAndServesPrometheusEndpoint) {
   EXPECT_NE(metrics_response.find("aegisgate_requests_total{route=\"_unmatched\",status=\"404\",upstream=\"\"} 1\n"),
             std::string::npos);
   EXPECT_NE(metrics_response.find("aegisgate_active_connections 1\n"), std::string::npos);
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+
+TEST(GatewayTest, ForwardsHeadRequestWithoutWaitingForBody) {
+  net::Socket upstream_listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1},
+                                  upstream_listener.BoundPort(), 1};
+  const config::Config config{{{"api", "gateway.test", "/v1", {endpoint}, 10, 10, 4}}};
+
+  constexpr std::string_view expected_upstream =
+      "HEAD /v1/head HTTP/1.1\r\nhost: gateway.test\r\nContent-Length: 0\r\n"
+      "Connection: keep-alive\r\n\r\n";
+  std::string upstream_error;
+  std::string received_request;
+  std::thread upstream([&] {
+    const int fd = AcceptUntil(upstream_listener, TestDeadline(), upstream_error);
+    if (fd < 0) return;
+    received_request = ReadExact(fd, expected_upstream.size(), TestDeadline(), upstream_error);
+    if (upstream_error.empty()) {
+      constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+      if (!WriteAll(fd, response, TestDeadline(), upstream_error)) {}
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  std::string client_error;
+  std::string client_response;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
+    constexpr std::string_view head_request =
+        "HEAD /v1/head HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    constexpr std::string_view expected = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+    if (!WriteAll(socket.Fd(), head_request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    client_response = ReadExact(socket.Fd(), expected.size(), TestDeadline(), client_error);
+    pollfd descriptor{socket.Fd(), POLLIN | POLLHUP, 0};
+    if (client_error.empty() && ::poll(&descriptor, 1, 100) != 0) {
+      client_error = "received bytes after head response";
+    }
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+  upstream.join();
+
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_TRUE(upstream_error.empty()) << upstream_error;
+  EXPECT_EQ(received_request, expected_upstream);
+  EXPECT_EQ(client_response, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
   EXPECT_EQ(::close(wake_fds[1]), 0);

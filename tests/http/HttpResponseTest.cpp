@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <optional>
 #include <stdexcept>
+#include <utility>
 
 namespace aegisgate::http {
 namespace {
@@ -63,6 +66,54 @@ TEST(HttpResponseTest, RejectsInvalidStatusOrHeaderInjection) {
                std::invalid_argument);
   EXPECT_THROW(static_cast<void>(HttpResponse{204, "No Content", {}, "x"}.Serialize()),
                std::invalid_argument);
+}
+
+TEST(HttpResponseTest, SerializesSuppressedBodyWithKnownLength) {
+  HttpResponse response{200, "OK", {}, ""};
+  response.body_mode = ResponseBodyMode::kSuppressedWithKnownLength;
+  response.content_length = 5;
+
+  EXPECT_EQ(response.Serialize(), "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+}
+
+TEST(HttpResponseTest, OmitsContentLengthForUnknownLengthHead) {
+  HttpResponse response{200, "OK", {}, ""};
+  response.body_mode = ResponseBodyMode::kSuppressedWithUnknownLength;
+
+  EXPECT_EQ(response.Serialize(), "HTTP/1.1 200 OK\r\n\r\n");
+}
+
+TEST(HttpResponseTest, RejectsInvalidBodyModeCombinations) {
+  const auto build = [](ResponseBodyMode mode, std::optional<std::size_t> length,
+                        std::string body) {
+    HttpResponse response{200, "OK", {}, std::move(body)};
+    response.body_mode = mode;
+    response.content_length = length;
+    return response;
+  };
+  EXPECT_THROW(static_cast<void>(
+                   build(ResponseBodyMode::kSuppressedWithKnownLength, std::nullopt, "").Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(
+                   build(ResponseBodyMode::kSuppressedWithUnknownLength, std::size_t{5}, "").Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(
+                   build(ResponseBodyMode::kNormal, std::size_t{5}, "").Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(
+                   build(ResponseBodyMode::kSuppressedWithKnownLength, std::size_t{5}, "x").Serialize()),
+               std::invalid_argument);
+  EXPECT_THROW(static_cast<void>(
+                   build(ResponseBodyMode::kSuppressedWithUnknownLength, std::nullopt, "x").Serialize()),
+               std::invalid_argument);
+  // Bodyless statuses must not silently swallow framing metadata.
+  HttpResponse no_content{204, "No Content", {}, ""};
+  no_content.body_mode = ResponseBodyMode::kSuppressedWithKnownLength;
+  no_content.content_length = 5;
+  EXPECT_THROW(static_cast<void>(no_content.Serialize()), std::invalid_argument);
+  HttpResponse not_modified{304, "Not Modified", {}, ""};
+  not_modified.content_length = 5;
+  EXPECT_THROW(static_cast<void>(not_modified.Serialize()), std::invalid_argument);
 }
 
 } // namespace

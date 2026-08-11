@@ -17,6 +17,8 @@
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
 
+#include "../support/WakeFd.h"
+
 namespace aegisgate::mock {
 namespace {
 
@@ -121,7 +123,7 @@ TEST(MockBackendTest, DelaysNonblockinglyAndRejectsTheSecondRequestAtConcurrency
     net::Socket first = net::Socket::ConnectLoopback(port);
     constexpr std::string_view first_request = "GET /slow HTTP/1.1\r\nHost: mock.test\r\n\r\n";
     if (!WriteAll(first.Fd(), first_request, TestDeadline(), error)) {
-      (void)::write(wake_fd, "q", 1);
+      (void)test::SignalWakeFd(wake_fd, 'q', error);
       return;
     }
     // poll is a bounded observation, not a sleep: it proves the timer has
@@ -129,7 +131,7 @@ TEST(MockBackendTest, DelaysNonblockinglyAndRejectsTheSecondRequestAtConcurrency
     if (WaitFor(first.Fd(), POLLIN | POLLHUP,
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(75))) {
       error = "delayed response arrived too early";
-      (void)::write(wake_fd, "q", 1);
+      (void)test::SignalWakeFd(wake_fd, 'q', error);
       return;
     }
     net::Socket second = net::Socket::ConnectLoopback(port);
