@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <stdexcept>
 
 namespace aegisgate::resilience {
 
@@ -26,13 +27,16 @@ TEST(CircuitBreakerTest, StaysClosedBelowThreshold) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(), now);
   for (int i = 0; i < 11; ++i) {
-    breaker.RecordSuccess(now + std::chrono::milliseconds(i));
+    breaker.RecordSuccess(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
   for (int i = 0; i < 9; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
   // 9 failures out of 20 samples: just below the 50% threshold.
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(20)), Selection::kAllowed);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(20)).selection,
+            Selection::kAllowed);
   EXPECT_EQ(breaker.StateNow(), State::kClosed);
 }
 
@@ -40,92 +44,146 @@ TEST(CircuitBreakerTest, OpensWhenThresholdAndMinimumSamplesReached) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(), now);
   for (int i = 0; i < 5; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
   EXPECT_EQ(breaker.StateNow(), State::kOpen);
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(10)), Selection::kRejectedOpen);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(10)).selection,
+            Selection::kRejectedOpen);
 }
 
 TEST(CircuitBreakerTest, ExpiredWindowSamplesDoNotCount) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(), now);
-  // Below min_requests, so the breaker stays closed while the failures are
-  // still in the window.
   for (int i = 0; i < 4; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
   EXPECT_EQ(breaker.StateNow(), State::kClosed);
-  // The failures aged out of the window; a fresh success no longer opens.
-  breaker.RecordSuccess(now + std::chrono::milliseconds(150));
+  breaker.RecordSuccess(now + std::chrono::milliseconds(150),
+                        breaker.Select(now + std::chrono::milliseconds(150)));
   EXPECT_EQ(breaker.StateNow(), State::kClosed);
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(151)), Selection::kAllowed);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(151)).selection,
+            Selection::kAllowed);
 }
 
 TEST(CircuitBreakerTest, RejectsSelectionWhileOpen) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(), now);
   for (int i = 0; i < 5; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(10)), Selection::kRejectedOpen);
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(40)), Selection::kRejectedOpen);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(10)).selection,
+            Selection::kRejectedOpen);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(40)).selection,
+            Selection::kRejectedOpen);
 }
 
 TEST(CircuitBreakerTest, AllowsExactHalfOpenProbeQuotaAfterOpenWindow) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(5, 500, 2), now);
   for (int i = 0; i < 5; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
-  // Open window elapsed: exactly two probes allowed.
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(60)), Selection::kProbe);
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(61)), Selection::kProbe);
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(62)), Selection::kRejectedHalfOpenQuota);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(60)).selection,
+            Selection::kProbe);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(61)).selection,
+            Selection::kProbe);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(62)).selection,
+            Selection::kRejectedHalfOpenQuota);
 }
 
 TEST(CircuitBreakerTest, HalfOpenSuccessClosesAndResetsWindow) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(5, 500, 2), now);
   for (int i = 0; i < 5; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
-  (void)breaker.Select(now + std::chrono::milliseconds(60));
-  (void)breaker.Select(now + std::chrono::milliseconds(61));
-  breaker.RecordSuccess(now + std::chrono::milliseconds(70));
-  // First probe success does not close yet (quota is two).
+  const auto first = breaker.Select(now + std::chrono::milliseconds(60));
+  const auto second = breaker.Select(now + std::chrono::milliseconds(61));
+  ASSERT_EQ(first.selection, Selection::kProbe);
+  ASSERT_EQ(second.selection, Selection::kProbe);
+  breaker.RecordSuccess(now + std::chrono::milliseconds(70), first);
   EXPECT_EQ(breaker.StateNow(), State::kHalfOpen);
-  breaker.RecordSuccess(now + std::chrono::milliseconds(71));
+  breaker.RecordSuccess(now + std::chrono::milliseconds(71), second);
   EXPECT_EQ(breaker.StateNow(), State::kClosed);
-  // The window was reset: old failures must not reopen immediately.
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(72)), Selection::kAllowed);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(72)).selection,
+            Selection::kAllowed);
 }
 
 TEST(CircuitBreakerTest, HalfOpenFailureReopensImmediately) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(), now);
   for (int i = 0; i < 5; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
-  (void)breaker.Select(now + std::chrono::milliseconds(60));
-  breaker.RecordFailure(now + std::chrono::milliseconds(70));
+  const auto probe = breaker.Select(now + std::chrono::milliseconds(60));
+  ASSERT_EQ(probe.selection, Selection::kProbe);
+  breaker.RecordFailure(now + std::chrono::milliseconds(70), probe);
   EXPECT_EQ(breaker.StateNow(), State::kOpen);
-  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(71)), Selection::kRejectedOpen);
+  EXPECT_EQ(breaker.Select(now + std::chrono::milliseconds(71)).selection,
+            Selection::kRejectedOpen);
 }
 
 TEST(CircuitBreakerTest, StaleProbeResultCannotMutateNewGeneration) {
   const auto now = Clock::now();
   CircuitBreaker breaker(Config(5, 500, 2), now);
   for (int i = 0; i < 5; ++i) {
-    breaker.RecordFailure(now + std::chrono::milliseconds(i));
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
   }
-  (void)breaker.Select(now + std::chrono::milliseconds(60));  // probe 1
-  (void)breaker.Select(now + std::chrono::milliseconds(61));  // probe 2
-  breaker.RecordFailure(now + std::chrono::milliseconds(70)); // probe 1 fails -> reopens
+  const auto first = breaker.Select(now + std::chrono::milliseconds(60));
+  const auto second = breaker.Select(now + std::chrono::milliseconds(61));
+  breaker.RecordFailure(now + std::chrono::milliseconds(70), first);
   EXPECT_EQ(breaker.StateNow(), State::kOpen);
-  // The in-flight probe 2 result arrives after the reopen: it must be ignored,
-  // not treated as a success that closes the breaker.
-  breaker.RecordSuccess(now + std::chrono::milliseconds(71));
+  // The in-flight probe 2 result arrives after the reopen: its permit belongs
+  // to the old generation and must be ignored.
+  breaker.RecordSuccess(now + std::chrono::milliseconds(71), second);
   EXPECT_EQ(breaker.StateNow(), State::kOpen);
+}
+
+TEST(CircuitBreakerTest, LateOrdinarySuccessCannotCloseHalfOpen) {
+  const auto now = Clock::now();
+  CircuitBreaker breaker(Config(), now);
+  // An ordinary request is admitted while Closed.
+  const auto late = breaker.Select(now + std::chrono::milliseconds(0));
+  ASSERT_EQ(late.selection, Selection::kAllowed);
+  // Other failures open the breaker.
+  for (int i = 0; i < 5; ++i) {
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
+  }
+  EXPECT_EQ(breaker.StateNow(), State::kOpen);
+  // The open window elapses and a genuine probe is issued.
+  const auto probe = breaker.Select(now + std::chrono::milliseconds(60));
+  ASSERT_EQ(probe.selection, Selection::kProbe);
+  // The late ordinary success arrives before the probe result: it must not
+  // be mistaken for the probe (which would close the breaker).
+  breaker.RecordSuccess(now + std::chrono::milliseconds(61), late);
+  EXPECT_EQ(breaker.StateNow(), State::kHalfOpen);
+  breaker.RecordSuccess(now + std::chrono::milliseconds(62), probe);
+  EXPECT_EQ(breaker.StateNow(), State::kClosed);
+}
+
+TEST(CircuitBreakerTest, DuplicateProbeResultIsIgnored) {
+  const auto now = Clock::now();
+  CircuitBreaker breaker(Config(5, 500, 2), now);
+  for (int i = 0; i < 5; ++i) {
+    breaker.RecordFailure(now + std::chrono::milliseconds(i),
+                          breaker.Select(now + std::chrono::milliseconds(i)));
+  }
+  const auto first = breaker.Select(now + std::chrono::milliseconds(60));
+  const auto second = breaker.Select(now + std::chrono::milliseconds(61));
+  breaker.RecordSuccess(now + std::chrono::milliseconds(70), first);
+  // The same probe result delivered twice must not complete twice.
+  breaker.RecordSuccess(now + std::chrono::milliseconds(71), first);
+  EXPECT_EQ(breaker.StateNow(), State::kHalfOpen);
+  breaker.RecordSuccess(now + std::chrono::milliseconds(72), second);
+  EXPECT_EQ(breaker.StateNow(), State::kClosed);
 }
 
 TEST(CircuitBreakerTest, RejectsInvalidConfiguration) {

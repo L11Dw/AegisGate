@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 namespace aegisgate::resilience {
 
@@ -32,18 +33,32 @@ public:
   enum class State { kClosed, kOpen, kHalfOpen };
   enum class Selection { kAllowed, kRejectedOpen, kRejectedHalfOpenQuota, kProbe };
 
+  // The unforgeable license a request receives from Select() and must hand
+  // back with its outcome.  generation is the breaker epoch at admission;
+  // probe_id identifies the half-open probe this result belongs to.  Every
+  // Open/re-open/Close/transition to half-open advances generation_, so a
+  // late result from an older epoch (an ordinary request admitted before the
+  // breaker opened, or a probe from a previous half-open round) can never
+  // mutate the current state.
+  struct RequestPermit {
+    Selection selection = Selection::kRejectedOpen;
+    std::uint64_t generation = 0;
+    std::uint64_t probe_id = 0;
+  };
+
   explicit CircuitBreaker(CircuitBreakerConfig config, Clock::time_point now);
 
   // Passive request outcomes.  Callers decide what counts: 429/404 and
   // client-closed requests must not be reported as failures (and therefore
   // never reach these methods).
-  void RecordSuccess(Clock::time_point now);
-  void RecordFailure(Clock::time_point now);
+  void RecordSuccess(Clock::time_point now, const RequestPermit &permit);
+  void RecordFailure(Clock::time_point now, const RequestPermit &permit);
 
-  // Selection decision for a normal request.  A probe result is completed
-  // through the Record methods; the total deadline guarantees every probe
-  // eventually produces a result, so the half-open quota cannot stall.
-  [[nodiscard]] Selection Select(Clock::time_point now);
+  // Selection decision for a normal request, returned as a permit that the
+  // request carries through to its terminal result.  The total deadline
+  // guarantees every probe eventually produces a result, so the half-open
+  // quota cannot stall.
+  [[nodiscard]] RequestPermit Select(Clock::time_point now);
   [[nodiscard]] State StateNow() const noexcept { return state_; }
 
 private:
@@ -60,6 +75,8 @@ private:
       Clock::time_point now) const noexcept;
   void Open(Clock::time_point now) noexcept;
   void Close() noexcept;
+  void BeginHalfOpen() noexcept;
+  [[nodiscard]] bool ConsumeProbe(std::uint64_t probe_id) noexcept;
 
   CircuitBreakerConfig config_;
   State state_ = State::kClosed;
@@ -69,6 +86,9 @@ private:
   bool initialized_ = false;
   std::array<Bucket, kBucketCount> buckets_{};
   Clock::time_point open_until_{};
+  std::uint64_t generation_ = 1;
+  std::uint64_t next_probe_id_ = 1;
+  std::vector<std::uint64_t> pending_probes_;
   std::uint32_t half_open_issued_ = 0;
   std::uint32_t half_open_completed_ = 0;
 };
