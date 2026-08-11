@@ -1,7 +1,9 @@
 #include "aegisgate/http/HttpResponseParser.h"
 
+#include <algorithm>
 #include <cctype>
 #include <limits>
+#include <stdexcept>
 
 namespace aegisgate::http {
 namespace {
@@ -94,23 +96,144 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
     return result_;
   }
 
+  ParsedHeader parsed;
+  const ParseResult header_result = ParseHeaderArea(input, parsed);
+  if (header_result != ParseResult::kComplete) {
+    result_ = header_result;
+    return result_;
+  }
+  if (parsed.bodyless) {
+    parsed.content_length = 0;
+  }
+
+  HttpResponse response;
+  response.status = parsed.status;
+  response.reason = parsed.reason;
+  response.headers = std::move(parsed.headers);
+  if (response_to_head_) {
+    // A HEAD response never carries a body: it completes at the end of the
+    // headers, carrying the declared entity length without consuming any
+    // bytes beyond the header area.  Any bytes already buffered past the
+    // headers stay in the input so a dirty connection cannot be reused.
+    if (!parsed.bodyless) {
+      if (parsed.has_content_length) {
+        response.body_mode = ResponseBodyMode::kSuppressedWithKnownLength;
+        response.content_length = parsed.content_length;
+      } else {
+        response.body_mode = ResponseBodyMode::kSuppressedWithUnknownLength;
+      }
+    }
+    response_ = std::move(response);
+    input.Retrieve(parsed.header_end);
+    result_ = ParseResult::kComplete;
+    return result_;
+  }
+  const std::string_view bytes = input.ReadableView();
+  if (bytes.size() - parsed.header_end < parsed.content_length) {
+    return result_;
+  }
+
+  response.body = std::string(bytes.substr(parsed.header_end, parsed.content_length));
+  response_ = std::move(response);
+  input.Retrieve(parsed.header_end + parsed.content_length);
+  result_ = ParseResult::kComplete;
+  return result_;
+}
+
+ParseResult HttpResponseParser::ParseHeaders(net::Buffer &input) {
+  if (result_ != ParseResult::kNeedMoreData) {
+    return result_;
+  }
+
+  ParsedHeader parsed;
+  const ParseResult header_result = ParseHeaderArea(input, parsed);
+  if (header_result != ParseResult::kComplete) {
+    result_ = header_result;
+    return result_;
+  }
+
+  if (parsed.bodyless) {
+    head_ = HttpResponseHead{parsed.status, parsed.reason, std::move(parsed.headers)};
+    body_complete_ = true;
+  } else if (response_to_head_) {
+    if (parsed.has_content_length) {
+      head_ = HttpResponseHead{parsed.status, parsed.reason, std::move(parsed.headers),
+                               ResponseBodyMode::kSuppressedWithKnownLength,
+                               parsed.content_length};
+    } else {
+      head_ = HttpResponseHead{parsed.status, parsed.reason, std::move(parsed.headers),
+                               ResponseBodyMode::kSuppressedWithUnknownLength};
+    }
+    body_complete_ = true;
+  } else {
+    head_ = HttpResponseHead{parsed.status, parsed.reason, std::move(parsed.headers),
+                             ResponseBodyMode::kNormal, parsed.content_length};
+    remaining_body_ = parsed.content_length;
+  }
+  input.Retrieve(parsed.header_end);
+  return ParseResult::kComplete;
+}
+
+ParseResult HttpResponseParser::ConsumeBody(net::Buffer &input, const BodySink &sink) {
+  if (!headers_complete_) {
+    throw std::logic_error("response headers are not complete");
+  }
+  if (result_ != ParseResult::kNeedMoreData || body_complete_) {
+    result_ = ParseResult::kComplete;
+    return result_;
+  }
+  const std::string_view bytes = input.ReadableView();
+  const std::size_t take = std::min(remaining_body_, bytes.size());
+  if (take == 0) {
+    return ParseResult::kNeedMoreData;
+  }
+  const bool accepted = sink(bytes.substr(0, take));
+  if (!accepted) {
+    return ParseResult::kNeedMoreData;
+  }
+  input.Retrieve(take);
+  remaining_body_ -= take;
+  if (remaining_body_ == 0) {
+    body_complete_ = true;
+    result_ = ParseResult::kComplete;
+  }
+  return result_;
+}
+
+const HttpResponse &HttpResponseParser::Response() const noexcept { return response_; }
+
+const HttpResponseHead &HttpResponseParser::Head() const noexcept { return head_; }
+
+bool HttpResponseParser::HeadersComplete() const noexcept { return headers_complete_; }
+
+bool HttpResponseParser::BodyComplete() const noexcept { return body_complete_; }
+
+void HttpResponseParser::Reset(bool response_to_head) {
+  result_ = ParseResult::kNeedMoreData;
+  headers_complete_ = false;
+  response_to_head_ = response_to_head;
+  response_ = HttpResponse{};
+  head_ = HttpResponseHead{};
+  remaining_body_ = 0;
+  body_complete_ = false;
+}
+
+ParseResult HttpResponseParser::ParseHeaderArea(net::Buffer &input, ParsedHeader &out) {
   const std::string_view bytes = input.ReadableView();
   const std::size_t headers_end = bytes.find("\r\n\r\n");
   const std::string_view protocol = headers_end == std::string_view::npos
                                         ? bytes : bytes.substr(0, headers_end + 4);
   if (HasBareLineFeed(protocol)) {
-    result_ = ParseResult::kError;
-    return result_;
+    return ParseResult::kError;
   }
 
   const std::size_t status_line_end = bytes.find("\r\n");
   if (status_line_end == std::string_view::npos) {
-    if (bytes.size() > kMaxStatusLineBytes) result_ = ParseResult::kError;
-    return result_;
+    if (bytes.size() > kMaxStatusLineBytes) return ParseResult::kError;
+    return ParseResult::kNeedMoreData;
   }
   if (status_line_end > kMaxStatusLineBytes) {
-    result_ = ParseResult::kError;
-    return result_;
+    return ParseResult::kError;
   }
 
   const std::string_view status_line = bytes.substr(0, status_line_end);
@@ -120,44 +243,36 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
                                        : status_line.find(' ', first_space + 1);
   if (first_space != 8 || second_space != 12 || status_line.size() <= second_space + 1 ||
       status_line.substr(0, first_space) != "HTTP/1.1") {
-    result_ = ParseResult::kError;
-    return result_;
+    return ParseResult::kError;
   }
   const std::string_view status_text = status_line.substr(first_space + 1, 3);
   if (status_text[0] < '2' || status_text[0] > '5' ||
       status_text[1] < '0' || status_text[1] > '9' ||
       status_text[2] < '0' || status_text[2] > '9' ||
       !IsValidFieldValue(status_line.substr(second_space + 1))) {
-    result_ = ParseResult::kError;
-    return result_;
+    return ParseResult::kError;
   }
 
-  HttpResponse parsed;
-  parsed.status = (status_text[0] - '0') * 100 + (status_text[1] - '0') * 10 +
-                  (status_text[2] - '0');
-  parsed.reason = status_line.substr(second_space + 1);
-  bool has_content_length = false;
-  std::size_t content_length = 0;
+  out.status = (status_text[0] - '0') * 100 + (status_text[1] - '0') * 10 +
+               (status_text[2] - '0');
+  out.reason = status_line.substr(second_space + 1);
   std::size_t cursor = status_line_end + 2;
   for (;;) {
     if (cursor > kMaxHeaderBytes + status_line_end + 2) {
-      result_ = ParseResult::kError;
-      return result_;
+      return ParseResult::kError;
     }
     const std::size_t line_end = bytes.find("\r\n", cursor);
     if (line_end == std::string_view::npos) {
       // An unfinished line must still respect the per-line limit; waiting for
       // its CRLF would otherwise retain up to the much larger header block.
       if (bytes.size() - cursor > kMaxStatusLineBytes) {
-        result_ = ParseResult::kError;
-        return result_;
+        return ParseResult::kError;
       }
-      if (bytes.size() > kMaxHeaderBytes + status_line_end + 2) result_ = ParseResult::kError;
-      return result_;
+      if (bytes.size() > kMaxHeaderBytes + status_line_end + 2) return ParseResult::kError;
+      return ParseResult::kNeedMoreData;
     }
     if (line_end + 2 - (status_line_end + 2) > kMaxHeaderBytes) {
-      result_ = ParseResult::kError;
-      return result_;
+      return ParseResult::kError;
     }
     if (line_end == cursor) {
       cursor += 2;
@@ -167,85 +282,44 @@ ParseResult HttpResponseParser::Parse(net::Buffer &input) {
     // Match the request parser's line-limit convention: the CRLF delimiter is
     // not counted, so a field-line of exactly 8 KiB remains valid.
     if (line.size() > kMaxStatusLineBytes) {
-      result_ = ParseResult::kError;
-      return result_;
+      return ParseResult::kError;
     }
     const std::size_t colon = line.find(':');
     if (colon == std::string_view::npos || colon == 0 || !IsToken(line.substr(0, colon))) {
-      result_ = ParseResult::kError;
-      return result_;
+      return ParseResult::kError;
     }
     const std::string_view raw_value = line.substr(colon + 1);
     if (!IsValidFieldValue(raw_value)) {
-      result_ = ParseResult::kError;
-      return result_;
+      return ParseResult::kError;
     }
     const std::string_view value = TrimOws(raw_value);
     const std::string name = LowerAscii(line.substr(0, colon));
     if (name == "transfer-encoding") {
-      result_ = ParseResult::kUnsupported;
-      return result_;
+      return ParseResult::kUnsupported;
     }
     if (name == "content-length") {
-      if (has_content_length || !ParseContentLength(value, &content_length) ||
-          content_length > kMaxBodyBytes) {
-        result_ = ParseResult::kError;
-        return result_;
+      if (out.has_content_length || !ParseContentLength(value, &out.content_length) ||
+          out.content_length > kMaxBodyBytes) {
+        return ParseResult::kError;
       }
-      has_content_length = true;
+      out.has_content_length = true;
     }
-    parsed.headers.emplace_back(line.substr(0, colon), value);
+    out.headers.emplace_back(line.substr(0, colon), value);
     cursor = line_end + 2;
   }
 
-  const bool bodyless = parsed.status == 204 || parsed.status == 304;
-  if (bodyless) {
-    if (has_content_length && content_length != 0) {
-      result_ = ParseResult::kError;
-      return result_;
+  out.bodyless = out.status == 204 || out.status == 304;
+  if (out.bodyless) {
+    if (out.has_content_length && out.content_length != 0) {
+      return ParseResult::kError;
     }
-    content_length = 0;
-  } else if (!has_content_length && !response_to_head_) {
-    result_ = ParseResult::kError;
-    return result_;
+    out.content_length = 0;
+  } else if (!out.has_content_length && !response_to_head_) {
+    return ParseResult::kError;
   }
+  out.header_end = cursor;
   headers_complete_ = true;
-  if (response_to_head_) {
-    // A HEAD response never carries a body: it completes at the end of the
-    // headers, carrying the declared entity length without consuming any
-    // bytes beyond the header area.  Any bytes already buffered past the
-    // headers stay in the input so a dirty connection cannot be reused.
-    if (!bodyless) {
-      if (has_content_length) {
-        parsed.body_mode = ResponseBodyMode::kSuppressedWithKnownLength;
-        parsed.content_length = content_length;
-      } else {
-        parsed.body_mode = ResponseBodyMode::kSuppressedWithUnknownLength;
-      }
-    }
-    response_ = std::move(parsed);
-    input.Retrieve(cursor);
-    result_ = ParseResult::kComplete;
-    return result_;
-  }
-  if (bytes.size() - cursor < content_length) return result_;
-
-  parsed.body = bytes.substr(cursor, content_length);
-  response_ = std::move(parsed);
-  input.Retrieve(cursor + content_length);
-  result_ = ParseResult::kComplete;
-  return result_;
-}
-
-const HttpResponse &HttpResponseParser::Response() const noexcept { return response_; }
-
-bool HttpResponseParser::HeadersComplete() const noexcept { return headers_complete_; }
-
-void HttpResponseParser::Reset(bool response_to_head) {
-  result_ = ParseResult::kNeedMoreData;
-  headers_complete_ = false;
-  response_to_head_ = response_to_head;
-  response_ = HttpResponse{};
+  return ParseResult::kComplete;
 }
 
 } // namespace aegisgate::http
