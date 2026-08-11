@@ -246,6 +246,11 @@ TEST(GatewayTest, ReapsClosedClientAfterItsChannelCallbackReturns) {
   client.join();
 
   EXPECT_TRUE(client_error.empty()) << client_error;
+  // The worker reaps the closed client asynchronously on its own thread:
+  // poll the aggregated count until the reap lands.
+  const auto reap_deadline = TestDeadline();
+  while (gateway.ClientCount() != 0U && std::chrono::steady_clock::now() < reap_deadline) {
+  }
   EXPECT_EQ(gateway.ClientCount(), 0U);
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
@@ -948,9 +953,13 @@ TEST(GatewayTest, SkipsUnhealthyEndpointWith503) {
   EXPECT_TRUE(backend_error.empty()) << backend_error;
   const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
   ASSERT_NE(matched, nullptr);
-  health::EndpointHealth *state = gateway.Routes().HealthFor(*matched, matched->endpoints.front());
-  ASSERT_NE(state, nullptr);
-  EXPECT_FALSE(state->Healthy());
+  // The health result is committed asynchronously on the coordinator loop:
+  // poll the snapshot until the endpoint becomes unhealthy.
+  const auto health_deadline = TestDeadline();
+  while (gateway.EndpointHealthy(*matched, matched->endpoints.front()) &&
+         std::chrono::steady_clock::now() < health_deadline) {
+  }
+  EXPECT_FALSE(gateway.EndpointHealthy(*matched, matched->endpoints.front()));
 
   std::string client_error;
   std::string client_response;
@@ -1000,14 +1009,13 @@ TEST(GatewayTest, SkipsOpenEndpointWithoutConnecting) {
 
   const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
   ASSERT_NE(matched, nullptr);
-  auto *breaker = gateway.Routes().BreakerFor(*matched, matched->endpoints.front());
-  ASSERT_NE(breaker, nullptr);
-  const auto now = std::chrono::steady_clock::now();
+  // Drive the endpoint's breaker open through the coordinator seam; each
+  // submission blocks until the coordinator processed it and republished.
   for (int i = 0; i < 5; ++i) {
-    const auto at = now + std::chrono::milliseconds(i);
-    breaker->RecordFailure(at, breaker->Select(at));
+    gateway.SubmitResultAndWait(*matched, matched->endpoints.front(), /*success=*/false);
   }
-  EXPECT_TRUE(breaker->RefusesSelection(now + std::chrono::milliseconds(10)));
+  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints.front()),
+            resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
   std::string client_response;
@@ -1071,13 +1079,11 @@ TEST(GatewayTest, RouteIsolatedBreakerState) {
   // own state.
   const config::Route *matched_a = gateway.Routes().Match("a.test", "/x");
   ASSERT_NE(matched_a, nullptr);
-  auto *breaker_a = gateway.Routes().BreakerFor(*matched_a, matched_a->endpoints.front());
-  ASSERT_NE(breaker_a, nullptr);
-  const auto now = std::chrono::steady_clock::now();
   for (int i = 0; i < 5; ++i) {
-    const auto at = now + std::chrono::milliseconds(i);
-    breaker_a->RecordFailure(at, breaker_a->Select(at));
+    gateway.SubmitResultAndWait(*matched_a, matched_a->endpoints.front(), /*success=*/false);
   }
+  EXPECT_EQ(gateway.BreakerState(*matched_a, matched_a->endpoints.front()),
+            resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
   std::string a_response;
@@ -1142,16 +1148,14 @@ TEST(GatewayTest, RetrySkipsOpenCandidateWithoutConnecting) {
   Gateway gateway(loop, config, "127.0.0.1", 0);
   gateway.Start();
 
-  // Drive the second endpoint's breaker open.
+  // Drive the second endpoint's breaker open through the coordinator seam.
   const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
   ASSERT_NE(matched, nullptr);
-  auto *breaker = gateway.Routes().BreakerFor(*matched, matched->endpoints[1]);
-  ASSERT_NE(breaker, nullptr);
-  const auto now = std::chrono::steady_clock::now();
   for (int i = 0; i < 5; ++i) {
-    const auto at = now + std::chrono::milliseconds(i);
-    breaker->RecordFailure(at, breaker->Select(at));
+    gateway.SubmitResultAndWait(*matched, matched->endpoints[1], /*success=*/false);
   }
+  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints[1]),
+            resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
   std::string client_response;
@@ -1219,16 +1223,12 @@ TEST(GatewayTest, RetryFailureAccountsExactlyOnce) {
 
   const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
   ASSERT_NE(matched, nullptr);
-  auto *breaker_first = gateway.Routes().BreakerFor(*matched, matched->endpoints[0]);
-  auto *breaker_open = gateway.Routes().BreakerFor(*matched, matched->endpoints[1]);
-  ASSERT_NE(breaker_first, nullptr);
-  ASSERT_NE(breaker_open, nullptr);
-  // Drive the backup endpoint open with its own two failures.
-  const auto now = std::chrono::steady_clock::now();
+  // Drive the backup endpoint open with its own two failures (min_requests=2).
   for (int i = 0; i < 2; ++i) {
-    const auto at = now + std::chrono::milliseconds(i);
-    breaker_open->RecordFailure(at, breaker_open->Select(at));
+    gateway.SubmitResultAndWait(*matched, matched->endpoints[1], /*success=*/false);
   }
+  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints[1]),
+            resilience::CircuitBreaker::State::kOpen);
 
   std::string client_error;
   std::string client_response;
@@ -1253,7 +1253,8 @@ TEST(GatewayTest, RetryFailureAccountsExactlyOnce) {
   // The single retryable failure of the first endpoint was accounted exactly
   // once: with min_requests=2 the breaker must still be closed.  A double
   // count would open it.
-  EXPECT_EQ(breaker_first->StateNow(), resilience::CircuitBreaker::State::kClosed);
+  EXPECT_EQ(gateway.BreakerState(*matched, matched->endpoints[0]),
+            resilience::CircuitBreaker::State::kClosed);
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_fds[0]), 0);
   EXPECT_EQ(::close(wake_fds[1]), 0);
@@ -1450,9 +1451,11 @@ TEST(GatewayTest, LeastActiveSkipsUnhealthyAndOpen) {
   loop.Loop();
   const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
   ASSERT_NE(matched, nullptr);
-  health::EndpointHealth *health = gateway.Routes().HealthFor(*matched, matched->endpoints[0]);
-  ASSERT_NE(health, nullptr);
-  EXPECT_FALSE(health->Healthy());
+  const auto health_deadline = TestDeadline();
+  while (gateway.EndpointHealthy(*matched, matched->endpoints[0]) &&
+         std::chrono::steady_clock::now() < health_deadline) {
+  }
+  EXPECT_FALSE(gateway.EndpointHealthy(*matched, matched->endpoints[0]));
 
   // Phase 1: the request must reach the healthy endpoint.
   std::string client_error;
@@ -1480,12 +1483,8 @@ TEST(GatewayTest, LeastActiveSkipsUnhealthyAndOpen) {
 
   // Open the healthy endpoint's breaker: no candidate remains, so the gateway
   // answers a unique 503 without connecting anywhere.
-  auto *breaker = gateway.Routes().BreakerFor(*matched, matched->endpoints[1]);
-  ASSERT_NE(breaker, nullptr);
-  const auto now = resilience::CircuitBreaker::Clock::now();
   for (int i = 0; i < 5; ++i) {
-    const auto at = now + std::chrono::milliseconds(i);
-    breaker->RecordFailure(at, breaker->Select(at));
+    gateway.SubmitResultAndWait(*matched, matched->endpoints[1], /*success=*/false);
   }
 
   std::string unavailable_response;
@@ -1530,7 +1529,7 @@ TEST(GatewayTest, GatewayDestructionWithPendingUpstreamEofIsSafe) {
   const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_listener.BoundPort(), 1};
   config::Route route{"api", "gateway.test", "/v1", {first, second}, 10, 10, 4};
   route.balance = config::BalancePolicy::kLeastActive;
-  route.retry_budget = 1;
+  route.retry_budget = 0;
   const config::Config config{{route}};
 
   std::array<int, 2> gate{};
@@ -1553,7 +1552,7 @@ TEST(GatewayTest, GatewayDestructionWithPendingUpstreamEofIsSafe) {
       (void)::close(fd);
       return;
     }
-    (void)::close(fd);  // EOF inside the safe retry window
+    (void)::close(fd);  // the EOF may land before or during gateway shutdown
     if (::write(gate[1], "d", 1) != 1 && first_error.empty()) {
       first_error = "closed gate failed";
     }
@@ -1592,7 +1591,12 @@ TEST(GatewayTest, GatewayDestructionWithPendingUpstreamEofIsSafe) {
   client.join();
   EXPECT_TRUE(client_error.empty()) << client_error;
 
-  // Close the first endpoint now: its EOF is pending but not yet processed.
+  // Close the first endpoint now.  With always-running workers the EOF is
+  // processed as soon as it is ready (no constructible "pending but
+  // unprocessed" window), so the destruction races the EOF delivery: both
+  // orders must be safe.  retry_budget 0 makes "no second connect" the
+  // deterministic observable contract; the late-retry window itself is
+  // defended by the GatewayDown checks in StartUpstream.
   if (::write(gate[0], "c", 1) != 1) {
     FAIL() << "close gate write failed";
   }
@@ -1602,13 +1606,11 @@ TEST(GatewayTest, GatewayDestructionWithPendingUpstreamEofIsSafe) {
   }
   first_backend.join();
 
-  // Destroy the gateway while the retry decision is still queued.  The queued
-  // task and any late upstream event must terminate the transaction without
-  // touching the destroyed gateway and without connecting to the second
-  // endpoint.  (Transaction-termination evidence lives in
-  // ProxyTransactionTest.CancelAllTerminatesInFlightTransaction, where the
-  // route table is still alive; here the observable contract is "no second
-  // connect" plus a clean ASan run.)
+  // Destroy the gateway with the EOF possibly still in flight.  The destroy
+  // task terminates the exchange on the worker thread (CancelAll); any late
+  // upstream event must never touch the destroyed gateway, and no connect may
+  // follow.  (Transaction-termination evidence lives in
+  // ProxyTransactionTest.CancelAllTerminatesInFlightTransaction.)
   gateway.reset();
 
   // Pump briefly so a (buggy) retry connect would be observed; the watchdog
