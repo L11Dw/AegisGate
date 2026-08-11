@@ -1925,7 +1925,8 @@ TEST(ProxyTransactionTest, ClientCloseCancelsUpstream) {
     const std::string body(512 * 1024, 'b');
     std::size_t written = 0;
     while (backend_error.empty() && written < body.size()) {
-      const ssize_t count = ::write(fd, body.data() + written, body.size() - written);
+      const ssize_t count = ::send(fd, body.data() + written, body.size() - written,
+                                   MSG_NOSIGNAL);
       if (count > 0) {
         written += static_cast<std::size_t>(count);
         continue;
