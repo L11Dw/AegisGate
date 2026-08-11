@@ -79,4 +79,55 @@ std::string HttpResponse::Serialize() const {
   return result;
 }
 
+std::string HttpResponseHead::Serialize() const {
+  if (status < 200 || status > 599 || HasLineBreak(reason)) {
+    throw std::invalid_argument("invalid HTTP response status line");
+  }
+  const bool bodyless_status = status == 204 || status == 304;
+  if (bodyless_status) {
+    if (body_mode != ResponseBodyMode::kNormal || content_length.has_value()) {
+      throw std::invalid_argument("invalid bodyless HTTP response framing");
+    }
+  } else {
+    switch (body_mode) {
+    case ResponseBodyMode::kNormal:
+      // A streaming head carries no body: the declared entity length is the
+      // framing.  Without it the response cannot be re-framed downstream.
+      if (!content_length.has_value()) {
+        throw std::invalid_argument("streaming response head requires Content-Length");
+      }
+      break;
+    case ResponseBodyMode::kSuppressedWithKnownLength:
+      if (!content_length.has_value()) {
+        throw std::invalid_argument(
+            "suppressed body with known length requires Content-Length");
+      }
+      break;
+    case ResponseBodyMode::kSuppressedWithUnknownLength:
+      if (content_length.has_value()) {
+        throw std::invalid_argument(
+            "suppressed body with unknown length requires no Content-Length");
+      }
+      break;
+    }
+  }
+
+  std::string result = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n";
+  for (const auto &[name, value] : headers) {
+    if (name.empty() || HasLineBreak(name) || HasLineBreak(value)) {
+      throw std::invalid_argument("invalid HTTP response header");
+    }
+    const std::string lowercase_name = Lowercase(name);
+    if (lowercase_name == "content-length" || lowercase_name == "transfer-encoding") {
+      throw std::invalid_argument("HTTP response framing is managed by Serialize");
+    }
+    result.append(name).append(": ").append(value).append("\r\n");
+  }
+  if (!bodyless_status && body_mode != ResponseBodyMode::kSuppressedWithUnknownLength) {
+    result.append("Content-Length: ").append(std::to_string(*content_length)).append("\r\n");
+  }
+  result.append("\r\n");
+  return result;
+}
+
 } // namespace aegisgate::http

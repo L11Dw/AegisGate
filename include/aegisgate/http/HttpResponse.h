@@ -46,4 +46,27 @@ struct HttpResponse {
   [[nodiscard]] std::string Serialize() const;
 };
 
+// A validated response header with its framing but no body bytes.  Streaming
+// forwarding serializes this head before any body chunk arrives; the declared
+// entity length is the framing, so kNormal heads must carry one and must never
+// derive "Content-Length: 0" from an absent body.
+struct HttpResponseHead {
+  HttpResponseHead(int status_ = 200, std::string reason_ = "OK",
+                   std::vector<std::pair<std::string, std::string>> headers_ = {},
+                   ResponseBodyMode body_mode_ = ResponseBodyMode::kNormal,
+                   std::optional<std::size_t> content_length_ = std::nullopt)
+      : status(status_), reason(std::move(reason_)), headers(std::move(headers_)),
+        body_mode(body_mode_), content_length(content_length_) {}
+
+  int status = 200;
+  std::string reason = "OK";
+  std::vector<std::pair<std::string, std::string>> headers;
+  ResponseBodyMode body_mode = ResponseBodyMode::kNormal;
+  // The entity length declared on the wire.  Required for kNormal and
+  // kSuppressedWithKnownLength; absent for bodyless and unknown-length heads.
+  std::optional<std::size_t> content_length;
+
+  [[nodiscard]] std::string Serialize() const;
+};
+
 } // namespace aegisgate::http
