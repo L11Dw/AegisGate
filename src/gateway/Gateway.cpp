@@ -151,8 +151,17 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
           if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, *candidate)) {
             link = proxy::ProxyTransaction::BreakerLink{
                 breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
+            // Defensive: a rejected permit never starts an attempt, so it also
+            // never takes an active slot.  The Eligible() pre-filter makes
+            // this unreachable in the single-loop design.
+            if (link->permit.selection == resilience::CircuitBreaker::Selection::kRejectedOpen ||
+                link->permit.selection ==
+                    resilience::CircuitBreaker::Selection::kRejectedHalfOpenQuota) {
+              continue;
+            }
           }
-          return proxy::ProxyTransaction::AttemptSelection{candidate, std::move(link)};
+          return proxy::ProxyTransaction::AttemptSelection{
+              candidate, std::move(link), routes_.AcquireActive(*route, *candidate)};
         }
         return std::nullopt;
       });

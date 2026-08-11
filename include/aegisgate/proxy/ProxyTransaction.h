@@ -17,6 +17,7 @@
 #include "aegisgate/observability/Metrics.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/resilience/InflightLimiter.h"
+#include "aegisgate/routing/ActiveReservation.h"
 
 namespace aegisgate::net {
 class ClientConnection;
@@ -55,10 +56,13 @@ public:
     resilience::CircuitBreaker::RequestPermit permit;
   };
   // The outcome of choosing one upstream attempt: an eligible endpoint plus
-  // its breaker link (absent when the route has no breaker).
+  // its breaker link (absent when the route has no breaker) plus the active
+  // slot it holds.  The reservation is released exactly once when the attempt
+  // terminates; a selection is only constructed when an attempt starts.
   struct AttemptSelection {
     const config::Endpoint *endpoint;
     std::optional<BreakerLink> link;
+    routing::ActiveReservation active;
   };
   // Chooses the endpoint for the initial attempt and for every retry, so
   // unhealthy or open candidates are never connected to.  nullopt means no
@@ -121,6 +125,10 @@ private:
   std::string route_name_;
   observability::Metrics::RequestHandle metric_request_;
   std::optional<BreakerLink> breaker_link_;
+  // One active-attempt slot per upstream attempt: acquired by the provider,
+  // released at the attempt's terminal point (see the design lifecycle
+  // matrix).  Release is idempotent; an empty guard is a safe no-op.
+  routing::ActiveReservation active_reservation_;
   // One-shot guard: each upstream attempt may account its outcome at most
   // once, even when the retry fallback terminates the same attempt.
   bool attempt_accounted_ = false;
