@@ -154,13 +154,19 @@ bool ProxyTransaction::StartUpstream() {
   response_header_received_ = false;
   // The provider chooses an eligible endpoint and issues the attempt permit
   // (freshly per retry).  No candidate means do not connect.
+  breaker_link_.reset();
   if (attempt_provider_) {
     const auto selection = attempt_provider_();
     if (!selection.has_value()) {
+      // No candidate is not a new attempt: the previous attempt's guard and
+      // accounting stay as they are.
       return false;
     }
     endpoint_ = *selection->endpoint;
     breaker_link_ = selection->link;
+    attempt_accounted_ = false;
+  } else {
+    attempt_accounted_ = false;
   }
   ArmConnectDeadline();
   const auto self = shared_from_this();
@@ -263,7 +269,8 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
 }
 
 void ProxyTransaction::AccountSuccess() noexcept {
-  if (!breaker_link_.has_value()) return;
+  if (!breaker_link_.has_value() || attempt_accounted_) return;
+  attempt_accounted_ = true;
   try {
     breaker_link_->breaker->RecordSuccess(resilience::CircuitBreaker::Clock::now(),
                                           breaker_link_->permit);
@@ -273,7 +280,8 @@ void ProxyTransaction::AccountSuccess() noexcept {
 }
 
 void ProxyTransaction::AccountFailure() noexcept {
-  if (!breaker_link_.has_value()) return;
+  if (!breaker_link_.has_value() || attempt_accounted_) return;
+  attempt_accounted_ = true;
   try {
     breaker_link_->breaker->RecordFailure(resilience::CircuitBreaker::Clock::now(),
                                           breaker_link_->permit);
@@ -413,8 +421,9 @@ bool ProxyTransaction::HasRetryAlternative() const noexcept {
 
 bool ProxyTransaction::StartRetry() {
   if (attempt_provider_) {
+    if (!StartUpstream()) return false;
     ++retries_;
-    return StartUpstream();
+    return true;
   }
   if (!endpoint_) return false;
   const auto next = std::find_if(policy_.retry_endpoints.begin(), policy_.retry_endpoints.end(),
@@ -422,9 +431,10 @@ bool ProxyTransaction::StartRetry() {
     return candidate.address != endpoint_->address || candidate.port != endpoint_->port;
   });
   if (next == policy_.retry_endpoints.end()) return false;
-  ++retries_;
   *endpoint_ = *next;
-  return StartUpstream();
+  if (!StartUpstream()) return false;
+  ++retries_;
+  return true;
 }
 
 void ProxyTransaction::FinishGatewayTimeout() {

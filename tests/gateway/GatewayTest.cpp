@@ -1135,5 +1135,79 @@ TEST(GatewayTest, RetrySkipsOpenCandidateWithoutConnecting) {
   EXPECT_EQ(::close(wake_fds[1]), 0);
 }
 
+
+TEST(GatewayTest, RetryFailureAccountsExactlyOnce) {
+  net::Socket first_listener = net::Socket::ListenLoopback();
+  net::Socket open_listener = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_listener.BoundPort(), 1};
+  const config::Endpoint open_endpoint{"127.0.0.1", {127, 0, 0, 1}, open_listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {first, open_endpoint}, 10, 10, 4};
+  route.circuit_breaker = config::CircuitBreakerSettings{10, 2, 500, 5, 1};
+  route.retry_budget = 1;
+  const config::Config config{{route}};
+
+  std::string first_error;
+  std::thread first_backend([&] {
+    const int fd = AcceptUntil(first_listener, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, 53, TestDeadline(), first_error);
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  const config::Route *matched = gateway.Routes().Match("gateway.test", "/v1/x");
+  ASSERT_NE(matched, nullptr);
+  auto *breaker_first = gateway.Routes().BreakerFor(*matched, matched->endpoints[0]);
+  auto *breaker_open = gateway.Routes().BreakerFor(*matched, matched->endpoints[1]);
+  ASSERT_NE(breaker_first, nullptr);
+  ASSERT_NE(breaker_open, nullptr);
+  // Drive the backup endpoint open with its own two failures.
+  const auto now = std::chrono::steady_clock::now();
+  for (int i = 0; i < 2; ++i) {
+    const auto at = now + std::chrono::milliseconds(i);
+    breaker_open->RecordFailure(at, breaker_open->Select(at));
+  }
+
+  std::string client_error;
+  std::string client_response;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway.port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    constexpr std::string_view expected = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    client_response = ReadExact(socket.Fd(), expected.size(), TestDeadline(), client_error);
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+  first_backend.join();
+
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_EQ(client_response, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+  // The single retryable failure of the first endpoint was accounted exactly
+  // once: with min_requests=2 the breaker must still be closed.  A double
+  // count would open it.
+  EXPECT_EQ(breaker_first->StateNow(), resilience::CircuitBreaker::State::kClosed);
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
 } // namespace
 } // namespace aegisgate::gateway

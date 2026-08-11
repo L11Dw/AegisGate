@@ -121,6 +121,9 @@ private:
   std::string route_name_;
   observability::Metrics::RequestHandle metric_request_;
   std::optional<BreakerLink> breaker_link_;
+  // One-shot guard: each upstream attempt may account its outcome at most
+  // once, even when the retry fallback terminates the same attempt.
+  bool attempt_accounted_ = false;
   std::unique_ptr<net::UpstreamConnection> upstream_;
   std::shared_ptr<UpstreamPool> pool_;
   net::TimerQueue *timers_ = nullptr;
