@@ -129,6 +129,14 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
 }
 
 void ProxyTransaction::Begin() {
+  // The gateway may already be down (e.g. an expired lifetime token passed to
+  // Start): touch nothing of it — no metrics, no admission slot, no timers_,
+  // no provider, no connect.  The transaction stays terminal and its RAII
+  // members release nothing.
+  if (GatewayDown()) {
+    finished_ = true;
+    return;
+  }
   if (metrics_) {
     try {
       metric_request_ = metrics_->BeginRequest(route_name_);

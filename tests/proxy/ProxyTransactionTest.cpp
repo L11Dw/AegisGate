@@ -1469,5 +1469,80 @@ TEST(ProxyTransactionTest, KeepAliveReuseDoesNotRetainTransaction) {
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
+// R-044 regression: Start() with an already-expired gateway lifetime token
+// must be inert — no provider call, no admission slot, no timer, no connect,
+// no response callback — because Begin() must not touch the gateway (timers_)
+// while it is already down.
+TEST(ProxyTransactionTest, StartWithExpiredGatewayTokenIsInert) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  std::array<int, 2> client_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  const config::Route route{"limited", "test", "/", {}, 10, 10, 4};
+  const auto admission = std::make_shared<resilience::RouteAdmission>(
+      route, std::chrono::steady_clock::now());
+  // An already-expired gateway lifetime token.
+  auto expired = std::make_shared<int>(0);
+  std::optional<std::weak_ptr<void>> expired_token{std::weak_ptr<void>(expired)};
+  expired.reset();
+
+  bool provider_called = false;
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.connect_timeout = std::chrono::seconds(1);
+    policy.first_byte_timeout = std::chrono::seconds(1);
+    policy.total_timeout = std::chrono::seconds(2);
+    policy.retry_budget = 0;
+    transaction = ProxyTransaction::Start(
+        loop, connection, endpoint, parsed, pool, admission, &timers, std::move(policy),
+        nullptr, "least",
+        [&]() -> std::optional<ProxyTransaction::AttemptSelection> {
+          provider_called = true;
+          return std::nullopt;
+        },
+        expired_token);
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  std::array<int, 2> wake{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake.data()), 0);
+  net::Channel wake_channel(loop, wake[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  ASSERT_EQ(::write(wake[1], "q", 1), 1);
+  loop.Loop();
+  wake_channel.Remove();
+
+  EXPECT_TRUE(transaction);
+  EXPECT_FALSE(provider_called) << "provider was consulted with an expired token";
+  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()))
+      << "an admission slot was taken";
+  EXPECT_EQ(timers.PendingCount(), 0U) << "a deadline was armed";
+  pollfd pending{listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&pending, 1, 100), 0) << "the inert transaction connected upstream";
+  // The client must not have received any downstream bytes (no spurious 503):
+  // a nonblocking recv on the peer must report EAGAIN/EWOULDBLOCK.
+  char byte = '\0';
+  const ssize_t downstream = ::recv(client_sockets[1], &byte, 1, MSG_DONTWAIT);
+  EXPECT_EQ(downstream, -1);
+  EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK)
+      << "unexpected downstream bytes from the inert transaction";
+  client.Close();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake[0]), 0);
+  EXPECT_EQ(::close(wake[1]), 0);
+}
+
 } // namespace
 } // namespace aegisgate::proxy
