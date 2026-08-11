@@ -111,6 +111,10 @@ void ClientConnection::ResumeReading() {
   }
 
   parser_.Reset();
+  // A new request cycle starts: the previous response's streaming state must
+  // not leak into the next SendResponse/BeginResponse.
+  response_committed_ = false;
+  response_finished_ = false;
   reading_paused_ = false;
   if (input_.ReadableBytes() != 0) {
     switch (parser_.Parse(input_)) {

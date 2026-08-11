@@ -361,9 +361,12 @@ void UpstreamConnection::Finish(UpstreamResult result) {
   if (keep_alive) {
     reusable_ = true;
     state_ = State::kIdle;
-    // The exchange is over: drop the transaction-holding progress callback so
-    // an idle pooled connection cannot retain the transaction (R-043).
+    // The exchange is over: drop every transaction-holding callback so an
+    // idle pooled connection cannot retain the transaction (R-043).  The
+    // lending path re-installs fresh callbacks on the next Execute.
     progress_callback_ = nullptr;
+    header_callback_ = nullptr;
+    body_sink_ = nullptr;
     if (channel_) {
       try { channel_->DisableAll(); } catch (...) { Close(); }
     }

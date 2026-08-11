@@ -1544,5 +1544,545 @@ TEST(ProxyTransactionTest, StartWithExpiredGatewayTokenIsInert) {
   EXPECT_EQ(::close(wake[1]), 0);
 }
 
+// --- M3-C streaming failure semantics ---
+
+namespace {
+
+// Reads exactly size bytes, then expects the peer to close the connection
+// (streaming truncation).  Returns the received bytes; sets error otherwise.
+std::string ReadExactThenEof(int fd, std::size_t size, Deadline deadline, std::string &error) {
+  std::string result(size, '\0');
+  std::size_t received = 0;
+  while (received < size) {
+    pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(deadline)) <= 0) {
+      error = "read timed out";
+      return {};
+    }
+    const ssize_t count = ::read(fd, result.data() + received, size - received);
+    if (count > 0) {
+      received += static_cast<std::size_t>(count);
+      continue;
+    }
+    if (count < 0 && errno == EINTR) continue;
+    error = "unexpected EOF before committed bytes";
+    return {};
+  }
+  pollfd descriptor{fd, POLLIN | POLLHUP, 0};
+  if (::poll(&descriptor, 1, RemainingMilliseconds(deadline)) <= 0) {
+    error = "truncated connection did not reach EOF";
+    return result;
+  }
+  std::array<char, 8> extra{};
+  if (::read(fd, extra.data(), extra.size()) != 0) {
+    error = "expected EOF after truncated response";
+  }
+  return result;
+}
+
+bool HasNoPendingAccept(const net::Socket &listener) {
+  pollfd descriptor{listener.Fd(), POLLIN, 0};
+  return ::poll(&descriptor, 1, 100) == 0;
+}
+
+} // namespace
+
+TEST(ProxyTransactionTest, HeaderCommitDisablesRetry) {
+  net::Socket first_listener = net::Socket::ListenLoopback();
+  net::Socket second_listener = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_listener.BoundPort(), 1};
+  const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_listener.BoundPort(), 1};
+  constexpr std::string_view request =
+      "GET /header HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string first_error;
+  std::thread first_backend([&] {
+    const int fd = AcceptUntil(first_listener, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), first_error);
+    // Committed header plus a partial body, then EOF.
+    constexpr std::string_view partial = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    if (first_error.empty() &&
+        ::write(fd, partial.data(), partial.size()) != static_cast<ssize_t>(partial.size())) {
+      first_error = "failed to write partial response";
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.retry_budget = 1;
+    policy.retry_endpoints = {first, second};
+    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, nullptr, &timers,
+                                          std::move(policy));
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET /header HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    const auto received = ReadExactThenEof(client_sockets[1], committed.size(), TestDeadline(),
+                                           peer_result.error);
+    if (!received.empty() || peer_result.error.empty()) peer_result.received = received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  first_backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart");
+  EXPECT_TRUE(peer_result.wire_ok);
+  // A committed response head closes the retry window: no second endpoint.
+  EXPECT_TRUE(HasNoPendingAccept(second_listener));
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(ProxyTransactionTest, HeaderCommittedEofTruncatesWithoutSecondResponse) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const std::uint16_t port = listener.BoundPort();
+  constexpr std::string_view request =
+      "GET /truncate HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    constexpr std::string_view partial = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    if (backend_error.empty() &&
+        ::write(fd, partial.data(), partial.size()) != static_cast<ssize_t>(partial.size())) {
+      backend_error = "failed to write partial response";
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr, &timers,
+                                          std::move(policy));
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET /truncate HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    const auto received = ReadExactThenEof(client_sockets[1], committed.size(), TestDeadline(),
+                                           peer_result.error);
+    if (!received.empty() || peer_result.error.empty()) peer_result.received = received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  // The committed head and the forwarded bytes arrive; no 502 status line may
+  // follow them, and the connection is truncated.
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart");
+  EXPECT_TRUE(peer_result.wire_ok);
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(ProxyTransactionTest, HeaderCommittedTimeoutTruncates) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const std::uint16_t port = listener.BoundPort();
+  constexpr std::string_view request =
+      "GET /timeout HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    constexpr std::string_view partial = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    if (backend_error.empty() &&
+        ::write(fd, partial.data(), partial.size()) != static_cast<ssize_t>(partial.size())) {
+      backend_error = "failed to write partial response";
+    }
+    // Hold the connection open past the total timeout: the gateway must
+    // truncate downstream and close the upstream descriptor.
+    pollfd descriptor{fd, POLLHUP | POLLIN, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0 && backend_error.empty()) {
+      backend_error = "gateway did not close timed-out upstream";
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.total_timeout = std::chrono::milliseconds(50);
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr, &timers,
+                                          std::move(policy));
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET /timeout HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
+    const auto received = ReadExactThenEof(client_sockets[1], committed.size(), TestDeadline(),
+                                           peer_result.error);
+    if (!received.empty() || peer_result.error.empty()) peer_result.received = received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart");
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(ProxyTransactionTest, UnsupportedResponseDoesNotRetry) {
+  net::Socket first_listener = net::Socket::ListenLoopback();
+  net::Socket second_listener = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_listener.BoundPort(), 1};
+  const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_listener.BoundPort(), 1};
+  constexpr std::string_view request =
+      "GET /chunked HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string first_error;
+  std::thread first_backend([&] {
+    const int fd = AcceptUntil(first_listener, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), first_error);
+    constexpr std::string_view chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    if (first_error.empty() &&
+        ::write(fd, chunked.data(), chunked.size()) != static_cast<ssize_t>(chunked.size())) {
+      first_error = "failed to write chunked response";
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.retry_budget = 1;
+    policy.retry_endpoints = {first, second};
+    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, nullptr, &timers,
+                                          std::move(policy));
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET /chunked HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view bad_gateway = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+    const auto received = ReadExactUntil(client_sockets[1], bad_gateway.size(), TestDeadline(),
+                                         peer_result.error);
+    if (!received) return;
+    peer_result.received = *received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  first_backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+  EXPECT_TRUE(peer_result.wire_ok);
+  // An unsupported framing is a terminal 502 answer, not a retryable failure.
+  EXPECT_TRUE(HasNoPendingAccept(second_listener));
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(ProxyTransactionTest, ClientCloseCancelsUpstream) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const std::uint16_t port = listener.BoundPort();
+  constexpr std::string_view request =
+      "GET /client-close HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    // A large streaming body keeps the gateway's downstream write pending
+    // (EPOLLOUT registered), so the client's reset is observable there.
+    constexpr std::string_view header = "HTTP/1.1 200 OK\r\nContent-Length: 524288\r\n\r\n";
+    if (backend_error.empty() &&
+        ::write(fd, header.data(), header.size()) != static_cast<ssize_t>(header.size())) {
+      backend_error = "failed to write header";
+    }
+    const std::string body(512 * 1024, 'b');
+    std::size_t written = 0;
+    while (backend_error.empty() && written < body.size()) {
+      const ssize_t count = ::write(fd, body.data() + written, body.size() - written);
+      if (count > 0) {
+        written += static_cast<std::size_t>(count);
+        continue;
+      }
+      if (count < 0 && errno == EINTR) continue;
+      break;  // EAGAIN (paused) or EPIPE (gateway cancelled the exchange)
+    }
+    // The gateway must cancel the exchange once the client is gone.  A clean
+    // close yields EOF; closing with unread body bytes buffered yields RST.
+    pollfd descriptor{fd, POLLHUP | POLLIN, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+      if (backend_error.empty()) backend_error = "gateway did not close cancelled upstream";
+    } else {
+      char byte = '\0';
+      const ssize_t count = ::recv(fd, &byte, 1, 0);
+      const bool closed = count == 0 ||
+                          (count < 0 && (errno == ECONNRESET || errno == EPIPE));
+      if (!closed && backend_error.empty()) {
+        backend_error = "expected EOF on cancelled upstream";
+      }
+    }
+    (void)::close(fd);
+    (void)::write(wake_sockets[1], "q", 1);
+  });
+
+  std::array<int, 2> client_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  const config::Route route{"api", "test", "/", {}, 2, 2, 1};
+  const auto admission = std::make_shared<resilience::RouteAdmission>(
+      route, std::chrono::steady_clock::now());
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
+  std::shared_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission,
+                                          &timers, {});
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET /client-close HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  // The peer resets the connection: the abort path must cancel the upstream
+  // exchange and release the admission slot.
+  struct linger reset = {1, 0};
+  EXPECT_EQ(::setsockopt(client_sockets[1], SOL_SOCKET, SO_LINGER, &reset, sizeof(reset)), 0);
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_TRUE(transaction);
+  EXPECT_EQ(timers.PendingCount(), 0U);
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
+TEST(ProxyTransactionTest, ClearsClientStreamCallbacksAtTerminal) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const std::uint16_t port = listener.BoundPort();
+  constexpr std::string_view request =
+      "GET /keepalive HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    if (backend_error.empty() &&
+        ::write(fd, response.data(), response.size()) != static_cast<ssize_t>(response.size())) {
+      backend_error = "failed to write response";
+    }
+    (void)::close(fd);
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  int abort_calls = 0;
+  std::weak_ptr<ProxyTransaction> transaction;
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  std::unique_ptr<net::ClientConnection> client =
+      std::make_unique<net::ClientConnection>(
+          loop, client_sockets[0],
+          [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+            transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr,
+                                                  &timers);
+          });
+  client->SetRequestAbortCallback([&] { ++abort_calls; });
+  client->Start();
+  constexpr std::string_view inbound = "GET /keepalive HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  WorkerResult peer_result;
+  std::thread peer([&] {
+    constexpr std::string_view response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    const auto received = ReadExactUntil(client_sockets[1], response.size(), TestDeadline(),
+                                         peer_result.error);
+    if (!received) return;
+    peer_result.received = *received;
+    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
+    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  backend.join();
+
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
+  EXPECT_EQ(peer_result.received, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+  EXPECT_TRUE(transaction.expired());
+  // The transaction's terminal path cleared its stream callbacks: a later
+  // peer reset must not reach the transaction (and the connection cannot
+  // retain it).
+  EXPECT_EQ(abort_calls, 0);
+  client.reset();
+  EXPECT_EQ(abort_calls, 0);
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
 } // namespace
 } // namespace aegisgate::proxy

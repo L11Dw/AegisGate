@@ -428,11 +428,17 @@ TEST(EndToEndTest, AllEndpointsUnavailableServesUnique503WithInflightZero) {
         if (error.empty()) error = "expected upstream 503";
       }
     }
+    if (!error.empty() && error == "unexpected EOF or read error") {
+      error += " (first response)";
+    }
     // Open: the gateway answers 503 without connecting or retrying.
     if (error.empty() && WriteAll(client.Fd(), request, TestDeadline(), error)) {
       if (ReadExact(client.Fd(), gateway_fail.size(), TestDeadline(), error) != gateway_fail) {
         if (error.empty()) error = "expected gateway 503 while open";
       }
+    }
+    if (!error.empty() && error == "unexpected EOF or read error") {
+      error += " (second response)";
     }
     if (error.empty() && WriteAll(client.Fd(), "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n",
                                   TestDeadline(), error)) {

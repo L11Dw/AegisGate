@@ -169,12 +169,15 @@ ParseResult HttpResponseParser::ParseHeaders(net::Buffer &input) {
     head_ = HttpResponseHead{parsed.status, parsed.reason, std::move(parsed.headers),
                              ResponseBodyMode::kNormal, parsed.content_length};
     remaining_body_ = parsed.content_length;
+    // A declared zero-length body completes at the headers; ConsumeBody would
+    // otherwise wait forever for bytes that never arrive.
+    body_complete_ = parsed.content_length == 0;
   }
   input.Retrieve(parsed.header_end);
   return ParseResult::kComplete;
 }
 
-ParseResult HttpResponseParser::ConsumeBody(net::Buffer &input, const BodySink &sink) {
+ParseResult HttpResponseParser::ConsumeBody(net::Buffer &input, BodySink sink) {
   if (!headers_complete_) {
     throw std::logic_error("response headers are not complete");
   }

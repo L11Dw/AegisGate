@@ -77,6 +77,13 @@ void StripHopByHopHeaders(http::HttpResponse &response) {
   });
 }
 
+void StripHopByHopHeaders(http::HttpResponseHead &head) {
+  const auto names = HopByHopNames(head.headers);
+  std::erase_if(head.headers, [&names](const auto &header) {
+    return names.contains(LowerAscii(header.first));
+  });
+}
+
 } // namespace
 
 ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -152,6 +159,16 @@ void ProxyTransaction::Begin() {
       return;
     }
   }
+  // Wire the downstream stream notifications.  Both callbacks hold only a
+  // weak reference so a live connection cannot retain a finished transaction;
+  // every terminal path clears them via ClearClientStreamCallbacks().
+  const std::weak_ptr<ProxyTransaction> weak_self = shared_from_this();
+  client_->SetWriteDrainedCallback([weak_self] {
+    if (const auto self = weak_self.lock()) self->ResumeUpstreamReading();
+  });
+  client_->SetRequestAbortCallback([weak_self] {
+    if (const auto self = weak_self.lock()) self->HandleClientAbort();
+  });
   ArmTotalDeadline();
   if (!StartUpstream()) {
     FinishNoEndpoint();
@@ -199,7 +216,9 @@ bool ProxyTransaction::StartUpstream() {
       active_connection_ = pool_->Execute(*endpoint_, upstream_request,
                      [self](net::UpstreamResult result, http::HttpResponse response) {
                        self->HandleUpstream(result, std::move(response));
-                     }, [self](net::UpstreamProgress progress) { self->HandleProgress(progress); });
+                     }, [self](net::UpstreamProgress progress) { self->HandleProgress(progress); },
+                     [self](const http::HttpResponseHead &head) { self->HandleResponseHead(head); },
+                     [self](std::string_view bytes) { return self->HandleResponseBody(bytes); });
       starting_upstream_ = false;
       return true;
     }
@@ -210,6 +229,9 @@ bool ProxyTransaction::StartUpstream() {
     upstream_->SetProgressCallback([self](net::UpstreamProgress progress) {
       self->HandleProgress(progress);
     });
+    upstream_->SetStreamingCallbacks(
+        [self](const http::HttpResponseHead &head) { self->HandleResponseHead(head); },
+        [self](std::string_view bytes) { return self->HandleResponseBody(bytes); });
     starting_upstream_ = true;
     upstream_->Start(upstream_request);
     starting_upstream_ = false;
@@ -231,6 +253,7 @@ void ProxyTransaction::HandleAdmissionRejected() {
   CompleteMetric(429, true);
   const auto client_lifetime = client_lifetime_.lock();
   if (!client_lifetime) return;
+  ClearClientStreamCallbacks();
   const auto self = shared_from_this();
   try {
     client_->SendResponse(http::HttpResponse{429, "Too Many Requests", {}, ""});
@@ -269,13 +292,34 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   // destroy that object while its Start()/Finish() stack frame is active.
   if (!starting_upstream_) upstream_.reset();
 
-  CompleteMetric(response.status);
   const auto client_lifetime = client_lifetime_.lock();
   if (!client_lifetime) {
+    // The client is gone: nothing further may be written; breaker accounting
+    // stays untouched (R-034: a client disconnect consumes no permit).
+    CompleteMetric(downstream_response_committed_ ? response_head_.status
+                                                  : response.status);
+    return;
+  }
+  if (downstream_response_committed_) {
+    // Streaming success: the full body was handed to the downstream queue;
+    // FinishResponse closes the response and resumes request reading once the
+    // queue drains.
+    try {
+      client_->FinishResponse();
+    } catch (const std::logic_error &) {
+    } catch (const std::system_error &) {
+    }
+    CompleteMetric(response_head_.status);
+    if (response_head_.status >= 500) {
+      AccountFailure();
+    } else {
+      AccountSuccess();
+    }
     return;
   }
   // A 5xx answer is an endpoint failure for the breaker; 4xx and success
   // responses are healthy answers.
+  CompleteMetric(response.status);
   if (response.status >= 500) {
     AccountFailure();
   } else {
@@ -289,6 +333,117 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   } catch (const std::logic_error &) {
   } catch (const std::system_error &) {
   }
+}
+
+void ProxyTransaction::HandleResponseHead(const http::HttpResponseHead &head) {
+  if (finished_) return;
+  if (GatewayDown()) return;
+  // Keep the transaction alive across this call: the client-dead branch below
+  // may release the callback-held owners (and with them the last strong
+  // reference to this transaction).
+  const auto self = shared_from_this();
+  response_head_ = head;
+  StripHopByHopHeaders(response_head_);
+  // The retry window closes the moment the head is handed downstream: the
+  // output can no longer be replaced even before the kernel writes a byte.
+  downstream_response_committed_ = true;
+  const auto client_lifetime = client_lifetime_.lock();
+  if (!client_lifetime) {
+    // The client is gone before the head could be written: terminate with
+    // the upstream cancel deferred (this call runs inside the upstream
+    // callback stack, so nothing may destroy the upstream mid-callback).
+    HandleClientAbort();
+    return;
+  }
+  try {
+    client_->BeginResponse(response_head_);
+  } catch (const std::logic_error &) {
+    HandleClientAbort();
+  } catch (const std::system_error &) {
+    HandleClientAbort();
+  }
+}
+
+bool ProxyTransaction::HandleResponseBody(std::string_view bytes) {
+  if (finished_) return false;
+  if (GatewayDown()) return false;
+  // Keep the transaction alive: HandleClientAbort below cancels the upstream
+  // exchange, releasing every callback-held strong reference.
+  const auto self = shared_from_this();
+  bool crossed = false;
+  try {
+    crossed = client_->WriteResponseBody(bytes);
+  } catch (const std::logic_error &) {
+    HandleClientAbort();
+    return false;
+  } catch (const std::system_error &) {
+    HandleClientAbort();
+    return false;
+  }
+  if (crossed) {
+    PauseUpstreamReading();
+  }
+  return true;
+}
+
+void ProxyTransaction::HandleClientAbort() {
+  if (finished_) return;
+  // Keep the transaction alive across this call: the deferred cancellation
+  // may release the last callback-held strong reference at batch end.
+  const auto self = shared_from_this();
+  finished_ = true;
+  ++generation_;
+  CancelDeadlines();
+  reservation_.reset();
+  active_reservation_.Release();
+  // The client connection is gone: account the started response status (or
+  // 502 when nothing was written) and consume no breaker permit.
+  CompleteMetric(downstream_response_committed_ ? response_head_.status : 502);
+  if (client_lifetime_.lock()) {
+    ClearClientStreamCallbacks();
+    try {
+      client_->AbortResponse();
+    } catch (const std::logic_error &) {
+    } catch (const std::system_error &) {
+    }
+  }
+  // Cancel the upstream exchange at the end of this event batch: this method
+  // runs inside the client's or the upstream's callback stack, and destroying
+  // the upstream there would leave the calling stack touching its parser and
+  // input buffer (R-042 pattern).  The pool owns its active connections, so
+  // the deferred closure captures the pool; direct connections are owned by
+  // this transaction, which the closure keeps alive through a weak ref.
+  const auto pool = pool_;
+  net::UpstreamConnection *connection = active_connection_;
+  const std::weak_ptr<ProxyTransaction> weak_self = shared_from_this();
+  loop_.QueueAfterCurrentBatch([pool, connection, weak_self] {
+    if (pool && connection) {
+      (void)pool->Cancel(connection);
+      return;
+    }
+    if (const auto alive = weak_self.lock()) {
+      if (alive->upstream_) {
+        alive->upstream_->Close();
+        alive->upstream_.reset();
+      }
+    }
+  });
+}
+
+void ProxyTransaction::PauseUpstreamReading() noexcept {
+  if (pool_ && active_connection_) active_connection_->PauseReading();
+  if (upstream_) upstream_->PauseReading();
+}
+
+void ProxyTransaction::ResumeUpstreamReading() noexcept {
+  if (finished_ || GatewayDown()) return;
+  if (pool_ && active_connection_) active_connection_->ResumeReading();
+  if (upstream_) upstream_->ResumeReading();
+}
+
+void ProxyTransaction::ClearClientStreamCallbacks() noexcept {
+  if (!client_lifetime_.lock()) return;
+  client_->ClearStreamCallbacks();
 }
 
 void ProxyTransaction::AccountSuccess() noexcept {
@@ -324,6 +479,7 @@ void ProxyTransaction::FinishNoEndpoint() {
   } catch (...) {
   }
   if (!client_lifetime_.lock()) return;
+  ClearClientStreamCallbacks();
   const auto self = shared_from_this();
   try {
     client_->SendResponse(http::HttpResponse{503, "Service Unavailable", {}, ""});
@@ -344,8 +500,22 @@ void ProxyTransaction::FinishFailure() {
   // Start() finished synchronously on its own stack frame, releasing here
   // would destroy that frame's owner, so it stays deferred.
   if (!starting_upstream_) upstream_.reset();
+  if (downstream_response_committed_) {
+    // The head is already on the wire: truncate the client connection; a
+    // second status line must never replace the committed response.
+    CompleteMetric(502);
+    AccountFailure();
+    ClearClientStreamCallbacks();
+    try {
+      client_->AbortResponse();
+    } catch (const std::logic_error &) {
+    } catch (const std::system_error &) {
+    }
+    return;
+  }
   CompleteMetric(502);
   if (!client_lifetime_.lock()) return;
+  ClearClientStreamCallbacks();
   AccountFailure();
   const auto self = shared_from_this();
   try {
@@ -426,11 +596,19 @@ void ProxyTransaction::HandleDeadline(std::uint64_t generation) {
 }
 
 bool ProxyTransaction::RetryableFailure(net::UpstreamResult result) const noexcept {
-  // With an attempt provider the retry candidate set is decided at runtime
-  // (healthy and not open); without one the static retry_endpoints apply.
-  return !response_header_received_ && retries_ == 0 && policy_.retry_budget != 0 &&
+  // The retry window closes when the response head is committed downstream;
+  // only connection-level failures are retryable (kProtocolError and
+  // kUnsupported are terminal 502 answers, per the design doc's "no response
+  // header yet" retry rule).  With an attempt provider the candidate set is
+  // decided at runtime (healthy and not open); without one the static
+  // retry_endpoints apply.
+  return !downstream_response_committed_ && retries_ == 0 &&
+         policy_.retry_budget != 0 &&
          (request_.method == "GET" || request_.method == "HEAD") &&
-         result != net::UpstreamResult::kSuccess &&
+         (result == net::UpstreamResult::kConnectError ||
+          result == net::UpstreamResult::kWriteError ||
+          result == net::UpstreamResult::kReadError ||
+          result == net::UpstreamResult::kEof) &&
          (attempt_provider_ || HasRetryAlternative());
 }
 
@@ -471,12 +649,26 @@ void ProxyTransaction::FinishGatewayTimeout() {
   CancelDeadlines();
   reservation_.reset();
   active_reservation_.Release();
-  CompleteMetric(504);
   if (pool_ && active_connection_) (void)pool_->Cancel(active_connection_);
   active_connection_ = nullptr;
   if (upstream_) upstream_->Close();
   upstream_.reset();
+  if (downstream_response_committed_) {
+    // The head is already on the wire: a 504 status line cannot replace it,
+    // so the connection is truncated instead.
+    CompleteMetric(504);
+    AccountFailure();
+    ClearClientStreamCallbacks();
+    try {
+      client_->AbortResponse();
+    } catch (const std::logic_error &) {
+    } catch (const std::system_error &) {
+    }
+    return;
+  }
+  CompleteMetric(504);
   if (!client_lifetime_.lock()) return;
+  ClearClientStreamCallbacks();
   AccountFailure();
   const auto self = shared_from_this();
   try { client_->SendResponse(http::HttpResponse{504, "Gateway Timeout", {}, ""}); }

@@ -11,10 +11,11 @@ namespace aegisgate::proxy {
 UpstreamPool::UpstreamPool(net::EventLoop &loop) : loop_(loop) {}
 UpstreamPool::~UpstreamPool() = default;
 
-net::UpstreamConnection *UpstreamPool::Execute(const config::Endpoint &endpoint,
-                                               const http::HttpRequest &request,
-                                               ResponseCallback callback,
-                                               ProgressCallback progress) {
+net::UpstreamConnection *UpstreamPool::Execute(
+    const config::Endpoint &endpoint, const http::HttpRequest &request,
+    ResponseCallback callback, ProgressCallback progress,
+    net::UpstreamConnection::HeaderCallback header,
+    net::UpstreamConnection::BodySink body) {
   const Key key = ToKey(endpoint);
   Connection connection;
   auto &idle = idle_[key];
@@ -35,6 +36,9 @@ net::UpstreamConnection *UpstreamPool::Execute(const config::Endpoint &endpoint,
     Complete(raw, key, std::move(callback), result, std::move(response));
   });
   raw->SetProgressCallback(std::move(progress));
+  if (header || body) {
+    raw->SetStreamingCallbacks(std::move(header), std::move(body));
+  }
   try {
     raw->Start(request);
   } catch (...) {

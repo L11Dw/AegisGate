@@ -32,7 +32,9 @@ public:
   net::UpstreamConnection *Execute(const config::Endpoint &endpoint,
                                    const http::HttpRequest &request,
                                    ResponseCallback callback,
-                                   ProgressCallback progress = {});
+                                   ProgressCallback progress = {},
+                                   net::UpstreamConnection::HeaderCallback header = {},
+                                   net::UpstreamConnection::BodySink body = {});
   // Aborts an active exchange. It suppresses its response callback and cannot
   // return the descriptor to idle storage.
   [[nodiscard]] bool Cancel(net::UpstreamConnection *connection) noexcept;

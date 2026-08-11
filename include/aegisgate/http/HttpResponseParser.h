@@ -34,8 +34,10 @@ public:
   // Delivers up to the declared Content-Length in contiguous segments.  A
   // declined segment stays in the input; kComplete is returned once the
   // declared body is fully consumed.  Must only be called after a successful
-  // ParseHeaders and while BodyComplete() is false.
-  [[nodiscard]] ParseResult ConsumeBody(net::Buffer &input, const BodySink &sink);
+  // ParseHeaders and while BodyComplete() is false.  The sink is taken by
+  // value so the caller's callback (which may hold a shared owner) stays
+  // alive for the duration of this call.
+  [[nodiscard]] ParseResult ConsumeBody(net::Buffer &input, BodySink sink);
   // Terminal legacy result; stable until Reset().
   [[nodiscard]] const HttpResponse &Response() const noexcept;
   // Valid after a successful ParseHeaders (streaming) or Parse (legacy).
