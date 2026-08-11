@@ -26,6 +26,7 @@ add_library(aegisgate STATIC
     src/routing/WeightedRoundRobin.cpp
     src/resilience/InflightLimiter.cpp
     src/resilience/RouteAdmission.cpp
+    src/runtime/WorkerRuntime.cpp
     src/health/HealthChecker.cpp
     src/resilience/CircuitBreaker.cpp
     src/resilience/TokenBucket.cpp
