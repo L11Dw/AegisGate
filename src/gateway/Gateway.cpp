@@ -1,6 +1,7 @@
 #include "aegisgate/gateway/Gateway.h"
 
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -134,37 +135,69 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
   policy.first_byte_timeout = std::chrono::milliseconds(route->first_byte_timeout_ms);
   policy.total_timeout = std::chrono::milliseconds(route->total_timeout_ms);
   policy.retry_budget = route->retry_budget;
-  // The provider chooses the endpoint for the initial attempt and every
-  // retry (eligible means healthy and not refused by its breaker) and issues
-  // the attempt permit; no candidate ever connects.  Tried endpoints are
-  // tracked so a repeated weighted choice cannot loop.
+  // The provider chooses the endpoint for the initial attempt and every retry
+  // (eligible means healthy and not refused by its breaker) and issues the
+  // attempt permit plus its active slot; no candidate ever connects.
+  proxy::ProxyTransaction::AttemptProvider provider;
+  if (route->balance == config::BalancePolicy::kLeastActive) {
+    // Two-pass minimum-active scan in the route's weighted rotation order;
+    // tried holds table-owned endpoint indexes.  A defensively rejected
+    // permit joins tried and the selection is recomputed (unreachable after
+    // Eligible(), kept for future wiring changes).
+    provider = [this, route, tried = std::set<std::size_t>{}]() mutable
+        -> std::optional<proxy::ProxyTransaction::AttemptSelection> {
+      for (;;) {
+        const auto index = routes_.NextLeastActiveIndex(*route, tried);
+        if (!index) return std::nullopt;
+        tried.insert(*index);
+        const config::Endpoint &candidate = route->endpoints[*index];
+        std::optional<proxy::ProxyTransaction::BreakerLink> link;
+        if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, candidate)) {
+          link = proxy::ProxyTransaction::BreakerLink{
+              breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
+          if (link->permit.selection ==
+                  resilience::CircuitBreaker::Selection::kRejectedOpen ||
+              link->permit.selection ==
+                  resilience::CircuitBreaker::Selection::kRejectedHalfOpenQuota) {
+            continue;
+          }
+        }
+        return proxy::ProxyTransaction::AttemptSelection{
+            &candidate, std::move(link), routes_.AcquireActive(*route, candidate)};
+      }
+    };
+  } else {
+    // Weighted rotation scan; tried endpoints are tracked so a repeated
+    // weighted choice cannot loop.
+    provider = [this, route, tried = std::unordered_set<const config::Endpoint *>{}]() mutable
+        -> std::optional<proxy::ProxyTransaction::AttemptSelection> {
+      for (std::size_t attempts = 0; attempts < route->endpoints.size(); ++attempts) {
+        const config::Endpoint *candidate = routes_.NextEndpoint(*route);
+        if (candidate == nullptr || !tried.insert(candidate).second) continue;
+        if (!routes_.Eligible(*route, *candidate)) continue;
+        std::optional<proxy::ProxyTransaction::BreakerLink> link;
+        if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, *candidate)) {
+          link = proxy::ProxyTransaction::BreakerLink{
+              breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
+          // Defensive: a rejected permit never starts an attempt, so it also
+          // never takes an active slot.  The Eligible() pre-filter makes
+          // this unreachable in the single-loop design.
+          if (link->permit.selection == resilience::CircuitBreaker::Selection::kRejectedOpen ||
+              link->permit.selection ==
+                  resilience::CircuitBreaker::Selection::kRejectedHalfOpenQuota) {
+            continue;
+          }
+        }
+        return proxy::ProxyTransaction::AttemptSelection{
+            candidate, std::move(link), routes_.AcquireActive(*route, *candidate)};
+      }
+      return std::nullopt;
+    };
+  }
   (void)proxy::ProxyTransaction::Start(
       loop_, client, route->endpoints.front(), request, upstream_pool_,
       routes_.AdmissionFor(*route), timers_.get(), std::move(policy), metrics_, route->name,
-      [this, route, tried = std::unordered_set<const config::Endpoint *>{}]() mutable
-          -> std::optional<proxy::ProxyTransaction::AttemptSelection> {
-        for (std::size_t attempts = 0; attempts < route->endpoints.size(); ++attempts) {
-          const config::Endpoint *candidate = routes_.NextEndpoint(*route);
-          if (candidate == nullptr || !tried.insert(candidate).second) continue;
-          if (!routes_.Eligible(*route, *candidate)) continue;
-          std::optional<proxy::ProxyTransaction::BreakerLink> link;
-          if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, *candidate)) {
-            link = proxy::ProxyTransaction::BreakerLink{
-                breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
-            // Defensive: a rejected permit never starts an attempt, so it also
-            // never takes an active slot.  The Eligible() pre-filter makes
-            // this unreachable in the single-loop design.
-            if (link->permit.selection == resilience::CircuitBreaker::Selection::kRejectedOpen ||
-                link->permit.selection ==
-                    resilience::CircuitBreaker::Selection::kRejectedHalfOpenQuota) {
-              continue;
-            }
-          }
-          return proxy::ProxyTransaction::AttemptSelection{
-              candidate, std::move(link), routes_.AcquireActive(*route, *candidate)};
-        }
-        return std::nullopt;
-      });
+      std::move(provider));
 }
 
 void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,
