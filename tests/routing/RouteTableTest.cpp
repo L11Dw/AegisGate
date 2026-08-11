@@ -230,5 +230,22 @@ TEST(RouteTableTest, ActiveCountsDoNotCrossRoutes) {
   EXPECT_EQ(table.ActiveFor(*matched_b, shared), 0U);
 }
 
+// R-041 red test: the weighted selector must be reachable through a stable
+// table-owned index (never a pointer into the selector's internal copies).
+TEST(RouteTableTest, WeightedIndexFollowsSelectorOrder) {
+  RouteTable table = MakeLeastActiveTable({Loopback(9001, 2), Loopback(9002, 1)});
+  const config::Route *route = table.Match("la.test", "/x");
+  ASSERT_NE(route, nullptr);
+  std::vector<std::size_t> indices;
+  for (int i = 0; i < 6; ++i) {
+    indices.push_back(*table.NextWeightedIndex(*route));
+  }
+  EXPECT_EQ(indices, (std::vector<std::size_t>{0, 0, 1, 0, 0, 1}));
+
+  // A Route from another table must not be selectable.
+  config::Route other{"other", "o.test", "/", {Loopback(9003)}, 10, 10, 4};
+  EXPECT_EQ(table.NextWeightedIndex(other), std::nullopt);
+}
+
 } // namespace
 } // namespace aegisgate::routing

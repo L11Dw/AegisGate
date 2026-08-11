@@ -3,7 +3,6 @@
 #include <chrono>
 #include <set>
 #include <stdexcept>
-#include <unordered_set>
 #include <utility>
 
 #include <unistd.h>
@@ -176,16 +175,18 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
       }
     };
   } else {
-    // Weighted rotation scan; tried endpoints are tracked so a repeated
-    // weighted choice cannot loop.
-    provider = [this, route, tried = std::unordered_set<const config::Endpoint *>{}]() mutable
+    // Weighted rotation scan; tried tracks table-owned endpoint indexes so a
+    // repeated weighted choice cannot loop and the identity never depends on
+    // the selector's internal copies (R-041).
+    provider = [this, route, tried = std::set<std::size_t>{}]() mutable
         -> std::optional<proxy::ProxyTransaction::AttemptSelection> {
       for (std::size_t attempts = 0; attempts < route->endpoints.size(); ++attempts) {
-        const config::Endpoint *candidate = routes_.NextEndpoint(*route);
-        if (candidate == nullptr || !tried.insert(candidate).second) continue;
-        if (!routes_.Eligible(*route, *candidate)) continue;
+        const auto index = routes_.NextWeightedIndex(*route);
+        if (!index || !tried.insert(*index).second) continue;
+        const config::Endpoint &candidate = route->endpoints[*index];
+        if (!routes_.Eligible(*route, candidate)) continue;
         std::optional<proxy::ProxyTransaction::BreakerLink> link;
-        if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, *candidate)) {
+        if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, candidate)) {
           link = proxy::ProxyTransaction::BreakerLink{
               breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
           // Defensive: a rejected permit never starts an attempt, so it also
@@ -198,7 +199,7 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
           }
         }
         return proxy::ProxyTransaction::AttemptSelection{
-            candidate, std::move(link), routes_.AcquireActive(*route, *candidate)};
+            &candidate, std::move(link), routes_.AcquireActive(*route, candidate)};
       }
       return std::nullopt;
     };

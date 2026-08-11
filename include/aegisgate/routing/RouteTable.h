@@ -40,6 +40,12 @@ public:
   // table returns nullptr; this table is single-EventLoop-thread confined.
   [[nodiscard]] const config::Endpoint *NextEndpoint(const config::Route &route) const noexcept;
 
+  // Advances the route's weighted rotation cursor exactly once and returns the
+  // table-owned index of the selected endpoint (content-matched back into the
+  // config list), so callers never depend on the selector's internal copies
+  // (R-041).  Returns nullopt for a Route from another table.
+  [[nodiscard]] std::optional<std::size_t> NextWeightedIndex(const config::Route &route) const noexcept;
+
   // route x endpoint runtime state.  Both take pointers that belong to this
   // table (as returned by Match/NextEndpoint) and return nullptr for routes
   // from another table or routes that did not enable the feature.

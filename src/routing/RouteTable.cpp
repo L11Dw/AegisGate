@@ -149,6 +149,16 @@ const config::Endpoint *RouteTable::NextEndpoint(const config::Route &route) con
   return nullptr;
 }
 
+std::optional<std::size_t> RouteTable::NextWeightedIndex(const config::Route &route) const noexcept {
+  const std::size_t route_index = RouteIndex(route);
+  if (route_index == config_.routes.size()) return std::nullopt;
+  const config::Endpoint *selected = NextEndpoint(route);
+  if (selected == nullptr) return std::nullopt;
+  const std::size_t index = EndpointIndex(route_index, *selected);
+  if (index == config_.routes[route_index].endpoints.size()) return std::nullopt;
+  return index;
+}
+
 std::size_t RouteTable::EndpointIndex(std::size_t route_index,
                                       const config::Endpoint &endpoint) const noexcept {
   for (std::size_t index = 0; index < config_.routes[route_index].endpoints.size(); ++index) {
