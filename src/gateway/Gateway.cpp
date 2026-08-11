@@ -21,7 +21,8 @@ namespace aegisgate::gateway {
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port)
-    : loop_(loop), state_(std::make_shared<State>()), routes_(std::move(config)),
+    : lifetime_token_(std::make_shared<int>(0)), loop_(loop),
+      state_(std::make_shared<State>()), routes_(std::move(config)),
       metrics_(std::make_shared<observability::Metrics>()),
       upstream_pool_(std::make_shared<proxy::UpstreamPool>(loop)),
       timers_(std::make_unique<net::TimerQueue>(loop)),
@@ -49,7 +50,15 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
 }
 
 Gateway::~Gateway() {
+  // Fixed shutdown order (R-040): invalidate the lifetime token first so any
+  // late callback sees the gateway as down, stop the health checkers (their
+  // timer cancellations still find a live TimerQueue), then terminate every
+  // in-flight upstream exchange so transactions release via RAII instead of
+  // waiting for an upstream EOF or timeout, then drop the clients.
+  lifetime_token_.reset();
   state_->owner = nullptr;
+  health_checkers_.clear();
+  upstream_pool_->CancelAll();
   clients_.clear();
 }
 
@@ -197,7 +206,7 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
   (void)proxy::ProxyTransaction::Start(
       loop_, client, route->endpoints.front(), request, upstream_pool_,
       routes_.AdmissionFor(*route), timers_.get(), std::move(policy), metrics_, route->name,
-      std::move(provider));
+      std::move(provider), std::weak_ptr<void>(lifetime_token_));
 }
 
 void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,

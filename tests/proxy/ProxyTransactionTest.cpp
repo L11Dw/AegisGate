@@ -1227,5 +1227,119 @@ TEST(ProxyTransactionTest, CallbackCanDestroyOwnerWhileActiveHeld) {
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
 
+// R-040 direct evidence: CancelAll() terminates an in-flight transaction
+// without waiting for the upstream to respond or close.  The route table is
+// still alive here, so the weak transaction expiring and the admission
+// reservation returning are meaningful (unlike a Gateway-level test where the
+// table dies with the gateway).
+TEST(ProxyTransactionTest, CancelAllTerminatesInFlightTransaction) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  constexpr std::string_view request =
+      "GET / HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    (void)ReadExactUntil(fd, request.size(), TestDeadline(), backend_error);
+    if (::write(gate[1], "a", 1) != 1) {
+      backend_error = "accept gate failed";
+      (void)::close(fd);
+      return;
+    }
+    // Never respond and never close: CancelAll must terminate the exchange.
+    pollfd descriptor{fd, POLLHUP | POLLIN, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0 &&
+        backend_error.empty()) {
+      backend_error = "pool did not close the in-flight connection";
+    }
+    (void)::close(fd);
+    if (::write(gate[1], "d", 1) != 1 && backend_error.empty()) {
+      backend_error = "closed gate failed";
+    }
+  });
+
+  std::array<int, 2> client_sockets{};
+  std::array<int, 2> wake_sockets{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
+  net::EventLoop loop;
+  net::TimerQueue timers(loop);
+  auto pool = std::make_shared<UpstreamPool>(loop);
+  net::Channel wake_channel(loop, wake_sockets[0]);
+  bool watchdog_fired = false;
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  const config::Route route{"limited", "test", "/", {}, 10, 10, 4};
+  const auto admission = std::make_shared<resilience::RouteAdmission>(
+      route, std::chrono::steady_clock::now());
+  std::weak_ptr<ProxyTransaction> transaction;
+  net::ClientConnection client(loop, client_sockets[0],
+                               [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
+    UpstreamPolicy policy;
+    policy.connect_timeout = std::chrono::seconds(1);
+    policy.first_byte_timeout = std::chrono::seconds(1);
+    policy.total_timeout = std::chrono::seconds(2);
+    policy.retry_budget = 0;
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission,
+                                          &timers, std::move(policy));
+  });
+  client.Start();
+  constexpr std::string_view inbound = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
+  ASSERT_EQ(::write(client_sockets[1], inbound.data(), inbound.size()),
+            static_cast<ssize_t>(inbound.size()));
+  std::string peer_error;
+  std::thread peer([&] {
+    char accepted = '\0';
+    if (::read(gate[0], &accepted, 1) != 1 || accepted != 'a') {
+      peer_error = "accept gate read failed";
+      (void)test::SignalWakeFd(wake_sockets[1], 'q', peer_error);
+      return;
+    }
+    peer_error = ::write(wake_sockets[1], "q", 1) == 1 ? "" : "failed to wake event loop";
+  });
+  std::string watchdog_error;
+  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
+  loop.Loop();
+  watchdog.Stop();
+  peer.join();
+  EXPECT_FALSE(watchdog_fired);
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  EXPECT_TRUE(peer_error.empty()) << peer_error;
+
+  // CancelAll terminates the in-flight exchange without any upstream response.
+  pool->CancelAll();
+
+  EXPECT_TRUE(transaction.expired()) << "transaction survived CancelAll";
+  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()))
+      << "admission reservation was not released";
+  // Note: the attempt deadlines are not cancelled here (the transaction is
+  // destroyed directly, with no terminal callback); their weak callbacks are
+  // harmless no-ops once the transaction is gone.
+
+  pollfd gate_descriptor{gate[0], POLLIN, 0};
+  if (::poll(&gate_descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0) {
+    FAIL() << "backend did not observe the connection close";
+  }
+  char closed = '\0';
+  ASSERT_EQ(::read(gate[0], &closed, 1), 1);
+  EXPECT_EQ(closed, 'd');
+  backend.join();
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  client.Close();
+  wake_channel.Remove();
+  EXPECT_EQ(::close(client_sockets[1]), 0);
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(wake_sockets[0]), 0);
+  EXPECT_EQ(::close(wake_sockets[1]), 0);
+}
+
 } // namespace
 } // namespace aegisgate::proxy

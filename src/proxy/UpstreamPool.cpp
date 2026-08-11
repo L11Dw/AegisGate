@@ -57,6 +57,14 @@ bool UpstreamPool::Cancel(net::UpstreamConnection *connection) noexcept {
   return true;
 }
 
+void UpstreamPool::CancelAll() noexcept {
+  for (auto &[connection, owned] : active_) {
+    (void)connection;
+    owned->Close();
+  }
+  active_.clear();
+}
+
 std::size_t UpstreamPool::IdleCount(const config::Endpoint &endpoint) const noexcept {
   const auto iterator = idle_.find(ToKey(endpoint));
   return iterator == idle_.end() ? 0U : iterator->second.size();

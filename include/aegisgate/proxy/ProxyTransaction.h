@@ -76,7 +76,8 @@ public:
                         std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
         net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
         std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {},
-        AttemptProvider attempt_provider = {});
+        AttemptProvider attempt_provider = {},
+        std::optional<std::weak_ptr<void>> gateway_lifetime = std::nullopt);
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -88,9 +89,15 @@ private:
                    std::shared_ptr<resilience::RouteAdmission> admission,
                    net::TimerQueue *timers, UpstreamPolicy policy,
                    std::shared_ptr<observability::Metrics> metrics, std::string route_name,
-                   AttemptProvider attempt_provider);
+                   AttemptProvider attempt_provider,
+                   std::optional<std::weak_ptr<void>> gateway_lifetime);
 
   void Begin();
+  // True when the owning gateway has been destroyed.  nullopt (no gateway)
+  // means the caller guarantees the timers/provider lifetime.
+  [[nodiscard]] bool GatewayDown() const noexcept {
+    return gateway_lifetime_.has_value() && gateway_lifetime_->expired();
+  }
   [[nodiscard]] bool StartUpstream();
   void FinishNoEndpoint();
   void HandleProgress(net::UpstreamProgress progress);
@@ -116,6 +123,7 @@ private:
   net::EventLoop &loop_;
   net::ClientConnection *client_;
   std::weak_ptr<void> client_lifetime_;
+  std::optional<std::weak_ptr<void>> gateway_lifetime_;
   std::uint16_t upstream_port_;
   std::optional<config::Endpoint> endpoint_;
   http::HttpRequest request_;

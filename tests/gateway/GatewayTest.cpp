@@ -1,6 +1,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1463,6 +1464,354 @@ TEST(GatewayTest, LeastActiveSkipsUnhealthyAndOpen) {
   pollfd healthy_pending{healthy_listener.Fd(), POLLIN, 0};
   EXPECT_EQ(::poll(&healthy_pending, 1, 100), 0) << "503 connected to the open endpoint";
   wake_channel.Remove();
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+// R-040 red test: the gateway is destroyed while the first attempt's EOF is
+// pending but unprocessed.  The queued retry task and every late upstream
+// event must never touch the destroyed gateway (timers_ / provider captures);
+// no retry connect may happen and the transaction must terminate cleanly.
+TEST(GatewayTest, GatewayDestructionBeforeQueuedRetryIsSafe) {
+  net::Socket first_listener = net::Socket::ListenLoopback();
+  net::Socket second_listener = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_listener.BoundPort(), 1};
+  const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {first, second}, 10, 10, 4};
+  route.balance = config::BalancePolicy::kLeastActive;
+  route.retry_budget = 1;
+  const config::Config config{{route}};
+
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  std::string first_error;
+  std::thread first_backend([&] {
+    const int fd = AcceptUntil(first_listener, TestDeadline(), first_error);
+    if (fd < 0) return;
+    constexpr std::string_view request =
+        "GET /v1/x HTTP/1.1\r\nhost: gateway.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    (void)ReadExact(fd, request.size(), TestDeadline(), first_error);
+    if (::write(gate[1], "a", 1) != 1) {
+      first_error = "accept gate failed";
+      (void)::close(fd);
+      return;
+    }
+    char command = '\0';
+    if (::read(gate[1], &command, 1) != 1 || command != 'c') {
+      first_error = "close gate failed";
+      (void)::close(fd);
+      return;
+    }
+    (void)::close(fd);  // EOF inside the safe retry window
+    if (::write(gate[1], "d", 1) != 1 && first_error.empty()) {
+      first_error = "closed gate failed";
+    }
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  auto gateway = std::make_unique<Gateway>(loop, config, "127.0.0.1", 0);
+  gateway->Start();
+
+  std::string client_error;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway->port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    char accepted = '\0';
+    if (::read(gate[0], &accepted, 1) != 1 || accepted != 'a') {
+      client_error = "accept gate read failed";
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();  // Pass 1: the request is in flight on the first endpoint.
+  client.join();
+  EXPECT_TRUE(client_error.empty()) << client_error;
+
+  // Close the first endpoint now: its EOF is pending but not yet processed.
+  if (::write(gate[0], "c", 1) != 1) {
+    FAIL() << "close gate write failed";
+  }
+  char closed = '\0';
+  if (::read(gate[0], &closed, 1) != 1 || closed != 'd') {
+    FAIL() << "close gate read failed";
+  }
+  first_backend.join();
+
+  // Destroy the gateway while the retry decision is still queued.  The queued
+  // task and any late upstream event must terminate the transaction without
+  // touching the destroyed gateway and without connecting to the second
+  // endpoint.  (Transaction-termination evidence lives in
+  // ProxyTransactionTest.CancelAllTerminatesInFlightTransaction, where the
+  // route table is still alive; here the observable contract is "no second
+  // connect" plus a clean ASan run.)
+  gateway.reset();
+
+  // Pump briefly so a (buggy) retry connect would be observed; the watchdog
+  // drives the loop and is only a failure backstop.
+  std::array<int, 2> stop{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop.data()), 0);
+  std::string watchdog_error;
+  std::thread watchdog([&] {
+    pollfd descriptor{stop[0], POLLIN, 0};
+    while (::poll(&descriptor, 1, 100) == 0) {
+      if (::write(wake_fds[1], "q", 1) != 1) {
+        watchdog_error = "watchdog wake failed";
+        return;
+      }
+    }
+  });
+  const auto pump_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (std::chrono::steady_clock::now() < pump_end) {
+    loop.Loop();
+  }
+  (void)test::SignalWakeFd(stop[1], 's', watchdog_error);
+  watchdog.join();
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  pollfd retry_pending{second_listener.Fd(), POLLIN, 0};
+  EXPECT_EQ(::poll(&retry_pending, 1, 100), 0)
+      << "retry connected to the second endpoint after gateway destruction";
+  wake_channel.Remove();
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(stop[0]), 0);
+  EXPECT_EQ(::close(stop[1]), 0);
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+// R-040 companion: an in-flight attempt (no retry) whose upstream completes
+// after the gateway is destroyed must terminate without touching timers_.
+TEST(GatewayTest, GatewayDestructionDuringInFlightAttemptIsSafe) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {endpoint}, 10, 10, 4};
+  route.retry_budget = 0;
+  const config::Config config{{route}};
+
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    constexpr std::string_view request =
+        "GET /v1/x HTTP/1.1\r\nhost: gateway.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    (void)ReadExact(fd, request.size(), TestDeadline(), backend_error);
+    if (::write(gate[1], "a", 1) != 1) {
+      backend_error = "accept gate failed";
+      (void)::close(fd);
+      return;
+    }
+    char command = '\0';
+    if (::read(gate[1], &command, 1) != 1 || command != 'c') {
+      backend_error = "close gate failed";
+      (void)::close(fd);
+      return;
+    }
+    (void)::close(fd);  // EOF: the attempt's terminal event arrives late.
+    if (::write(gate[1], "d", 1) != 1 && backend_error.empty()) {
+      backend_error = "closed gate failed";
+    }
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  auto gateway = std::make_unique<Gateway>(loop, config, "127.0.0.1", 0);
+  gateway->Start();
+
+  std::string client_error;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway->port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    char accepted = '\0';
+    if (::read(gate[0], &accepted, 1) != 1 || accepted != 'a') {
+      client_error = "accept gate read failed";
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+  EXPECT_TRUE(client_error.empty()) << client_error;
+
+  if (::write(gate[0], "c", 1) != 1) {
+    FAIL() << "close gate write failed";
+  }
+  char closed = '\0';
+  if (::read(gate[0], &closed, 1) != 1 || closed != 'd') {
+    FAIL() << "close gate read failed";
+  }
+  backend.join();
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  gateway.reset();
+
+  // The late EOF must terminate the in-flight attempt without touching the
+  // destroyed gateway.  (Its own EOF is the backend-observed signal in the
+  // never-responds variant; here the contract is a clean ASan run, so just
+  // pump briefly with the watchdog as a backstop.)
+  std::array<int, 2> stop{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop.data()), 0);
+  std::string watchdog_error;
+  std::thread watchdog([&] {
+    pollfd descriptor{stop[0], POLLIN, 0};
+    while (::poll(&descriptor, 1, 100) == 0) {
+      if (::write(wake_fds[1], "q", 1) != 1) {
+        watchdog_error = "watchdog wake failed";
+        return;
+      }
+    }
+  });
+  const auto pump_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (std::chrono::steady_clock::now() < pump_end) {
+    loop.Loop();
+  }
+  (void)test::SignalWakeFd(stop[1], 's', watchdog_error);
+  watchdog.join();
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  wake_channel.Remove();
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(stop[0]), 0);
+  EXPECT_EQ(::close(stop[1]), 0);
+  EXPECT_EQ(::close(wake_fds[0]), 0);
+  EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+// R-040 companion (v2): an upstream that never responds nor closes must not
+// keep the transaction alive after the gateway is destroyed.  The gateway's
+// shutdown terminates the exchange (no waiting for EOF or a timeout); the
+// backend observes the connection close (the observable completion signal)
+// and the transaction's admission reference expires.
+TEST(GatewayTest, GatewayDestructionTerminatesInFlightAttempt) {
+  net::Socket listener = net::Socket::ListenLoopback();
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
+  config::Route route{"api", "gateway.test", "/v1", {endpoint}, 10, 10, 4};
+  route.retry_budget = 0;
+  const config::Config config{{route}};
+
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  std::string backend_error;
+  std::thread backend([&] {
+    const int fd = AcceptUntil(listener, TestDeadline(), backend_error);
+    if (fd < 0) return;
+    constexpr std::string_view request =
+        "GET /v1/x HTTP/1.1\r\nhost: gateway.test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+    (void)ReadExact(fd, request.size(), TestDeadline(), backend_error);
+    if (::write(gate[1], "a", 1) != 1) {
+      backend_error = "accept gate failed";
+      (void)::close(fd);
+      return;
+    }
+    // Never respond and never close on our own: the gateway's shutdown must
+    // terminate the exchange.  Observe the gateway closing the connection.
+    pollfd descriptor{fd, POLLHUP | POLLIN, 0};
+    if (::poll(&descriptor, 1, RemainingMilliseconds(TestDeadline())) <= 0 &&
+        backend_error.empty()) {
+      backend_error = "gateway did not close the in-flight connection";
+    }
+    (void)::close(fd);
+    if (::write(gate[1], "d", 1) != 1 && backend_error.empty()) {
+      backend_error = "closed gate failed";
+    }
+  });
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    ASSERT_EQ(::read(wake_fds[0], &byte, 1), 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+  auto gateway = std::make_unique<Gateway>(loop, config, "127.0.0.1", 0);
+  gateway->Start();
+
+  std::string client_error;
+  std::thread client([&] {
+    net::Socket socket = net::Socket::ConnectLoopback(gateway->port());
+    constexpr std::string_view request = "GET /v1/x HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+    if (!WriteAll(socket.Fd(), request, TestDeadline(), client_error)) {
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    char accepted = '\0';
+    if (::read(gate[0], &accepted, 1) != 1 || accepted != 'a') {
+      client_error = "accept gate read failed";
+      (void)test::SignalWakeFd(wake_fds[1], 'q', client_error);
+      return;
+    }
+    if (::write(wake_fds[1], "q", 1) != 1 && client_error.empty()) client_error = "wake failed";
+  });
+  loop.Loop();
+  client.join();
+  EXPECT_TRUE(client_error.empty()) << client_error;
+
+  // Destroy the gateway while the exchange is still in flight and the backend
+  // never responds: shutdown must terminate it without waiting.
+  gateway.reset();
+
+  // Completion signal: the backend observes the gateway closing the in-flight
+  // connection.  The watchdog only pumps the loop as a failure backstop.
+  std::array<int, 2> stop{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, stop.data()), 0);
+  std::string watchdog_error;
+  std::thread watchdog([&] {
+    pollfd descriptor{stop[0], POLLIN, 0};
+    while (::poll(&descriptor, 1, 100) == 0) {
+      if (::write(wake_fds[1], "q", 1) != 1) {
+        watchdog_error = "watchdog wake failed";
+        return;
+      }
+    }
+  });
+  pollfd gate_descriptor{gate[0], POLLIN, 0};
+  const auto deadline = TestDeadline();
+  while (::poll(&gate_descriptor, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) {
+    loop.Loop();
+  }
+  (void)test::SignalWakeFd(stop[1], 's', watchdog_error);
+  watchdog.join();
+  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
+  char closed = '\0';
+  ASSERT_EQ(::read(gate[0], &closed, 1), 1);
+  EXPECT_EQ(closed, 'd');
+  backend.join();
+  EXPECT_TRUE(backend_error.empty()) << backend_error;
+  wake_channel.Remove();
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(stop[0]), 0);
+  EXPECT_EQ(::close(stop[1]), 0);
   EXPECT_EQ(::close(wake_fds[0]), 0);
   EXPECT_EQ(::close(wake_fds[1]), 0);
 }

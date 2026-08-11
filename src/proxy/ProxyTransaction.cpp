@@ -91,8 +91,10 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
                                    std::shared_ptr<resilience::RouteAdmission> admission,
                                    net::TimerQueue *timers, UpstreamPolicy policy,
                                    std::shared_ptr<observability::Metrics> metrics,
-                                   std::string route_name, AttemptProvider attempt_provider)
+                                   std::string route_name, AttemptProvider attempt_provider,
+                                   std::optional<std::weak_ptr<void>> gateway_lifetime)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
+      gateway_lifetime_(std::move(gateway_lifetime)),
       endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
       metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
       timers_(timers), attempt_provider_(std::move(attempt_provider)),
@@ -115,12 +117,13 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         std::shared_ptr<resilience::RouteAdmission> admission,
                         net::TimerQueue *timers, UpstreamPolicy policy,
                         std::shared_ptr<observability::Metrics> metrics, std::string route_name,
-                        AttemptProvider attempt_provider) {
+                        AttemptProvider attempt_provider,
+                        std::optional<std::weak_ptr<void>> gateway_lifetime) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
       loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
       timers, std::move(policy), std::move(metrics), std::move(route_name),
-      std::move(attempt_provider)));
+      std::move(attempt_provider), std::move(gateway_lifetime)));
   transaction->Begin();
   return transaction;
 }
@@ -148,6 +151,10 @@ void ProxyTransaction::Begin() {
 }
 
 bool ProxyTransaction::StartUpstream() {
+  // The owning gateway may have been destroyed while this attempt was queued
+  // or retried; nothing of the gateway (timers, provider, pool wiring) may be
+  // touched then.  Returning false reuses the "no candidate" terminal path.
+  if (GatewayDown()) return false;
   CancelAttemptDeadlines();
   ++generation_;
   connected_ = false;
@@ -342,6 +349,7 @@ void ProxyTransaction::FinishFailure() {
 
 void ProxyTransaction::HandleProgress(net::UpstreamProgress progress) {
   if (finished_) return;
+  if (GatewayDown()) return;  // the gateway's TimerQueue may be gone
   if (progress == net::UpstreamProgress::kConnected) {
     connected_ = true;
     if (timers_ && connect_timer_ != 0) (void)timers_->Cancel(connect_timer_);
@@ -388,6 +396,7 @@ void ProxyTransaction::ArmTotalDeadline() {
 }
 
 void ProxyTransaction::CancelDeadlines() {
+  if (GatewayDown()) return;  // the gateway's TimerQueue is destroyed
   if (!timers_) return;
   CancelAttemptDeadlines();
   if (total_timer_ != 0) (void)timers_->Cancel(total_timer_);
@@ -395,6 +404,7 @@ void ProxyTransaction::CancelDeadlines() {
 }
 
 void ProxyTransaction::CancelAttemptDeadlines() {
+  if (GatewayDown()) return;  // the gateway's TimerQueue is destroyed
   if (!timers_) return;
   for (auto *timer : {&connect_timer_, &first_byte_timer_}) {
     if (*timer != 0) (void)timers_->Cancel(*timer);

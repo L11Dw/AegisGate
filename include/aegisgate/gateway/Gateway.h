@@ -60,6 +60,11 @@ private:
   static void NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> state,
                                  std::uint64_t identifier);
 
+  // Lifecycle token observed (weakly) by in-flight transactions.  Reset on
+  // the first line of the destructor so any late callback sees the gateway as
+  // down before its members are torn down.
+  std::shared_ptr<void> lifetime_token_;
+
   net::EventLoop &loop_;
   std::shared_ptr<State> state_;
   routing::RouteTable routes_;
