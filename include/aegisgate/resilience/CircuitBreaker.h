@@ -60,6 +60,12 @@ public:
   // quota cannot stall.
   [[nodiscard]] RequestPermit Select(Clock::time_point now);
   [[nodiscard]] State StateNow() const noexcept { return state_; }
+  // The breaker epoch; every Open/re-open/Close/transition to half-open
+  // advances it.  The M3-D coordinator publishes it in the decision snapshot
+  // so workers can bind attempt results to the epoch they were admitted in.
+  [[nodiscard]] std::uint64_t Generation() const noexcept { return generation_; }
+  // When the current Open window elapses (meaningful only while kOpen).
+  [[nodiscard]] Clock::time_point OpenUntil() const noexcept { return open_until_; }
   // Read-only selection refusal, without Select()'s half-open transition or
   // probe side effects: Open before its window elapses, or half-open with the
   // probe quota exhausted.
