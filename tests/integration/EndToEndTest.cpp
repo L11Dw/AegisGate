@@ -768,7 +768,10 @@ TEST(EndToEndTest, ClientDisconnectStopsUpstreamRead) {
     std::size_t written = 0;
     while (backend_error.empty() && written < kBodySize) {
       const std::size_t want = std::min(chunk.size(), kBodySize - written);
-      const ssize_t count = ::write(fd, chunk.data(), want);
+      // MSG_NOSIGNAL: the gateway cancels this upstream while the blocking
+      // write may still be in flight; EPIPE must not kill the test process
+      // (d2b80d2 fixed the same pattern in ProxyTransactionTest).
+      const ssize_t count = ::send(fd, chunk.data(), want, MSG_NOSIGNAL);
       if (count > 0) {
         written += static_cast<std::size_t>(count);
         continue;
