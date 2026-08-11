@@ -45,4 +45,12 @@ TEST(MetricsTest, EscapesPrometheusLabelValuesAndDoesNotDoubleComplete) {
 }
 
 } // namespace
+
+TEST(MetricsTest, RendersReasonLabelForImmediate) {
+  Metrics metrics;
+  metrics.RecordImmediate("api", 503, {}, false, "no_healthy_endpoint");
+  const std::string text = metrics.RenderPrometheus();
+  EXPECT_NE(text.find("aegisgate_requests_total{route=\"api\",status=\"503\",upstream=\"\",reason=\"no_healthy_endpoint\"} 1\n"),
+            std::string::npos);
+}
 } // namespace aegisgate::observability

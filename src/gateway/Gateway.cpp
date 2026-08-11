@@ -58,7 +58,30 @@ std::uint16_t Gateway::port() const { return acceptor_->port(); }
 
 std::size_t Gateway::ClientCount() const noexcept { return clients_.size(); }
 
-std::string Gateway::MetricsText() const { return metrics_->RenderPrometheus(); }
+std::string Gateway::MetricsText() const {
+  std::string text = metrics_->RenderPrometheus();
+  // Route x endpoint protection state, appended after the counters so the
+  // text stays valid Prometheus exposition.
+  for (const config::Route &route : routes_.Config().routes) {
+    for (const config::Endpoint &endpoint : route.endpoints) {
+      if (const resilience::CircuitBreaker *breaker = routes_.BreakerFor(route, endpoint)) {
+        text += "aegisgate_circuit_state{route=\"" + route.name + "\",upstream=\"" +
+                endpoint.host + ":" + std::to_string(endpoint.port) + "\"} ";
+        switch (breaker->StateNow()) {
+        case resilience::CircuitBreaker::State::kClosed: text += "closed\n"; break;
+        case resilience::CircuitBreaker::State::kOpen: text += "open\n"; break;
+        case resilience::CircuitBreaker::State::kHalfOpen: text += "half_open\n"; break;
+        }
+      }
+      if (const health::EndpointHealth *state = routes_.HealthFor(route, endpoint)) {
+        text += "aegisgate_upstream_health{route=\"" + route.name + "\",upstream=\"" +
+                endpoint.host + ":" + std::to_string(endpoint.port) + "\"} " +
+                (state->Healthy() ? "1\n" : "0\n");
+      }
+    }
+  }
+  return text;
+}
 
 void Gateway::Accept(int fd) {
   // Acceptor closes fd if its callback throws.  Once a ClientConnection owns
@@ -94,7 +117,7 @@ void Gateway::Accept(int fd) {
 void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpRequest &request) {
   if (request.method == "GET" && request.target == "/metrics") {
     client.SendResponse(http::HttpResponse{200, "OK", {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
-                                           metrics_->RenderPrometheus()});
+                                           MetricsText()});
     return;
   }
   const config::Route *route = routes_.Match(request.Header("host"), request.target);
@@ -117,7 +140,7 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
     break;
   }
   if (endpoint == nullptr) {
-    try { metrics_->RecordImmediate(route->name, 503); } catch (...) {}
+    try { metrics_->RecordImmediate(route->name, 503, {}, false, "no_healthy_endpoint"); } catch (...) {}
     client.SendResponse(http::HttpResponse{503, "Service Unavailable", {}, ""});
     return;
   }
@@ -127,9 +150,17 @@ void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpReque
   policy.total_timeout = std::chrono::milliseconds(route->total_timeout_ms);
   policy.retry_budget = route->retry_budget;
   policy.retry_endpoints = route->endpoints;
-  (void)proxy::ProxyTransaction::Start(loop_, client, *endpoint, request, upstream_pool_,
-                                       routes_.AdmissionFor(*route), timers_.get(), std::move(policy),
-                                       metrics_, route->name);
+  (void)proxy::ProxyTransaction::Start(
+      loop_, client, *endpoint, request, upstream_pool_, routes_.AdmissionFor(*route),
+      timers_.get(), std::move(policy), metrics_, route->name,
+      [this, route](const config::Endpoint &endpoint) {
+        if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, endpoint)) {
+          return std::optional<proxy::ProxyTransaction::BreakerLink>(
+              proxy::ProxyTransaction::BreakerLink{
+                  breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())});
+        }
+        return std::optional<proxy::ProxyTransaction::BreakerLink>();
+      });
 }
 
 void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,

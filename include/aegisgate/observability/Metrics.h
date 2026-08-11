@@ -25,7 +25,7 @@ public:
 
   [[nodiscard]] RequestHandle BeginRequest(std::string_view route);
   void RecordImmediate(std::string_view route, int status, std::string_view upstream = {},
-                       bool rate_limited = false);
+                       bool rate_limited = false, std::string_view reason = {});
   void SetActiveConnections(std::size_t count) noexcept;
   [[nodiscard]] std::string RenderPrometheus() const;
 
@@ -45,7 +45,8 @@ public:
 
   // Only the first Complete call is observed.  Later calls are ignored so a
   // retry/timeout race cannot double count a request or underflow in-flight.
-  void Complete(int status, std::string_view upstream = {}, bool rate_limited = false);
+  void Complete(int status, std::string_view upstream = {}, bool rate_limited = false,
+               std::string_view reason = {});
 
 private:
   friend class Metrics;
