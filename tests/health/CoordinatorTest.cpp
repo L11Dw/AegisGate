@@ -21,6 +21,9 @@ config::Route RouteWithBreaker(std::string name, std::uint32_t window_seconds,
                                std::uint32_t open_seconds, std::uint32_t probes) {
   config::Route route{std::move(name), name + ".test", "/",
                       {config::Endpoint{name + ".host", {127, 0, 0, 1}, 9001, 1}}};
+  // A breaker route's outcome channel capacity derives from max_inflight; the
+  // coordinator requires a positive in-flight cap.
+  route.max_inflight = 8;
   route.circuit_breaker =
       config::CircuitBreakerSettings{window_seconds, min_requests, threshold_permille,
                                      open_seconds, probes};
@@ -239,6 +242,44 @@ TEST(CoordinatorRuntimeTest, RecordHealthAndWaitPublishes) {
   coordinator.RecordHealthAndWait(0, 0, false);
   EXPECT_FALSE(coordinator.CurrentSnapshot()->endpoints[0][0].healthy);
   coordinator.Stop();
+}
+
+// R-053: a worker-side outcome reservation, published and drained on the
+// coordinator loop, drives the breaker exactly like a direct submission.
+TEST(CoordinatorRuntimeTest, ReserveOutcomeAndDrainRecordsToBreaker) {
+  const auto now = Clock::now();
+  Coordinator coordinator(ConfigWith({RouteWithBreaker("a", 10, 2, 500, 1, 1)}), now);
+  coordinator.Start();
+  const std::uint64_t generation = coordinator.CurrentSnapshot()->endpoints[0][0].generation;
+  auto first = coordinator.ReserveOutcome(0);
+  auto second = coordinator.ReserveOutcome(0);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  first->Publish({0, 0, {false, generation, 0}, false});
+  second->Publish({0, 0, {false, generation, 0}, false});
+  // The published outcomes are drained by the coordinator loop's wake handler.
+  EXPECT_TRUE(WaitForState(coordinator, 0, 0, State::kOpen, TestDeadline()));
+  // Consuming each outcome restored a credit: the capacity is usable again.
+  EXPECT_TRUE(coordinator.ReserveOutcome(0).has_value());
+  coordinator.Stop();
+}
+
+// R-053/R-061: BeginStopping refuses new reservations and counts them; the
+// rejected total is observable (outcome_reservation_rejected_total).
+TEST(CoordinatorRuntimeTest, BeginOutcomeStoppingRejectsNewReserve) {
+  const auto now = Clock::now();
+  Coordinator coordinator(ConfigWith({RouteWithBreaker("a", 10, 2, 500, 1, 1)}), now);
+  coordinator.Start();
+  EXPECT_TRUE(coordinator.ReserveOutcome(0).has_value());
+  coordinator.BeginOutcomeStopping();
+  EXPECT_FALSE(coordinator.ReserveOutcome(0).has_value());
+  EXPECT_GE(coordinator.OutcomeRejectedTotal(), 1U);
+  // A route without a breaker has no outcome channel at all.
+  coordinator.Stop();
+  Coordinator plain(ConfigWith({PlainRoute("plain")}), now);
+  plain.Start();
+  EXPECT_FALSE(plain.ReserveOutcome(0).has_value());
+  plain.Stop();
 }
 
 } // namespace

@@ -1,8 +1,10 @@
 #include "aegisgate/gateway/Gateway.h"
 
 #include <chrono>
+#include <cstdio>
 #include <future>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include <unistd.h>
@@ -12,6 +14,21 @@
 #include "aegisgate/resilience/GlobalAdmission.h"
 
 namespace aegisgate::gateway {
+namespace {
+// Bounded shutdown-destroy retries: a live, draining worker always accepts the
+// destroy task on the first tries, so exhausting this bound means the worker
+// thread is gone and retrying would spin forever (R-063).
+constexpr int kShutdownPostAttempts = 256;
+
+// Fatal-crash leak holder: when a worker thread died without accepting its
+// destroy task, the WorkerData is kept alive here rather than destroyed
+// off-thread (its loop-attached objects can only be torn down on the worker
+// thread).  Reached only when the worker has already crashed.
+std::vector<std::shared_ptr<runtime::WorkerData>> &WorkerDataLeaks() {
+  static std::vector<std::shared_ptr<runtime::WorkerData>> leaks;
+  return leaks;
+}
+} // namespace
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port, net::StreamFlowControl flow_control)
@@ -46,30 +63,52 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
 }
 
 Gateway::~Gateway() {
-  // Fixed shutdown order (R-040 extended): invalidate the lifetime token
-  // first so any late callback sees the gateway as down, stop accepting,
-  // stop the coordinator (no new snapshots), then stop every worker: each
-  // WorkerData is destroyed on its own thread (CancelAll and connection
-  // teardown release transactions via RAII) before the runtime joins.
+  // Fixed shutdown order (R-040 extended, R-062): invalidate the lifetime
+  // token first so any late callback sees the gateway as down; stop accepting;
+  // refuse every new outcome reservation (no attempt may start against a
+  // stopping channel); tear down each worker on its own thread (CancelAll and
+  // connection teardown release their outcome reservations via RAII); join
+  // them; only then drain the remaining published outcomes on the coordinator
+  // loop and stop the coordinator — a worker still publishing to a stopped
+  // coordinator would lose breaker accounting.
   lifetime_token_.reset();
   acceptor_.reset();
-  coordinator_->Stop();
-  std::vector<std::shared_ptr<runtime::WorkerData>> pending;
-  pending.reserve(worker_datas_.size());
-  for (auto &slot : worker_datas_) {
-    if (slot) pending.push_back(std::move(slot));
-  }
-  for (std::size_t index = 0; index < pending.size(); ++index) {
-    auto &data = pending[index];
+  coordinator_->BeginOutcomeStopping();
+  // Original-index teardown (R-057): worker_datas_[i] always corresponds to
+  // workers_->At(i), so a partially initialized set cannot misalign.
+  for (std::size_t index = 0; index < worker_datas_.size(); ++index) {
+    if (!worker_datas_[index]) continue;
+    auto &data = worker_datas_[index];
     auto &worker = workers_->At(index);
-    // The destroy task must run on the worker thread (loop-attached
-    // objects); retry until accepted, the worker keeps draining.  `pending`
-    // lives until the join below, so the captured reference cannot dangle.
-    while (!worker.PostWithLoop([&data](net::EventLoop &) mutable { data.reset(); })) {
+    // The destroy task must run on the worker thread (loop-attached objects);
+    // it captures `data` (a reference into this member vector, alive until the
+    // join below) and resets it when it runs.  R-063: bounded retry, never an
+    // infinite spin — a live draining worker always accepts, so a rejection
+    // means the worker thread is gone; abandon the worker data rather than
+    // burn a core (it cannot be safely destroyed off-thread).
+    bool accepted = false;
+    for (int attempt = 0; attempt < kShutdownPostAttempts; ++attempt) {
+      if (worker.PostWithLoop([&data](net::EventLoop &) mutable { data.reset(); })) {
+        accepted = true;
+        break;
+      }
+      std::this_thread::yield();
+    }
+    if (!accepted && data) {
+      (void)std::fprintf(stderr,
+                         "fatal: worker destroy task not accepted; worker data leaked\n");
+      // Keep the WorkerData alive instead of destroying it off-thread (its
+      // loop-attached objects can only be torn down on the worker thread).
+      WorkerDataLeaks().push_back(std::move(data));
     }
   }
   if (workers_) workers_->StopAll();
-  // pending entries are all empty: the destroy tasks ran on their workers.
+  // The coordinator drains every published-but-undrained outcome on its own
+  // loop before stopping.
+  coordinator_->DrainOutcomesAndWait();
+  coordinator_->Stop();
+  // worker_datas_ entries are all empty: the destroy tasks ran on their
+  // workers (or were intentionally abandoned after the bounded retry gave up).
 }
 
 void Gateway::Start() {

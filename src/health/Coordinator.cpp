@@ -1,10 +1,16 @@
 #include "aegisgate/health/Coordinator.h"
 
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <future>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
+#include <unistd.h>
+
+#include "aegisgate/net/Channel.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/TimerQueue.h"
 
@@ -19,6 +25,17 @@ Coordinator::Coordinator(std::shared_ptr<const config::Config> config, Clock::ti
     : config_(std::move(config)), state_(std::make_unique<CoordinatorState>(config_, now)),
       runtime_(std::make_unique<runtime::WorkerRuntime>()) {
   if (!config_) throw std::invalid_argument("coordinator requires a config snapshot");
+  // One OutcomeChannel per breaker route: every accounted attempt reserves a
+  // slot before it connects, so its terminal result always has room (capacity
+  // = max_inflight x (1 + retry_budget)).  Config-level limits are enforced by
+  // CapacityForRoute (overflow / safety ceiling).
+  outcome_channels_.resize(config_->routes.size());
+  for (std::size_t route = 0; route < config_->routes.size(); ++route) {
+    const config::Route &route_config = config_->routes[route];
+    if (!route_config.circuit_breaker.has_value()) continue;
+    outcome_channels_[route] = std::make_unique<OutcomeChannel>(
+        OutcomeChannel::CapacityForRoute(route_config.max_inflight, route_config.retry_budget));
+  }
   // Publish the initial decision set before any worker reads a snapshot.
   Publish();
 }
@@ -53,16 +70,32 @@ void Coordinator::Stop() noexcept {
   // reference and resets it when it runs, destroying LoopData on the
   // coordinator thread.  `data` stays in scope until Stop returns (the join
   // guarantees the accepted destroy task ran during the drain), so the
-  // reference can never dangle.  Retry until accepted: the coordinator loop
-  // keeps draining, so acceptance is guaranteed.
+  // reference can never dangle.
   std::unique_ptr<LoopData> data;
   if (loop_data_) {
     data = std::move(loop_data_);
-    while (!runtime_->PostWithLoop([&data](net::EventLoop &) mutable { data.reset(); })) {
+    // R-063: bounded retry, never an infinite spin.  A live, draining
+    // coordinator loop always accepts the destroy task; a rejection means the
+    // coordinator thread is gone, and retrying forever would burn a core.
+    // Give up after the bound and abandon the loop-attached objects (they can
+    // only be destroyed on the coordinator thread, which no longer runs).
+    bool accepted = false;
+    for (int attempt = 0; attempt < kShutdownPostAttempts; ++attempt) {
+      if (runtime_->PostWithLoop([&data](net::EventLoop &) mutable { data.reset(); })) {
+        accepted = true;
+        break;
+      }
+      std::this_thread::yield();
+    }
+    if (!accepted && data) {
+      (void)std::fprintf(stderr,
+                         "fatal: coordinator destroy task not accepted; loop data leaked\n");
+      (void)data.release();
     }
   }
   runtime_->Stop();
-  // data is empty here: the destroy task ran on the coordinator thread.
+  // data is empty here: the destroy task ran on the coordinator thread (or was
+  // intentionally abandoned after the bounded retry gave up).
 }
 
 std::shared_ptr<const HealthCircuitSnapshot> Coordinator::CurrentSnapshot() const noexcept {
@@ -71,6 +104,53 @@ std::shared_ptr<const HealthCircuitSnapshot> Coordinator::CurrentSnapshot() cons
 
 bool Coordinator::PostResult(const AttemptResult &result) noexcept {
   return PostTask([this, result] { RecordResultTask(result); });
+}
+
+std::optional<OutcomeChannel::Reservation>
+Coordinator::ReserveOutcome(std::size_t route_index) noexcept {
+  if (route_index >= outcome_channels_.size() || !outcome_channels_[route_index]) {
+    return std::nullopt;
+  }
+  return outcome_channels_[route_index]->TryReserve();
+}
+
+void Coordinator::BeginOutcomeStopping() noexcept {
+  for (const auto &channel : outcome_channels_) {
+    if (channel) channel->BeginStopping();
+  }
+}
+
+void Coordinator::DrainOutcomesAndWait() noexcept {
+  std::promise<void> drained;
+  auto future = drained.get_future();
+  // R-063: bounded retry.  The coordinator loop is running during gateway
+  // shutdown (this runs before Stop()), so the drain task is normally accepted
+  // on the first try; a rejection means the loop is stuck, and spinning would
+  // burn a core forever.
+  bool accepted = false;
+  for (int attempt = 0; attempt < kShutdownPostAttempts; ++attempt) {
+    if (PostTask([this, &drained] {
+          DrainAllOutcomeChannels();
+          drained.set_value();
+        })) {
+      accepted = true;
+      break;
+    }
+    std::this_thread::yield();
+  }
+  if (!accepted) {
+    (void)std::fprintf(stderr, "fatal: coordinator outcome drain task not accepted\n");
+    return;
+  }
+  future.wait();
+}
+
+std::uint64_t Coordinator::OutcomeRejectedTotal() const noexcept {
+  std::uint64_t total = 0;
+  for (const auto &channel : outcome_channels_) {
+    if (channel) total += channel->rejected();
+  }
+  return total;
 }
 
 bool Coordinator::ProbeAvailable(std::size_t route, std::size_t endpoint) const noexcept {
@@ -138,16 +218,60 @@ void Coordinator::OnLoopInit(net::EventLoop &loop) {
       data->checkers.back()->Start();
     }
   }
+  // Register each outcome channel's wake descriptor: a Publish signals that a
+  // result is waiting; drain it and republish the snapshot.  The eventfd is a
+  // control wake only — the result payload travels in the channel's ring.
+  for (std::size_t route = 0; route < outcome_channels_.size(); ++route) {
+    OutcomeChannel *channel = outcome_channels_[route].get();
+    if (!channel) continue;
+    data->outcome_wake_channels.push_back(
+        std::make_unique<net::Channel>(loop, channel->WakeFd()));
+    data->outcome_wake_channels.back()->SetReadCallback([this, channel] {
+      // Drain the eventfd counter once; the ring drain below consumes every
+      // queued result regardless of how many publishes coalesced.
+      std::uint64_t counter = 0;
+      for (;;) {
+        const ssize_t count = ::read(channel->WakeFd(), &counter, sizeof(counter));
+        if (count == static_cast<ssize_t>(sizeof(counter))) break;
+        if (count < 0 && errno == EINTR) continue;
+        break;  // EAGAIN: no pending wake
+      }
+      DrainOneOutcomeChannel(*channel);
+    });
+    data->outcome_wake_channels.back()->EnableReading();
+  }
   if (!admissions_.empty()) ScheduleRefillTick(*data->timers);
   loop_data_ = std::move(data);
 }
 
 void Coordinator::RecordResultTask(const AttemptResult &result) {
+  RecordResultDirect(result);
+  Publish();
+}
+
+void Coordinator::RecordResultDirect(const AttemptResult &result) {
   state_->RecordResult(result, Clock::now());
   if (state_->IsOpen(result.route_index, result.endpoint_index)) {
     ScheduleArm(result.route_index, result.endpoint_index);
   }
-  Publish();
+}
+
+void Coordinator::DrainOneOutcomeChannel(OutcomeChannel &channel) {
+  const std::size_t drained = channel.DrainOnCoordinatorLoop([this](const AttemptResult &result) {
+    RecordResultDirect(result);
+  });
+  if (drained > 0) Publish();
+}
+
+void Coordinator::DrainAllOutcomeChannels() {
+  bool any = false;
+  for (const auto &channel : outcome_channels_) {
+    if (!channel) continue;
+    const std::size_t drained = channel->DrainOnCoordinatorLoop(
+        [this](const AttemptResult &result) { RecordResultDirect(result); });
+    any = any || drained > 0;
+  }
+  if (any) Publish();
 }
 
 void Coordinator::RecordHealthTask(std::size_t route, std::size_t endpoint, bool healthy) {
