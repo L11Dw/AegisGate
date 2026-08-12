@@ -1,6 +1,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -20,6 +21,7 @@
 #include "aegisgate/net/Channel.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
+#include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/health/EndpointHealth.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 
@@ -1891,6 +1893,72 @@ TEST(GatewayTest, ReloadPublishesOnlyCompatiblePreparedGeneration) {
   incompatible.workers = 2;
   EXPECT_FALSE(gateway.RequestReload(std::move(incompatible)));
   EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
+}
+
+TEST(GatewayTest, FileReloadParsesOffThreadAndPublishesOnControlLoop) {
+  char path[] = "/tmp/aegisgate-gateway-reload-XXXXXX";
+  const int config_fd = ::mkstemp(path);
+  ASSERT_GE(config_fd, 0);
+  const auto yaml_for = [](std::uint16_t endpoint_port) {
+    return "workers: 1\nroutes:\n"
+           "  - name: api\n    host: file-reload.test\n    path_prefix: /\n    endpoints:\n"
+           "      - host: 127.0.0.1\n        port: " + std::to_string(endpoint_port) +
+           "\n        weight: 1\n    rate_limit: 10\n    burst: 10\n    max_inflight: 4\n";
+  };
+  const std::string initial_yaml = yaml_for(18080);
+  ASSERT_EQ(::write(config_fd, initial_yaml.data(), initial_yaml.size()),
+            static_cast<ssize_t>(initial_yaml.size()));
+  ASSERT_EQ(::close(config_fd), 0);
+
+  std::array<int, 2> done{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, done.data()), 0);
+  net::EventLoop loop;
+  const config::Endpoint initial_endpoint{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
+  Gateway gateway(loop,
+                  config::Config{{{"api", "file-reload.test", "/", {initial_endpoint}, 10, 10, 4}}},
+                  "127.0.0.1", 0, {}, path);
+  gateway.Start();
+  net::Channel done_channel(loop, done[0]);
+  bool timed_out = false;
+  done_channel.SetReadCallback([&] {
+    char result = '\0';
+    ASSERT_EQ(::read(done[0], &result, 1), 1);
+    timed_out = result != 'd';
+    loop.Quit();
+  });
+  done_channel.EnableReading();
+  net::TimerQueue reload_timer(loop);
+
+  const int replacement_fd = ::open(path, O_WRONLY | O_TRUNC | O_CLOEXEC);
+  ASSERT_GE(replacement_fd, 0);
+  const std::string replacement_yaml = yaml_for(18081);
+  ASSERT_EQ(::write(replacement_fd, replacement_yaml.data(), replacement_yaml.size()),
+            static_cast<ssize_t>(replacement_yaml.size()));
+  ASSERT_EQ(::close(replacement_fd), 0);
+  ASSERT_TRUE(gateway.RequestReload());
+  const auto deadline = TestDeadline();
+  std::string signal_error;
+  auto check_published = std::make_shared<std::function<void()>>();
+  *check_published = [&] {
+    const char result = gateway.CurrentGenerationVersion() == 2 ? 'd' :
+                        (std::chrono::steady_clock::now() >= deadline ? 't' : '\0');
+    if (result != '\0') {
+      if (::write(done[1], &result, 1) != 1) signal_error = "reload completion wake failed";
+      return;
+    }
+    (void)reload_timer.ScheduleAfter(std::chrono::milliseconds(1), *check_published);
+  };
+  (void)reload_timer.ScheduleAfter(std::chrono::milliseconds(1), *check_published);
+  loop.Loop();
+
+  EXPECT_TRUE(signal_error.empty()) << signal_error;
+  EXPECT_FALSE(timed_out);
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), 2U);
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
+  done_channel.Remove();
+  EXPECT_EQ(::close(done[0]), 0);
+  EXPECT_EQ(::close(done[1]), 0);
+  EXPECT_EQ(::unlink(path), 0);
 }
 
 TEST(GatewayTest, InflightRequestRetainsOldGenerationAcrossReload) {

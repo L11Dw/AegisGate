@@ -74,6 +74,10 @@ public:
   // already stopping.
   [[nodiscard]] bool RequestReload();
   [[nodiscard]] std::uint16_t port() const;
+  [[nodiscard]] std::uint64_t CurrentGenerationVersion() const noexcept {
+    const auto generation = CurrentGeneration();
+    return generation ? generation->version() : 0;
+  }
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
   [[nodiscard]] Lifecycle lifecycle() const noexcept { return lifecycle_; }
