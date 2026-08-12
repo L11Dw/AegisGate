@@ -16,6 +16,7 @@
 #include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/observability/Metrics.h"
 #include "aegisgate/health/CoordinatorState.h"
+#include "aegisgate/health/OutcomeChannel.h"
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/routing/ActiveReservation.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
@@ -48,15 +49,19 @@ public:
   Start(net::EventLoop &loop, net::ClientConnection &client, std::uint16_t upstream_port,
         http::HttpRequest request,
         std::optional<resilience::GlobalAdmission::Reservation> reservation = std::nullopt);
-  // One breaker link per upstream attempt: the C1' coordinator handle plus
-  // the permit this attempt was admitted with.  The coordinator validates the
-  // permit (generation, probe id) on its own loop; nullopt means the route
-  // has no breaker and outcomes are not accounted.
+  // One breaker link per upstream attempt: the outcome reservation the worker
+  // claimed before connecting (R-053), the route/endpoint indices and the
+  // permit this attempt was admitted with.  The terminal outcome is published
+  // into the reservation's channel; client abort or a never-started attempt
+  // cancels it (returns the credit without accounting).  The coordinator
+  // validates the permit (generation, probe id) on its own loop; nullopt means
+  // the route has no breaker and outcomes are not accounted.
   struct BreakerLink {
     std::shared_ptr<health::Coordinator> coordinator;
     std::size_t route_index;
     std::size_t endpoint_index;
     health::AttemptPermit permit;
+    health::OutcomeChannel::Reservation outcome_reservation;
   };
   // The outcome of choosing one upstream attempt: a value-copied endpoint from
   // the request-bound config snapshot plus its breaker link (absent when the

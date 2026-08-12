@@ -12,8 +12,10 @@
 
 namespace aegisgate::runtime {
 
-WorkerRuntime::WorkerRuntime(std::size_t task_capacity)
-    : task_capacity_(task_capacity), wake_fd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {
+WorkerRuntime::WorkerRuntime(
+    std::size_t task_capacity, std::function<ssize_t(int, const void *, std::size_t)> wake_writer)
+    : task_capacity_(task_capacity), wake_writer_(std::move(wake_writer)),
+      wake_fd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) {
   if (task_capacity_ == 0) {
     throw std::invalid_argument("worker task capacity must be positive");
   }
@@ -97,13 +99,37 @@ bool WorkerRuntime::PostTask(Task task) {
     return false;
   }
   for (;;) {
-    const ssize_t count = ::write(fd, &wake, sizeof(wake));
+    const ssize_t count = wake_writer_ ? wake_writer_(fd, &wake, sizeof(wake))
+                                       : ::write(fd, &wake, sizeof(wake));
     if (count == static_cast<ssize_t>(sizeof(wake))) return true;
     if (count < 0 && errno == EINTR) continue;
     if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
     tasks_.pop_back();
     return false;
   }
+}
+
+bool WorkerRuntime::PostFd(int fd, std::function<void(int)> handler) {
+  if (fd < 0 || !handler) {
+    if (fd >= 0) (void)::close(fd);
+    return false;
+  }
+  auto wrapped = [fd, handler = std::move(handler)]() mutable {
+    try {
+      handler(fd);
+    } catch (...) {
+      // The handler failed after taking over the descriptor: close it so a
+      // partially initialized resource can never leak the fd.
+      (void)::close(fd);
+    }
+  };
+  if (!PostTask(Task(std::move(wrapped)))) {
+    // Rejected: the task was popped and destroyed without running, and its
+    // destructor does not close the raw fd; the API owns it here.
+    (void)::close(fd);
+    return false;
+  }
+  return true;
 }
 
 void WorkerRuntime::Run() {

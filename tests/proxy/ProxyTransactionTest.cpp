@@ -596,7 +596,8 @@ public:
       if (snapshot->endpoints[0][*index].generation != 0) {
         link = ProxyTransaction::BreakerLink{
             coordinator_, 0, *index,
-            {false, snapshot->endpoints[0][*index].generation, 0}};
+            {false, snapshot->endpoints[0][*index].generation, 0},
+            health::OutcomeChannel::Reservation{}};
       }
       return ProxyTransaction::AttemptSelection{
           endpoints[*index], std::move(link), selection_.AcquireActive(0, *index),

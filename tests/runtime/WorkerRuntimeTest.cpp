@@ -1,5 +1,6 @@
 #include <array>
 #include <atomic>
+#include <future>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -344,4 +345,153 @@ TEST(WorkerRuntimeTest, RejectsLoopTaskWhenFullOrStopped) {
 }
 
 } // namespace
+
+
+// R-056: PostFd transfers ownership on success; on rejection the API closes
+// the descriptor itself, so the caller never double-closes.
+TEST(WorkerRuntimeTest, PostFdRejectsWhenFullAndClosesFd) {
+  std::array<int, 2> gate{};
+  std::array<int, 2> done{};
+  std::array<int, 2> peer{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, done.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, peer.data()), 0);
+  std::string error;
+  std::atomic_int accepted_runs{0};
+  WorkerRuntime worker(/*task_capacity=*/2);
+  worker.Start();
+  // Fill the queue with two blocking tasks.
+  for (int index = 0; index != 2; ++index) {
+    ASSERT_TRUE(worker.Post([&] {
+      char release = '\0';
+      (void)::read(gate[0], &release, 1);
+      ++accepted_runs;
+      (void)test::SignalWakeFd(done[1], 'd', error);
+    }));
+  }
+  // Queue full: PostFd rejects and the API closes the handed descriptor.
+  EXPECT_FALSE(worker.PostFd(peer[1], [](int) {}));
+  EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
+  char byte = '\0';
+  EXPECT_EQ(::read(peer[0], &byte, 1), 0) << "peer must see EOF (fd closed by the API)";
+  // Release the accepted tasks; each completes exactly once.
+  ASSERT_EQ(::write(gate[1], "rr", 2), 2);
+  for (int index = 0; index != 2; ++index) {
+    ASSERT_TRUE(WaitFor(done[0], POLLIN, TestDeadline()));
+    ASSERT_EQ(::read(done[0], &byte, 1), 1);
+  }
+  worker.Stop();
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_EQ(accepted_runs.load(), 2);
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+  EXPECT_EQ(::close(done[0]), 0);
+  EXPECT_EQ(::close(done[1]), 0);
+  EXPECT_EQ(::close(peer[0]), 0);
+  // peer[1] was closed by PostFd; closing it again would double-close.
+}
+
+TEST(WorkerRuntimeTest, PostFdRejectsWhenStoppedAndClosesFd) {
+  std::array<int, 2> peer{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, peer.data()), 0);
+  WorkerRuntime worker;
+  worker.Start();
+  worker.Stop();
+  EXPECT_FALSE(worker.PostFd(peer[1], [](int) {}));
+  EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
+  char byte = '\0';
+  EXPECT_EQ(::read(peer[0], &byte, 1), 0) << "peer must see EOF (fd closed by the API)";
+  EXPECT_EQ(::close(peer[0]), 0);
+}
+
+// R-056: on acceptance the handler is the sole fd owner.
+TEST(WorkerRuntimeTest, PostFdRunsHandlerWithOwnedFd) {
+  std::array<int, 2> peer{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, peer.data()), 0);
+  std::atomic_int received{-1};
+  std::promise<void> handled;
+  auto future = handled.get_future();
+  WorkerRuntime worker;
+  worker.Start();
+  ASSERT_TRUE(worker.PostFd(peer[1], [&](int fd) {
+    received.store(fd);
+    (void)::close(fd);  // the handler owns and closes the descriptor
+    handled.set_value();
+  }));
+  future.get();
+  EXPECT_EQ(received.load(), peer[1]);
+  EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
+  char byte = '\0';
+  EXPECT_EQ(::read(peer[0], &byte, 1), 0);
+  worker.Stop();
+  EXPECT_EQ(::close(peer[0]), 0);
+}
+
+// R-066: a throwing handler is absorbed and its fd closed by the wrapper, so
+// no partially initialized resource can leak the descriptor.
+TEST(WorkerRuntimeTest, PostFdHandlerThrowClosesFd) {
+  std::array<int, 2> peer{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, peer.data()), 0);
+  WorkerRuntime worker;
+  worker.Start();
+  ASSERT_TRUE(worker.PostFd(peer[1], [](int) { throw std::runtime_error("handler boom"); }));
+  EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
+  char byte = '\0';
+  EXPECT_EQ(::read(peer[0], &byte, 1), 0) << "peer must see EOF (wrapper closed the fd)";
+  worker.Stop();
+  EXPECT_EQ(::close(peer[0]), 0);
+}
+
+// R-056 wake-writer seam: a hard wake failure pops the task and returns false;
+// PostFd closes the handed fd.
+TEST(WorkerRuntimeTest, WakeWriteFailurePopsTaskAndClosesFd) {
+  std::array<int, 2> peer{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, peer.data()), 0);
+  WorkerRuntime worker(/*task_capacity=*/2, [](int, const void *, std::size_t) -> ssize_t {
+    errno = EBADF;
+    return -1;
+  });
+  worker.Start();
+  std::atomic_int runs{0};
+  EXPECT_FALSE(worker.Post([&] { ++runs; }));
+  EXPECT_FALSE(worker.PostFd(peer[1], [](int) {}));
+  EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
+  char byte = '\0';
+  EXPECT_EQ(::read(peer[0], &byte, 1), 0);
+  worker.Stop();
+  EXPECT_EQ(runs.load(), 0) << "a popped task must never run";
+  EXPECT_EQ(::close(peer[0]), 0);
+}
+
+// The wake write is retried on EINTR.
+TEST(WorkerRuntimeTest, WakeWriteEintrRetriedThenAccepted) {
+  int calls = 0;
+  WorkerRuntime worker(2, [&calls](int, const void *, std::size_t) -> ssize_t {
+    ++calls;
+    if (calls == 1) {
+      errno = EINTR;
+      return -1;
+    }
+    return sizeof(std::uint64_t);
+  });
+  worker.Start();
+  std::atomic_int runs{0};
+  ASSERT_TRUE(worker.Post([&] { ++runs; }));
+  worker.Stop();
+  EXPECT_EQ(runs.load(), 1);
+}
+
+// EAGAIN on the wake write means a wake is already pending: no loss.
+TEST(WorkerRuntimeTest, WakeWriteEagainMeansWakePending) {
+  WorkerRuntime worker(2, [](int, const void *, std::size_t) -> ssize_t {
+    errno = EAGAIN;
+    return -1;
+  });
+  worker.Start();
+  std::atomic_int runs{0};
+  ASSERT_TRUE(worker.Post([&] { ++runs; }));
+  worker.Stop();
+  EXPECT_EQ(runs.load(), 1);
+}
+
 } // namespace aegisgate::runtime

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -17,13 +18,19 @@ namespace aegisgate::runtime {
 class WorkerSet {
 public:
   // Throws std::invalid_argument when count is zero (a misconfiguration;
-  // config parsing already rejects it).
-  explicit WorkerSet(std::size_t count);
+  // config parsing already rejects it).  `factory` is a constructor-injected
+  // test seam (default = a fresh WorkerRuntime) used to inject a worker whose
+  // Start() fails, exercising the partial-start rollback.
+  explicit WorkerSet(std::size_t count,
+                     std::function<std::unique_ptr<WorkerRuntime>()> factory = {});
   ~WorkerSet();
 
   WorkerSet(const WorkerSet &) = delete;
   WorkerSet &operator=(const WorkerSet &) = delete;
 
+  // Starts every worker; on the first failure it stops (drains + joins) the
+  // workers already started and rethrows, leaving no running worker behind
+  // (R-067).
   void Start();
   // Stops every worker (each rejects new tasks, drains accepted ones and
   // joins).  Idempotent; safe to call without Start().

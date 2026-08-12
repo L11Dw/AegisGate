@@ -8,6 +8,29 @@
 #include "aegisgate/routing/RouteTable.h"
 
 namespace aegisgate::runtime {
+namespace {
+
+// R-065: the accepted descriptor is owned by RAII until ClientConnection takes
+// ownership, so an allocation failure in the construction path can never leak
+// the fd.  release() transfers ownership; the destructor closes otherwise.
+class FdOwner {
+public:
+  explicit FdOwner(int fd) : fd_(fd) {}
+  ~FdOwner() { if (fd_ >= 0) (void)::close(fd_); }
+  FdOwner(const FdOwner &) = delete;
+  FdOwner &operator=(const FdOwner &) = delete;
+  [[nodiscard]] int get() const noexcept { return fd_; }
+  [[nodiscard]] int release() noexcept {
+    const int fd = fd_;
+    fd_ = -1;
+    return fd;
+  }
+
+private:
+  int fd_;
+};
+
+} // namespace
 
 WorkerData::WorkerData(net::EventLoop &loop, std::shared_ptr<WorkerShared> shared,
                        std::uint32_t worker_index,
@@ -35,23 +58,23 @@ WorkerData::~WorkerData() {
 }
 
 void WorkerData::Accept(int fd) {
-  // The handoff task owns the fd: on any setup failure the sole owner is
-  // erased here and the descriptor closed by the connection's destructor,
-  // so the acceptor never double-closes a reused descriptor.
+  // R-065: the descriptor is RAII-owned here and released only once
+  // ClientConnection has been constructed and taken ownership; an allocation
+  // failure in the construction path closes it instead of leaking.  The
+  // handoff task (PostFd) owns the fd until Accept runs.
+  FdOwner owned(fd);
   std::uint64_t identifier = 0;
   bool inserted = false;
-  if (next_client_identifier_ == 0) {
-    (void)::close(fd);
-    return;
-  }
+  if (next_client_identifier_ == 0) return;  // FdOwner closes
   try {
     identifier = next_client_identifier_++;
     auto client = std::make_unique<net::ClientConnection>(
-        loop_, fd,
+        loop_, owned.get(),
         [this](net::ClientConnection &connection, const http::HttpRequest &request) {
           HandleRequest(connection, request);
         },
         shared_->flow_control);
+    (void)owned.release();  // ClientConnection owns the descriptor from here
     client->SetCloseCallback([&loop = loop_, state = std::weak_ptr<State>(state_),
                               identifier] { NotifyClientClosed(loop, state, identifier); });
     const auto result = clients_.emplace(identifier, std::move(client));
@@ -158,6 +181,18 @@ bool WorkerData::TryAdmit(std::size_t route_index,
 }
 
 void WorkerData::Shutdown() noexcept {
+  // Return every unspent lease before the balances are destroyed: a worker
+  // that stops holding a lease must not leak global tokens (R-055).  Balances
+  // are zeroed on return, so repeated shutdown returns nothing.  This runs
+  // before any worker-local selection state is destroyed (the destructor body
+  // precedes member destruction) and touches admissions only while they are
+  // still alive (held via shared_).
+  for (std::size_t route = 0; route < lease_balances_.size() &&
+                              route < shared_->admissions.size();
+       ++route) {
+    shared_->admissions[route]->Return(lease_balances_[route]);
+    lease_balances_[route] = 0;
+  }
   pool_->CancelAll();
   clients_.clear();
   metrics_->SetActiveConnections(0);

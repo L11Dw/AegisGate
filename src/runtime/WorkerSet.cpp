@@ -4,20 +4,29 @@
 
 namespace aegisgate::runtime {
 
-WorkerSet::WorkerSet(std::size_t count) {
+WorkerSet::WorkerSet(std::size_t count,
+                     std::function<std::unique_ptr<WorkerRuntime>()> factory) {
   if (count == 0) {
     throw std::invalid_argument("worker count must be positive");
   }
   workers_.reserve(count);
   for (std::size_t index = 0; index != count; ++index) {
-    workers_.push_back(std::make_unique<WorkerRuntime>());
+    workers_.push_back(factory ? factory() : std::make_unique<WorkerRuntime>());
   }
 }
 
 WorkerSet::~WorkerSet() { StopAll(); }
 
 void WorkerSet::Start() {
-  for (const auto &worker : workers_) worker->Start();
+  // R-067: a partial start must roll back the workers already started (drain +
+  // join) before rethrowing, so no worker is left running after a failure.
+  std::size_t started = 0;
+  try {
+    for (; started < workers_.size(); ++started) workers_[started]->Start();
+  } catch (...) {
+    for (std::size_t index = 0; index < started; ++index) workers_[index]->Stop();
+    throw;
+  }
 }
 
 void WorkerSet::StopAll() noexcept {

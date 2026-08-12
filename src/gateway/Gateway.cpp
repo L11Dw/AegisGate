@@ -195,18 +195,16 @@ void Gateway::Accept(int fd) {
     return;
   }
   const runtime::WorkerSet::WorkerHandle handle = workers_->Next();
-  runtime::WorkerRuntime &worker = handle.worker;
-  const std::size_t worker_index = handle.index;
-  if (!worker.Post([this, worker_index, fd] {
-        auto &slot = worker_datas_[worker_index];
-        if (slot) {
-          slot->Accept(fd);
-        } else {
-          (void)::close(fd);
-        }
-      })) {
-    (void)::close(fd);
-  }
+  // R-056: on success the handler owns the fd; on rejection PostFd closes it,
+  // so the gateway never closes it twice.
+  (void)handle.worker.PostFd(fd, [this, worker_index = handle.index](int fd) {
+    auto &slot = worker_datas_[worker_index];
+    if (slot) {
+      slot->Accept(fd);
+    } else {
+      (void)::close(fd);
+    }
+  });
 }
 
 std::string Gateway::RenderMetrics() const {

@@ -195,7 +195,7 @@ bool ProxyTransaction::StartUpstream() {
       return false;
     }
     endpoint_ = selection->endpoint;
-    breaker_link_ = selection->link;
+    breaker_link_ = std::move(selection->link);
     // Bind the request snapshot on the first successful selection; retries use
     // the same provider (same snapshot), so this stays the request's own
     // configuration (R-054).
@@ -389,6 +389,10 @@ void ProxyTransaction::HandleClientAbort() {
   CancelDeadlines();
   reservation_.reset();
   active_reservation_.Release();
+  // A client abort consumes no breaker permit (R-034): cancel the outcome
+  // reservation so its credit is returned without accounting.  The abort is
+  // terminal, so no attempt will publish through this link.
+  breaker_link_.reset();
   // The client connection is gone: account the started response status (or
   // 502 when nothing was written) and consume no breaker permit.
   CompleteMetric(downstream_response_committed_ ? response_head_.status : 502);
@@ -442,18 +446,19 @@ void ProxyTransaction::ClearClientStreamCallbacks() noexcept {
 void ProxyTransaction::AccountSuccess() noexcept {
   if (!breaker_link_.has_value() || attempt_accounted_) return;
   attempt_accounted_ = true;
-  const BreakerLink &link = *breaker_link_;
-  (void)link.coordinator->PostResult(
+  BreakerLink &link = *breaker_link_;
+  // Publish into the reservation's outcome channel.  The slot was reserved
+  // before the attempt connected, so this is infallible by the capacity
+  // invariant (R-053); the coordinator drains it and validates the permit.
+  link.outcome_reservation.Publish(
       {link.route_index, link.endpoint_index, link.permit, true});
 }
 
 void ProxyTransaction::AccountFailure() noexcept {
   if (!breaker_link_.has_value() || attempt_accounted_) return;
   attempt_accounted_ = true;
-  const BreakerLink &link = *breaker_link_;
-  // A dropped submission (coordinator queue full or stopping) loses one
-  // accounting sample at most; it is never double-applied.
-  (void)link.coordinator->PostResult(
+  BreakerLink &link = *breaker_link_;
+  link.outcome_reservation.Publish(
       {link.route_index, link.endpoint_index, link.permit, false});
 }
 

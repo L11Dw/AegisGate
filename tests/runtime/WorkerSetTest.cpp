@@ -97,4 +97,24 @@ TEST(WorkerSetTest, StopAllDrainsAcceptedTasks) {
 }
 
 } // namespace
+// R-067: a partial Start must stop (drain + join) the workers already started
+// before rethrowing, leaving no running worker behind.
+TEST(WorkerSetTest, PartialStartRollsBackStartedWorkers) {
+  int calls = 0;
+  WorkerSet set(2, [&calls]() -> std::unique_ptr<WorkerRuntime> {
+    ++calls;
+    if (calls == 2) {
+      auto worker = std::make_unique<WorkerRuntime>();
+      worker->Stop();  // its Start() throws "worker already stopped"
+      return worker;
+    }
+    return std::make_unique<WorkerRuntime>();
+  });
+  EXPECT_THROW(set.Start(), std::logic_error);
+  // The first worker was rolled back: it rejects new tasks.
+  EXPECT_FALSE(set.At(0).Post([] {}));
+  // Destructor (StopAll) remains safe over the rolled-back set.
+}
+
 } // namespace aegisgate::runtime
+

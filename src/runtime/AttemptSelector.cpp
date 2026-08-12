@@ -76,8 +76,14 @@ AttemptSelector::MakeSelection(std::size_t endpoint_index,
     } else {
       permit = health::AttemptPermit{false, decision.generation, 0};
     }
-    link = proxy::ProxyTransaction::BreakerLink{shared_->coordinator, route_index_,
-                                                endpoint_index, permit};
+    // R-053: claim a result slot before the attempt may connect.  A nullopt
+    // means the route's outcome capacity is exhausted or the coordinator is
+    // stopping: this candidate cannot start a breaker-accounted attempt, so it
+    // is not selectable (the caller terminates with 503 / ends the retry).
+    auto reservation = shared_->coordinator->ReserveOutcome(route_index_);
+    if (!reservation) return std::nullopt;
+    link = proxy::ProxyTransaction::BreakerLink{
+        shared_->coordinator, route_index_, endpoint_index, permit, std::move(*reservation)};
   }
   // Value-copied endpoint from the request-bound snapshot: the transaction
   // never holds a pointer into snapshot internals (R-054).
