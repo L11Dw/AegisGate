@@ -1,0 +1,19 @@
+{
+  "git_sha": "f3170a9",
+  "cpu": "AMD Ryzen 9 7945HX with Radeon Graphics",
+  "kernel": "7.0.0-29-generic",
+  "workers": 1,
+  "scenario": "normal",
+  "duration_seconds": 5,
+  "runs": [{"requests":538,"errors":0,"duration_ms":5011,"rps":107,"p50_us":389,"p95_us":537,"p99_us":585,"mean_us":401,"rss_kb":5216,"cpu_percent":1.9,"context_switches":859}],
+  "summary": {
+    "rps_mean": 107,
+    "rps_stddev": 0,
+    "p50_us_mean": 389,
+    "p50_us_stddev": 0,
+    "p99_us_mean": 585,
+    "p99_us_stddev": 0
+  },
+  "log_dropped_count": 0,
+  "timestamp": "2026-08-12T22:59:27+08:00"
+}

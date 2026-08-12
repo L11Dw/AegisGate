@@ -42,7 +42,7 @@ log() { echo "[bench] $*"; }
 
 # Build release if needed.
 build_release() {
-  if [ ! -f "$PROJECT_DIR/build/release/apps/aegisgate_server" ]; then
+  if [ ! -f "$PROJECT_DIR/build/release/aegisgate_server" ]; then
     log "Building release..."
     cmake -S "$PROJECT_DIR" -B "$PROJECT_DIR/build/release" \
       -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF 2>&1 | tail -3
@@ -97,7 +97,7 @@ start_backend() {
   local port=9100
   local status="${1:-200}"
   local delay="${2:-0}"
-  "$PROJECT_DIR/build/release/apps/aegisgate_mock_backend" "$port" \
+  "$PROJECT_DIR/build/release/aegisgate_mock_backend" "$port" \
     --status "$status" --delay-ms "$delay" &
   BACKEND_PID=$!
   sleep 0.2
@@ -113,7 +113,7 @@ start_gateway() {
   local port=8080
   # Try ports 8080-8090.
   for p in $(seq 8080 8090); do
-    "$PROJECT_DIR/build/release/apps/aegisgate_server" "$config_file" "$p" &
+    "$PROJECT_DIR/build/release/aegisgate_server" "$config_file" "$p" &
     GATEWAY_PID=$!
     sleep 0.3
     if kill -0 "$GATEWAY_PID" 2>/dev/null; then
@@ -140,7 +140,7 @@ measure_latency_curl() {
   local latencies=()
   for _ in $(seq 1 "$count"); do
     local time_ms
-    time_ms=$(curl -s -o /dev/null -w "%{time_total}" \
+    time_ms=$(curl -s --noproxy '*' -o /dev/null -w "%{time_total}" \
       -H "Host: bench.local" \
       "http://127.0.0.1:$GATEWAY_PORT/" 2>/dev/null || echo "1.0")
     local us
@@ -171,7 +171,7 @@ run_benchmark() {
 
   while [ "$(date +%s%N)" -lt "$end_time" ]; do
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" \
+    code=$(curl -s --noproxy '*' -o /dev/null -w "%{http_code}" \
       -H "Host: bench.local" \
       "http://127.0.0.1:$GATEWAY_PORT/" 2>/dev/null || echo "000")
     if [ "$code" = "200" ]; then
@@ -283,7 +283,7 @@ read -r p99_mean p99_stddev <<< "$P99_SUMMARY"
 
 # Read logger dropped count from the gateway's metrics endpoint.
 DROPPED_COUNT=0
-METRICS=$(curl -s "http://127.0.0.1:$GATEWAY_PORT/metrics" 2>/dev/null || echo "")
+METRICS=$(curl -s --noproxy '*' "http://127.0.0.1:$GATEWAY_PORT/metrics" 2>/dev/null || echo "")
 if echo "$METRICS" | grep -q "aegisgate_log_dropped"; then
   DROPPED_COUNT=$(echo "$METRICS" | grep "aegisgate_log_dropped" | awk '{print $2}' || echo "0")
 fi
