@@ -121,7 +121,16 @@ bool Gateway::RequestReload(config::Config candidate) {
   try {
     replacement = std::make_shared<runtime::RuntimeGeneration>(previous->version() + 1,
                                                                 std::move(candidate));
-    replacement->coordinator()->Start();
+    replacement->coordinator()->StartPrepared();
+    const auto protection = previous->coordinator()->ExportProtectionSnapshotAndWait(
+        std::chrono::seconds(2));
+    if (!protection ||
+        !replacement->coordinator()->ImportProtectionSnapshotAndWait(
+            *protection, std::chrono::seconds(2)) ||
+        !replacement->coordinator()->Activate()) {
+      replacement->coordinator()->Stop();
+      return false;
+    }
   } catch (...) {
     // Nothing was published, so every old runtime object remains untouched.
     return false;

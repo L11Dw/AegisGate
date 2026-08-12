@@ -410,6 +410,20 @@ TEST(CoordinatorRuntimeTest, SubmitResultAndWaitDrivesOpenArmProbeAndClose) {
   coordinator.Stop();
 }
 
+TEST(CoordinatorRuntimeTest, PreparedCoordinatorRejectsWorkersUntilActivation) {
+  const auto now = Clock::now();
+  auto config = ConfigWith({RouteWithBreaker("a", 10, 2, 500, 5, 1)});
+  Coordinator coordinator(config, now);
+  coordinator.StartPrepared();
+  EXPECT_FALSE(coordinator.ReserveOutcome(0).has_value());
+  EXPECT_FALSE(coordinator.ProbeAvailable(0, 0));
+  auto exported = coordinator.ExportProtectionSnapshotAndWait(1s);
+  ASSERT_TRUE(exported.has_value());
+  EXPECT_TRUE(coordinator.Activate());
+  EXPECT_TRUE(coordinator.ReserveOutcome(0).has_value());
+  coordinator.Stop();
+}
+
 TEST(CoordinatorRuntimeTest, RecordHealthAndWaitPublishes) {
   const auto now = Clock::now();
   Coordinator coordinator(ConfigWith({PlainRoute("plain")}), now);
