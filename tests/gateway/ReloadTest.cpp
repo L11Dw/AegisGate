@@ -166,7 +166,7 @@ routes:
   net::Channel wake_channel(loop, wake_fds[0]);
   wake_channel.SetReadCallback([&] {
     char byte = '\0';
-    (void)::read(wake_fds[0], &byte, 1);
+    [[maybe_unused]] auto _r = ::read(wake_fds[0], &byte, 1);
     loop.Quit();
   });
   wake_channel.EnableReading();
@@ -211,7 +211,7 @@ TEST(ReloadTest, InvalidYamlLeavesCurrentGenerationUntouched) {
   net::Channel wake_channel(loop, wake_fds[0]);
   wake_channel.SetReadCallback([&] {
     char byte = '\0';
-    (void)::read(wake_fds[0], &byte, 1);
+    [[maybe_unused]] auto _r = ::read(wake_fds[0], &byte, 1);
     loop.Quit();
   });
   wake_channel.EnableReading();
@@ -248,7 +248,7 @@ TEST(ReloadTest, NoConfigPathDisablesFileReload) {
   net::Channel wake_channel(loop, wake_fds[0]);
   wake_channel.SetReadCallback([&] {
     char byte = '\0';
-    (void)::read(wake_fds[0], &byte, 1);
+    [[maybe_unused]] auto _r = ::read(wake_fds[0], &byte, 1);
     loop.Quit();
   });
   wake_channel.EnableReading();
@@ -260,7 +260,7 @@ TEST(ReloadTest, NoConfigPathDisablesFileReload) {
 
   EXPECT_FALSE(gateway.RequestReload());
 
-  (void)::write(wake_fds[1], "q", 1);
+  [[maybe_unused]] auto _w = ::write(wake_fds[1], "q", 1);
   loop.Loop();
   wake_channel.Remove();
   (void)::close(wake_fds[0]);
