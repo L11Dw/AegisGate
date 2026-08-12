@@ -96,6 +96,13 @@ public:
   void SubmitResultAndWait(std::size_t route_index, std::size_t endpoint_index, bool success);
 
 private:
+  // A reload never destroys an in-flight generation, so an operator can
+  // temporarily have active + retiring generations.  Bound that set: an
+  // unbounded stream of valid SIGHUPs must not create an unbounded number of
+  // coordinators, health checkers, and reaper threads.  A rejected reload is
+  // atomic; the currently published generation remains live.
+  static constexpr std::size_t kMaxRetiringGenerations = 2;
+
   struct RetiringGeneration {
     runtime::RuntimeGenerationRef generation;
     std::size_t returned_worker_balances = 0;

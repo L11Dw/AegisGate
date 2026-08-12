@@ -40,7 +40,15 @@ bool ReloadController::Request() {
     }
     if (parser_.joinable()) completed = std::move(parser_);
     parsing_ = true;
-    parser_ = std::thread([this] { ParseLoop(); });
+    try {
+      parser_ = std::thread([this] { ParseLoop(); });
+    } catch (...) {
+      // Keep the state machine truthful when the OS rejects thread creation:
+      // a later Request() may retry and no caller is left believing a parser
+      // is running when there is none.
+      parsing_ = false;
+      throw;
+    }
   }
   if (completed.joinable()) completed.join();
   return true;

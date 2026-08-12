@@ -115,6 +115,7 @@ bool Gateway::RequestReload(config::Config candidate) {
   if (!loop_.IsOwnerThread() || lifecycle_ != Lifecycle::kRunning) return false;
   const auto previous = CurrentGeneration();
   if (!previous || candidate.workers != previous->snapshot()->config.workers) return false;
+  if (retiring_generations_.size() >= kMaxRetiringGenerations) return false;
 
   runtime::RuntimeGenerationRef replacement;
   try {

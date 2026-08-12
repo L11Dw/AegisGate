@@ -42,33 +42,35 @@ ReloadWatcher::ReloadWatcher(net::EventLoop &loop, std::string config_path,
     : loop_(loop), trigger_(std::move(trigger)), timers_(std::make_unique<net::TimerQueue>(loop)) {
   if (!loop_.IsOwnerThread()) throw std::logic_error("reload watcher requires control loop owner");
   if (config_path.empty() || !trigger_) throw std::invalid_argument("reload watcher needs path and trigger");
-  auto [directory, filename] = SplitPath(config_path);
-  directory_ = std::move(directory);
-  filename_ = std::move(filename);
-  inotify_fd_ = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-  if (inotify_fd_ < 0) throw std::system_error(errno, std::generic_category(), "inotify_init1");
-  watch_descriptor_ = ::inotify_add_watch(
-      inotify_fd_, directory_.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB);
-  if (watch_descriptor_ < 0) {
-    const int error = errno;
-    (void)::close(inotify_fd_);
-    inotify_fd_ = -1;
-    throw std::system_error(error, std::generic_category(), "inotify_add_watch");
-  }
-  inotify_channel_ = std::make_unique<net::Channel>(loop_, inotify_fd_);
-  inotify_channel_->SetReadCallback([this] { HandleInotify(); });
-  inotify_channel_->EnableReading();
+  try {
+    auto [directory, filename] = SplitPath(config_path);
+    directory_ = std::move(directory);
+    filename_ = std::move(filename);
+    inotify_fd_ = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (inotify_fd_ < 0) throw std::system_error(errno, std::generic_category(), "inotify_init1");
+    watch_descriptor_ = ::inotify_add_watch(
+        inotify_fd_, directory_.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB);
+    if (watch_descriptor_ < 0) {
+      throw std::system_error(errno, std::generic_category(), "inotify_add_watch");
+    }
+    inotify_channel_ = std::make_unique<net::Channel>(loop_, inotify_fd_);
+    inotify_channel_->SetReadCallback([this] { HandleInotify(); });
+    inotify_channel_->EnableReading();
 
-  if (!watch_sighup) return;
-  sigset_t signals;
-  if (::sigemptyset(&signals) != 0 || ::sigaddset(&signals, SIGHUP) != 0) {
-    throw std::system_error(errno, std::generic_category(), "make SIGHUP signal set");
+    if (!watch_sighup) return;
+    sigset_t signals;
+    if (::sigemptyset(&signals) != 0 || ::sigaddset(&signals, SIGHUP) != 0) {
+      throw std::system_error(errno, std::generic_category(), "make SIGHUP signal set");
+    }
+    sighup_fd_ = ::signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (sighup_fd_ < 0) throw std::system_error(errno, std::generic_category(), "signalfd");
+    sighup_channel_ = std::make_unique<net::Channel>(loop_, sighup_fd_);
+    sighup_channel_->SetReadCallback([this] { HandleSighup(); });
+    sighup_channel_->EnableReading();
+  } catch (...) {
+    Stop();
+    throw;
   }
-  sighup_fd_ = ::signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
-  if (sighup_fd_ < 0) throw std::system_error(errno, std::generic_category(), "signalfd");
-  sighup_channel_ = std::make_unique<net::Channel>(loop_, sighup_fd_);
-  sighup_channel_->SetReadCallback([this] { HandleSighup(); });
-  sighup_channel_->EnableReading();
 }
 
 ReloadWatcher::~ReloadWatcher() { Stop(); }

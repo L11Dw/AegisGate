@@ -1895,6 +1895,24 @@ TEST(GatewayTest, ReloadPublishesOnlyCompatiblePreparedGeneration) {
   EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
 }
 
+TEST(GatewayTest, ReloadBoundsRetiringGenerationsWithoutReplacingTheLiveOne) {
+  net::EventLoop loop;
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
+  Gateway gateway(loop, config::Config{{{"api", "gateway.test", "/", {first}, 10, 10, 4}}},
+                  "127.0.0.1", 0);
+  gateway.Start();
+
+  const auto replacement = [](std::uint16_t port) {
+    const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
+    return config::Config{{{"api", "gateway.test", "/", {endpoint}, 10, 10, 4}}};
+  };
+  EXPECT_TRUE(gateway.RequestReload(replacement(18081)));
+  EXPECT_TRUE(gateway.RequestReload(replacement(18082)));
+  EXPECT_FALSE(gateway.RequestReload(replacement(18083)));
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), 3U);
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18082);
+}
+
 TEST(GatewayTest, FileReloadParsesOffThreadAndPublishesOnControlLoop) {
   char path[] = "/tmp/aegisgate-gateway-reload-XXXXXX";
   const int config_fd = ::mkstemp(path);
