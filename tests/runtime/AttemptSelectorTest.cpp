@@ -6,29 +6,22 @@
 #include "aegisgate/health/Coordinator.h"
 #include "aegisgate/runtime/AttemptSelector.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
+#include "aegisgate/runtime/RuntimeGeneration.h"
 #include "aegisgate/runtime/SelectionState.h"
-#include "aegisgate/runtime/WorkerShared.h"
 
 namespace aegisgate::runtime {
 namespace {
 
 config::Route RouteWithEndpoint(const char *host, std::uint16_t port) {
-  return config::Route{"r", "r.test", "/", {config::Endpoint{host, {127, 0, 0, 1}, port, 1}}};
+  return config::Route{"r", "r.test", "/", {config::Endpoint{host, {127, 0, 0, 1}, port, 1}},
+                       /*rate_limit=*/10, /*burst=*/10, /*max_inflight=*/10};
 }
 
 config::Route RouteWithTwoEndpoints() {
   return config::Route{"r", "r.test", "/",
                        {config::Endpoint{"a.host", {127, 0, 0, 1}, 9001, 1},
-                        config::Endpoint{"b.host", {127, 0, 0, 1}, 9002, 1}}};
-}
-
-std::shared_ptr<WorkerShared> MakeShared(std::shared_ptr<health::Coordinator> coordinator,
-                                         ConfigSnapshotRef snapshot) {
-  auto shared = std::make_shared<WorkerShared>();
-  shared->config_snapshot.store(std::move(snapshot), std::memory_order_release);
-  shared->coordinator = std::move(coordinator);
-  shared->lifetime_token = std::make_shared<int>(0);
-  return shared;
+                        config::Endpoint{"b.host", {127, 0, 0, 1}, 9002, 1}},
+                       /*rate_limit=*/10, /*burst=*/10, /*max_inflight=*/10};
 }
 
 // R-054: the selector binds the request's snapshot at construction, so a
@@ -39,15 +32,9 @@ TEST(AttemptSelectorTest, RetryUsesRequestSnapshotAfterReload) {
   // tried); V2 has a single different endpoint.
   auto config_v1 = std::make_shared<config::Config>();
   config_v1->routes = {RouteWithTwoEndpoints()};
-  const auto v1 = std::make_shared<const ConfigSnapshot>(ConfigSnapshot{1, *config_v1});
-
-  // The coordinator is never started: its constructor already publishes the
-  // initial all-eligible snapshot matching config V1.
-  auto coordinator = std::make_shared<health::Coordinator>(config_v1,
-                                                           health::Coordinator::Clock::now());
-  auto shared = MakeShared(coordinator, v1);
-  SelectionState selection(v1->config, v1->version);
-  AttemptSelector selector(selection, shared, /*route_index=*/0, v1);
+  auto generation_v1 = std::make_shared<RuntimeGeneration>(/*version=*/1, *config_v1);
+  AttemptSelector selector(*generation_v1->selection_states()[0], generation_v1,
+                           /*route_index=*/0);
 
   const auto initial = selector.Select(/*least_active=*/false);
   ASSERT_TRUE(initial.selection.has_value());
@@ -57,8 +44,8 @@ TEST(AttemptSelectorTest, RetryUsesRequestSnapshotAfterReload) {
   // Publish a new global snapshot with a single different endpoint.
   auto config_v2 = std::make_shared<config::Config>();
   config_v2->routes = {RouteWithEndpoint("c.host", 9003)};
-  const auto v2 = std::make_shared<const ConfigSnapshot>(ConfigSnapshot{2, *config_v2});
-  shared->config_snapshot.store(v2, std::memory_order_release);
+  auto generation_v2 = std::make_shared<RuntimeGeneration>(/*version=*/2, *config_v2);
+  ASSERT_NE(generation_v2->snapshot(), generation_v1->snapshot());
 
   // The retry still selects from the request-bound V1 snapshot: the second V1
   // candidate, never the reloaded single endpoint.
@@ -66,7 +53,7 @@ TEST(AttemptSelectorTest, RetryUsesRequestSnapshotAfterReload) {
   ASSERT_TRUE(retry.selection.has_value());
   EXPECT_FALSE(retry.coordinator_overloaded);
   EXPECT_EQ(retry.selection->endpoint.port, 9002);
-  EXPECT_EQ(retry.selection->snapshot->version, v1->version);
+  EXPECT_EQ(retry.selection->snapshot->version, generation_v1->snapshot()->version);
   EXPECT_NE(retry.selection->endpoint.host, "c.host");
 }
 
@@ -75,12 +62,8 @@ TEST(AttemptSelectorTest, RetryUsesRequestSnapshotAfterReload) {
 TEST(AttemptSelectorTest, SelectionCarriesSnapshotRefAndValueEndpoint) {
   auto config = std::make_shared<config::Config>();
   config->routes = {RouteWithEndpoint("a.host", 9001)};
-  const auto snapshot = std::make_shared<const ConfigSnapshot>(ConfigSnapshot{7, *config});
-  auto coordinator =
-      std::make_shared<health::Coordinator>(config, health::Coordinator::Clock::now());
-  auto shared = MakeShared(coordinator, snapshot);
-  SelectionState selection(snapshot->config, snapshot->version);
-  AttemptSelector selector(selection, shared, 0, snapshot);
+  auto generation = std::make_shared<RuntimeGeneration>(/*version=*/7, *config);
+  AttemptSelector selector(*generation->selection_states()[0], generation, 0);
 
   const auto selection_result = selector.Select(false);
   ASSERT_TRUE(selection_result.selection.has_value());
@@ -97,16 +80,14 @@ TEST(AttemptSelectorTest, SelectionCarriesSnapshotRefAndValueEndpoint) {
 TEST(AttemptSelectorTest, CoordinatorOverloadIsDistinctFromNoCandidate) {
   auto config = std::make_shared<config::Config>();
   config::Route route{"r", "r.test", "/",
-                      {config::Endpoint{"a.host", {127, 0, 0, 1}, 9001, 1}}};
-  route.max_inflight = 1;
+                      {config::Endpoint{"a.host", {127, 0, 0, 1}, 9001, 1}},
+                      /*rate_limit=*/10, /*burst=*/10, /*max_inflight=*/1};
   route.retry_budget = 1;
   route.circuit_breaker = config::CircuitBreakerSettings{10, 2, 500, 5, 2};
   config->routes = {std::move(route)};
-  const auto snapshot = std::make_shared<const ConfigSnapshot>(ConfigSnapshot{1, *config});
-  auto coordinator = std::make_shared<health::Coordinator>(config, health::Coordinator::Clock::now());
-  auto shared = MakeShared(coordinator, snapshot);
-  SelectionState selection(snapshot->config, snapshot->version);
-  AttemptSelector selector(selection, shared, 0, snapshot);
+  auto generation = std::make_shared<RuntimeGeneration>(/*version=*/1, *config);
+  auto coordinator = generation->coordinator();
+  AttemptSelector selector(*generation->selection_states()[0], generation, 0);
 
   // Exhaust the route's outcome channel (capacity = max_inflight x (1+retry)).
   // Hold the reservations: a discarded reservation returns its credit.

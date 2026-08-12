@@ -5,14 +5,16 @@
 
 namespace aegisgate::runtime {
 
-AttemptSelector::AttemptSelector(SelectionState &selection, std::shared_ptr<WorkerShared> shared,
-                                 std::size_t route_index, ConfigSnapshotRef snapshot)
-    : selection_(selection), shared_(std::move(shared)), route_index_(route_index),
-      snapshot_(std::move(snapshot)) {}
+AttemptSelector::AttemptSelector(SelectionState &selection, RuntimeGenerationRef generation,
+                                 std::size_t route_index)
+    : selection_(selection), generation_(std::move(generation)),
+      coordinator_(generation_ ? generation_->coordinator() : nullptr), route_index_(route_index),
+      snapshot_(generation_ ? generation_->snapshot() : nullptr) {}
 
 proxy::ProxyTransaction::AttemptDecision AttemptSelector::Select(bool least_active) {
   overload_ = false;
-  const auto health_snapshot = shared_->coordinator->CurrentSnapshot();
+  if (!coordinator_ || !snapshot_) return {std::nullopt, false};
+  const auto health_snapshot = coordinator_->CurrentSnapshot();
   if (!health_snapshot) return {std::nullopt, false};
   if (least_active) {
     for (;;) {
@@ -55,7 +57,7 @@ bool AttemptSelector::Eligible(std::size_t endpoint_index,
   }
   if (decision.breaker_state ==
           static_cast<std::uint8_t>(resilience::CircuitBreaker::State::kHalfOpen) &&
-      !shared_->coordinator->ProbeAvailable(route_index_, endpoint_index)) {
+      !coordinator_->ProbeAvailable(route_index_, endpoint_index)) {
     return false;
   }
   return true;
@@ -70,7 +72,7 @@ AttemptSelector::MakeSelection(std::size_t endpoint_index,
     health::AttemptPermit permit;
     if (decision.breaker_state ==
         static_cast<std::uint8_t>(resilience::CircuitBreaker::State::kHalfOpen)) {
-      const auto claimed = shared_->coordinator->ClaimProbe(route_index_, endpoint_index, snapshot);
+      const auto claimed = coordinator_->ClaimProbe(route_index_, endpoint_index, snapshot);
       if (!claimed) return std::nullopt;  // slot race: not a candidate
       permit = *claimed;
     } else {
@@ -81,13 +83,13 @@ AttemptSelector::MakeSelection(std::size_t endpoint_index,
     // stopping: this candidate cannot start a breaker-accounted attempt, so it
     // is not selectable (the caller terminates with 503 / ends the retry) and
     // the decision reports coordinator overload.
-    auto reservation = shared_->coordinator->ReserveOutcome(route_index_);
+    auto reservation = coordinator_->ReserveOutcome(route_index_);
     if (!reservation) {
       overload_ = true;
       return std::nullopt;
     }
     link = proxy::ProxyTransaction::BreakerLink{
-        shared_->coordinator, route_index_, endpoint_index, permit, std::move(*reservation)};
+        coordinator_, route_index_, endpoint_index, permit, std::move(*reservation)};
   }
   // Value-copied endpoint from the request-bound snapshot: the transaction
   // never holds a pointer into snapshot internals (R-054).

@@ -18,29 +18,19 @@ namespace aegisgate::gateway {
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port, net::StreamFlowControl flow_control)
     : loop_(loop), lifetime_token_(std::make_shared<int>(0)),
-      config_snapshot_(std::make_shared<runtime::ConfigSnapshot>(
-          runtime::ConfigSnapshot{1, std::move(config)})),
-      routes_(config_snapshot_->config), worker_shared_(std::make_shared<runtime::WorkerShared>()),
-      coordinator_(std::make_shared<health::Coordinator>(
-          std::make_shared<config::Config>(config_snapshot_->config),
-          health::Coordinator::Clock::now())),
+      current_generation_(std::make_shared<runtime::RuntimeGeneration>(1, std::move(config))),
+      routes_(CurrentGeneration()->snapshot()->config),
+      worker_shared_(std::make_shared<runtime::WorkerShared>()),
       acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)),
       flow_control_(flow_control) {
-  worker_shared_->config_snapshot.store(config_snapshot_, std::memory_order_release);
-  worker_shared_->coordinator = coordinator_;
-  worker_shared_->worker_count = config_snapshot_->config.workers;
+  const auto generation = CurrentGeneration();
+  worker_shared_->current_generation.store(generation, std::memory_order_release);
   worker_shared_->flow_control = flow_control_;
   worker_shared_->lifetime_token = lifetime_token_;
-  const auto now = resilience::GlobalAdmission::Clock::now();
-  for (const config::Route &route : config_snapshot_->config.routes) {
-    admissions_.push_back(std::make_shared<resilience::GlobalAdmission>(route, now));
-  }
-  worker_shared_->admissions = admissions_;
-  coordinator_->SetAdmissions(admissions_);
   worker_shared_->metrics_renderer = [this] { return RenderMetrics(); };
-  worker_metrics_.resize(worker_shared_->worker_count);
-  client_counts_.resize(worker_shared_->worker_count);
-  for (std::size_t index = 0; index < worker_shared_->worker_count; ++index) {
+  worker_metrics_.resize(generation->snapshot()->config.workers);
+  client_counts_.resize(generation->snapshot()->config.workers);
+  for (std::size_t index = 0; index < generation->snapshot()->config.workers; ++index) {
     worker_metrics_[index] = std::make_shared<observability::Metrics>();
     client_counts_[index] = std::make_shared<std::atomic<std::uint64_t>>(0);
   }
@@ -59,7 +49,8 @@ Gateway::~Gateway() {
   lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
-  coordinator_->BeginOutcomeStopping();
+  const auto generation = CurrentGeneration();
+  if (generation) generation->coordinator()->BeginOutcomeStopping();
   // Original-index teardown (R-057): worker_datas_[i] always corresponds to
   // workers_->At(i), so a partially initialized set cannot misalign.
   for (std::size_t index = 0; index < worker_datas_.size(); ++index) {
@@ -81,8 +72,10 @@ Gateway::~Gateway() {
   if (workers_) workers_->StopAll();
   // The coordinator drains every published-but-undrained outcome on its own
   // loop before stopping.
-  coordinator_->DrainOutcomesAndWait();
-  coordinator_->Stop();
+  if (generation) {
+    generation->coordinator()->DrainOutcomesAndWait();
+    generation->coordinator()->Stop();
+  }
   // worker_datas_ entries are all empty: the destroy tasks ran on their workers.
 }
 
@@ -91,8 +84,10 @@ void Gateway::Start() {
     throw std::logic_error("gateway cannot be started twice");
   }
   lifecycle_ = Lifecycle::kStarting;
-  coordinator_->Start();
-  workers_ = std::make_unique<runtime::WorkerSet>(config_snapshot_->config.workers);
+  const auto generation = CurrentGeneration();
+  if (!generation) throw std::logic_error("gateway has no runtime generation");
+  generation->coordinator()->Start();
+  workers_ = std::make_unique<runtime::WorkerSet>(generation->snapshot()->config.workers);
   workers_->Start();
   worker_datas_.resize(workers_->size());
   for (std::size_t index = 0; index < workers_->size(); ++index) {
@@ -132,7 +127,9 @@ std::string Gateway::MetricsText() { return RenderMetrics(); }
 
 bool Gateway::EndpointHealthy(std::size_t route_index,
                               std::size_t endpoint_index) const noexcept {
-  const auto snapshot = coordinator_->CurrentSnapshot();
+  const auto generation = CurrentGeneration();
+  if (!generation) return true;
+  const auto snapshot = generation->coordinator()->CurrentSnapshot();
   if (!snapshot) return true;
   if (route_index >= snapshot->endpoints.size() ||
       endpoint_index >= snapshot->endpoints[route_index].size()) {
@@ -143,7 +140,9 @@ bool Gateway::EndpointHealthy(std::size_t route_index,
 
 resilience::CircuitBreaker::State
 Gateway::BreakerState(std::size_t route_index, std::size_t endpoint_index) const noexcept {
-  const auto snapshot = coordinator_->CurrentSnapshot();
+  const auto generation = CurrentGeneration();
+  if (!generation) return resilience::CircuitBreaker::State::kClosed;
+  const auto snapshot = generation->coordinator()->CurrentSnapshot();
   if (!snapshot) return resilience::CircuitBreaker::State::kClosed;
   if (route_index >= snapshot->endpoints.size() ||
       endpoint_index >= snapshot->endpoints[route_index].size()) {
@@ -155,13 +154,15 @@ Gateway::BreakerState(std::size_t route_index, std::size_t endpoint_index) const
 
 void Gateway::SubmitResultAndWait(std::size_t route_index, std::size_t endpoint_index,
                                   bool success) {
-  const auto snapshot = coordinator_->CurrentSnapshot();
+  const auto generation_ref = CurrentGeneration();
+  if (!generation_ref) return;
+  const auto snapshot = generation_ref->coordinator()->CurrentSnapshot();
   if (!snapshot || route_index >= snapshot->endpoints.size() ||
       endpoint_index >= snapshot->endpoints[route_index].size()) {
     return;
   }
   const std::uint64_t generation = snapshot->endpoints[route_index][endpoint_index].generation;
-  coordinator_->SubmitResultAndWait(
+  generation_ref->coordinator()->SubmitResultAndWait(
       {route_index, endpoint_index, {false, generation, 0}, success});
 }
 
@@ -191,7 +192,9 @@ std::string Gateway::RenderMetrics() const {
   // Take the coordinator protection snapshot before the worker counters so the
   // protection gauges and the counters are observed in one consistent order
   // (R-059).
-  const auto snapshot = coordinator_->CurrentSnapshot();
+  const auto generation = CurrentGeneration();
+  if (!generation) return observability::Metrics::RenderPrometheus({}, {});
+  const auto snapshot = generation->coordinator()->CurrentSnapshot();
   observability::Metrics::Data aggregate;
   for (const auto &metrics : worker_metrics_) {
     observability::Metrics::MergeInto(aggregate, metrics->Snapshot());
@@ -200,7 +203,7 @@ std::string Gateway::RenderMetrics() const {
   if (snapshot) {
     // Iterate the config snapshot (the same boundary workers and the
     // coordinator use), never the table's own copy (R-060).
-    const std::vector<config::Route> &routes = config_snapshot_->config.routes;
+    const std::vector<config::Route> &routes = generation->snapshot()->config.routes;
     for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
       if (!routes[route_index].circuit_breaker.has_value() &&
           !routes[route_index].health_check.has_value()) {

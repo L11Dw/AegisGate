@@ -58,8 +58,12 @@ private:
   void ReapClosedClients(std::vector<std::uint64_t> identifiers);
   static void NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> state,
                                  std::uint64_t identifier);
-  [[nodiscard]] bool TryAdmit(std::size_t route_index,
+  [[nodiscard]] bool TryAdmit(const RuntimeGenerationRef &generation, std::size_t route_index,
                               std::optional<resilience::GlobalAdmission::Reservation> &reservation);
+  struct LeaseBalance {
+    std::vector<std::shared_ptr<resilience::GlobalAdmission>> admissions;
+    std::vector<std::uint32_t> balances;
+  };
 
   net::EventLoop &loop_;
   std::shared_ptr<WorkerShared> shared_;
@@ -71,8 +75,11 @@ private:
   std::shared_ptr<std::atomic<std::uint64_t>> client_count_;
   std::unordered_map<std::uint64_t, std::unique_ptr<net::ClientConnection>> clients_;
   std::uint64_t next_client_identifier_ = 1;
-  SelectionState selection_;
-  std::vector<std::uint32_t> lease_balances_;
+  // A request selects exclusively from the state owned by its generation.
+  // Local admission leases are keyed by generation version so tokens drawn
+  // before a reload are returned to the matching GlobalAdmission, never to a
+  // newly published route with the same index.
+  std::unordered_map<std::uint64_t, LeaseBalance> lease_balances_;
 };
 
 } // namespace aegisgate::runtime

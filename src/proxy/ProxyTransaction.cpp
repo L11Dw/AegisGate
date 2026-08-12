@@ -101,14 +101,17 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
                                    net::TimerQueue *timers, UpstreamPolicy policy,
                                    std::shared_ptr<observability::Metrics> metrics,
                                    std::string route_name, AttemptProvider attempt_provider,
-                                   std::optional<std::weak_ptr<void>> gateway_lifetime)
+                                   std::optional<std::weak_ptr<void>> gateway_lifetime,
+                                   std::optional<runtime::RuntimeGeneration::RequestLease>
+                                       request_generation_lease)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       gateway_lifetime_(std::move(gateway_lifetime)),
-      endpoint_(std::move(endpoint)), request_(std::move(request)),
+      endpoint_(std::move(endpoint)),
+      request_generation_lease_(std::move(request_generation_lease)),
+      request_(std::move(request)),
       reservation_(std::move(reservation)),
       metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
-      timers_(timers), attempt_provider_(std::move(attempt_provider)),
-      policy_(std::move(policy)) {}
+      timers_(timers), attempt_provider_(std::move(attempt_provider)), policy_(std::move(policy)) {}
 
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
@@ -128,12 +131,15 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         net::TimerQueue *timers, UpstreamPolicy policy,
                         std::shared_ptr<observability::Metrics> metrics, std::string route_name,
                         AttemptProvider attempt_provider,
-                        std::optional<std::weak_ptr<void>> gateway_lifetime) {
+                        std::optional<std::weak_ptr<void>> gateway_lifetime,
+                        std::optional<runtime::RuntimeGeneration::RequestLease>
+                            request_generation_lease) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
       loop, client, std::move(endpoint), std::move(request), std::move(pool),
       std::move(reservation), timers, std::move(policy), std::move(metrics),
-      std::move(route_name), std::move(attempt_provider), std::move(gateway_lifetime)));
+      std::move(route_name), std::move(attempt_provider), std::move(gateway_lifetime),
+      std::move(request_generation_lease)));
   transaction->Begin();
   return transaction;
 }

@@ -76,6 +76,9 @@ public:
 
 private:
   void Accept(int fd);
+  [[nodiscard]] runtime::RuntimeGenerationRef CurrentGeneration() const noexcept {
+    return current_generation_.load(std::memory_order_acquire);
+  }
   [[nodiscard]] std::string RenderMetrics() const;
 
   net::EventLoop &loop_;
@@ -84,15 +87,16 @@ private:
   // the first line of the destructor so any late callback sees the gateway
   // as down before its members are torn down (R-040).
   std::shared_ptr<void> lifetime_token_;
-  runtime::ConfigSnapshotRef config_snapshot_;
+  // The one published generation used by every newly accepted request.  M4-A
+  // reload will atomically replace this pointer; no duplicate gateway-level
+  // coordinator/admission aliases are permitted.
+  std::atomic<runtime::RuntimeGenerationRef> current_generation_;
   routing::RouteTable routes_;
   std::shared_ptr<runtime::WorkerShared> worker_shared_;
-  std::vector<std::shared_ptr<resilience::GlobalAdmission>> admissions_;
   std::vector<std::shared_ptr<observability::Metrics>> worker_metrics_;
   std::vector<std::shared_ptr<std::atomic<std::uint64_t>>> client_counts_;
   std::vector<std::shared_ptr<runtime::WorkerData>> worker_datas_;
   std::unique_ptr<runtime::WorkerSet> workers_;
-  std::shared_ptr<health::Coordinator> coordinator_;
   std::unique_ptr<net::Acceptor> acceptor_;
   net::StreamFlowControl flow_control_;
 };
