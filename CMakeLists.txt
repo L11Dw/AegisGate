@@ -11,6 +11,7 @@ add_library(aegisgate STATIC
     src/gateway/Gateway.cpp
     src/mock/MockBackend.cpp
     src/observability/Metrics.cpp
+    src/observability/AsyncLogger.cpp
     src/net/Buffer.cpp
     src/net/Acceptor.cpp
     src/net/Channel.cpp
