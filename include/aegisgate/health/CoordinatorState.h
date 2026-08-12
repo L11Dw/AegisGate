@@ -13,16 +13,32 @@
 
 namespace aegisgate::health {
 
+// One HalfOpen cycle's immutable probe slot object (R-058).  Workers claim
+// from the object their snapshot holds, so a permit is always consistent with
+// the snapshot it was requested from; the coordinator replaces the object on
+// the next cycle.  The counters are atomic (claimable from any worker), the
+// base/generation/quota are fixed at arm time.
+struct ProbeSlotState {
+  // mutable: workers claim through a shared_ptr<const ProbeSlotState>; the
+  // counters are the only mutating part of an otherwise immutable cycle.
+  mutable std::atomic<std::uint32_t> remaining{0};
+  mutable std::atomic<std::uint64_t> issued{0};
+  std::uint64_t probe_base = 0;
+  std::uint64_t generation = 0;
+  std::uint32_t quota = 0;
+};
+
 // One route x endpoint decision as published to every worker.  breaker_state
 // is the CircuitBreaker::State enum value (0 closed / 1 open / 2 half_open);
-// probe_base and probe_quota let a worker derive its half-open probe id
-// (probe_id = probe_base + claim index) without touching the breaker.
+// probe_slots is the per-cycle claim object this snapshot was built with (null
+// when the endpoint is not half-open).
 struct EndpointDecision {
   bool healthy = true;
   std::uint8_t breaker_state = 0;
   std::uint64_t generation = 0;
   std::uint64_t probe_base = 0;
   std::uint32_t probe_quota = 0;
+  std::shared_ptr<const ProbeSlotState> probe_slots;
 };
 
 // Immutable, versioned coordination snapshot.  Published with
@@ -89,15 +105,12 @@ public:
   [[nodiscard]] std::uint64_t Generation(std::size_t route, std::size_t endpoint) const noexcept;
 
 private:
-  struct ProbeClaimSlots {
-    std::atomic<std::uint32_t> available{0};
-    std::atomic<std::uint64_t> claims{0};
-  };
   struct EndpointState {
     health::EndpointHealth health;
     std::unique_ptr<resilience::CircuitBreaker> breaker;
-    ProbeClaimSlots slots;
-    std::uint64_t probe_base = 0;
+    // The current HalfOpen cycle's probe slot object; published by the
+    // coordinator loop, read by workers (atomics only).
+    std::atomic<std::shared_ptr<const ProbeSlotState>> probe_slots{nullptr};
   };
 
   std::shared_ptr<const config::Config> config_;

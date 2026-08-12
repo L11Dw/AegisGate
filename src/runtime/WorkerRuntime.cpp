@@ -39,6 +39,11 @@ void WorkerRuntime::Start() {
 }
 
 void WorkerRuntime::Stop() noexcept {
+  // R-064: Stop() called from the worker's own thread cannot join itself.  The
+  // stop is still requested (the loop quits at the next wake and the thread
+  // exits on its own); a later external Stop (or the destructor) joins it.  The
+  // wake descriptor is left to Run() so the loop never epolls a closed fd.
+  const bool on_owner = std::this_thread::get_id() == owner_thread_.load(std::memory_order_acquire);
   {
     std::lock_guard<std::mutex> guard(queue_mutex_);
     stopping_.store(true, std::memory_order_relaxed);
@@ -57,6 +62,7 @@ void WorkerRuntime::Stop() noexcept {
       break;
     }
   }
+  if (on_owner) return;
   if (thread_.joinable()) thread_.join();
   // The worker thread closes the descriptor at the end of Run(); exchange
   // makes this idempotent for the never-started and double-Stop cases.

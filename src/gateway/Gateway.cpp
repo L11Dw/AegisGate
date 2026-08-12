@@ -208,12 +208,15 @@ void Gateway::Accept(int fd) {
 }
 
 std::string Gateway::RenderMetrics() const {
+  // Take the coordinator protection snapshot before the worker counters so the
+  // protection gauges and the counters are observed in one consistent order
+  // (R-059).
+  const auto snapshot = coordinator_->CurrentSnapshot();
   observability::Metrics::Data aggregate;
   for (const auto &metrics : worker_metrics_) {
     observability::Metrics::MergeInto(aggregate, metrics->Snapshot());
   }
   std::vector<observability::Metrics::ProtectionSample> protection;
-  const auto snapshot = coordinator_->CurrentSnapshot();
   if (snapshot) {
     // Iterate the config snapshot (the same boundary workers and the
     // coordinator use), never the table's own copy (R-060).

@@ -494,4 +494,24 @@ TEST(WorkerRuntimeTest, WakeWriteEagainMeansWakePending) {
   EXPECT_EQ(runs.load(), 1);
 }
 
+
+// R-064: Stop() called from the worker's own thread must not self-join; the
+// stop is requested, the loop quits and the thread exits on its own, and a
+// later external Stop joins it.
+TEST(WorkerRuntimeTest, StopFromOwnerThreadDoesNotSelfJoin) {
+  std::promise<void> stopped;
+  auto future = stopped.get_future();
+  WorkerRuntime worker;
+  worker.Start();
+  ASSERT_TRUE(worker.Post([&] {
+    worker.Stop();  // self-stop from the worker thread
+    stopped.set_value();
+  }));
+  // Returns without deadlocking: the self-Stop skipped the join.
+  future.get();
+  // A subsequent external Stop joins the thread that quit on its own.
+  worker.Stop();
+  EXPECT_FALSE(worker.IsOwnerThread());
+}
+
 } // namespace aegisgate::runtime

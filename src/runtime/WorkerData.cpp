@@ -71,7 +71,25 @@ void WorkerData::Accept(int fd) {
     auto client = std::make_unique<net::ClientConnection>(
         loop_, owned.get(),
         [this](net::ClientConnection &connection, const http::HttpRequest &request) {
-          HandleRequest(connection, request);
+          // R-066: an unexpected request-handling exception must not leave
+          // the connection paused with the request half-processed; answer with
+          // a controlled 500, or abort the connection if its state no longer
+          // permits a new response.
+          try {
+            HandleRequest(connection, request);
+          } catch (...) {
+            try {
+              metrics_->RecordImmediate("_internal_error", 500);
+            } catch (...) {
+            }
+            try {
+              connection.SendResponse(http::HttpResponse{500, "Internal Server Error", {}, ""});
+            } catch (const std::logic_error &) {
+              connection.AbortResponse();
+            } catch (const std::system_error &) {
+              connection.AbortResponse();
+            }
+          }
         },
         shared_->flow_control);
     (void)owned.release();  // ClientConnection owns the descriptor from here

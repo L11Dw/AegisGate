@@ -1,7 +1,11 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -148,6 +152,120 @@ TEST(CoordinatorStateTest, ProbeFailureReopensImmediately) {
   state.RecordResult({0, 0, *probe, false}, now + 7s);
   EXPECT_EQ(state.BreakerState(0, 0), State::kOpen);
   EXPECT_GT(state.Generation(0, 0), armed->endpoints[0][0].generation);
+}
+
+// R-058: a stale snapshot's probe claim is voided once the coordinator has
+// moved to a new HalfOpen cycle; no counters are rolled back.
+TEST(CoordinatorStateTest, StaleSnapshotProbeClaimIsRejected) {
+  const auto now = Clock::now();
+  CoordinatorState state(ConfigWith({RouteWithBreaker("a", 10, 2, 500, 5, 2)}), now);
+  const std::uint64_t generation = state.BuildSnapshot()->endpoints[0][0].generation;
+  state.RecordResult({0, 0, {false, generation, 0}, false}, now + 1ms);
+  state.RecordResult({0, 0, {false, generation, 0}, false}, now + 2ms);
+  state.ArmHalfOpen(0, 0, now + 6s);
+  auto first_cycle = state.BuildSnapshot();
+  auto probe = state.ClaimProbe(0, 0, *first_cycle);
+  ASSERT_TRUE(probe.has_value());
+  state.RecordResult({0, 0, *probe, false}, now + 7s);  // probe failure reopens
+  state.ArmHalfOpen(0, 0, now + 13s);                   // second cycle
+  auto second_cycle = state.BuildSnapshot();
+
+  // The stale first-cycle snapshot claims from its own (now inactive) slot
+  // object; the post-claim currency check voids it.
+  EXPECT_FALSE(state.ClaimProbe(0, 0, *first_cycle).has_value());
+  // The current cycle claims normally with matching base/generation/quota.
+  auto claim = state.ClaimProbe(0, 0, *second_cycle);
+  ASSERT_TRUE(claim.has_value());
+  EXPECT_EQ(claim->generation, second_cycle->endpoints[0][0].generation);
+  EXPECT_GE(claim->probe_id, second_cycle->endpoints[0][0].probe_base);
+  EXPECT_LT(claim->probe_id,
+            second_cycle->endpoints[0][0].probe_base + 2U);
+}
+
+// R-058: concurrent claims from one cycle never exceed the quota and never
+// issue duplicate probe ids.
+TEST(CoordinatorStateTest, ConcurrentClaimsBoundedByQuotaNoDuplicates) {
+  const auto now = Clock::now();
+  CoordinatorState state(ConfigWith({RouteWithBreaker("a", 10, 2, 500, 5, 4)}), now);
+  const std::uint64_t generation = state.BuildSnapshot()->endpoints[0][0].generation;
+  state.RecordResult({0, 0, {false, generation, 0}, false}, now + 1ms);
+  state.RecordResult({0, 0, {false, generation, 0}, false}, now + 2ms);
+  state.ArmHalfOpen(0, 0, now + 6s);
+  auto armed = state.BuildSnapshot();
+
+  constexpr int kThreads = 4;
+  constexpr int kAttempts = 200;
+  std::atomic<int> successes{0};
+  std::mutex ids_mutex;
+  std::vector<std::uint64_t> ids;
+  std::vector<std::thread> threads;
+  for (int thread_index = 0; thread_index < kThreads; ++thread_index) {
+    threads.emplace_back([&] {
+      for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        const auto claim = state.ClaimProbe(0, 0, *armed);
+        if (claim.has_value()) {
+          ++successes;
+          {
+            std::lock_guard<std::mutex> guard(ids_mutex);
+            ids.push_back(claim->probe_id);
+          }
+        }
+      }
+    });
+  }
+  for (auto &thread : threads) thread.join();
+  EXPECT_EQ(successes.load(), 4);
+  const std::set<std::uint64_t> distinct(ids.begin(), ids.end());
+  EXPECT_EQ(distinct.size(), 4U);
+  for (const std::uint64_t id : ids) {
+    EXPECT_GE(id, armed->endpoints[0][0].probe_base);
+    EXPECT_LT(id, armed->endpoints[0][0].probe_base + 4U);
+  }
+}
+
+// R-058: concurrent stale and current-cycle claims — the stale ones are all
+// voided by the currency check and no duplicate probe id is ever issued.
+TEST(CoordinatorStateTest, ConcurrentStaleAndCurrentCycleClaims) {
+  const auto now = Clock::now();
+  CoordinatorState state(ConfigWith({RouteWithBreaker("a", 10, 2, 500, 5, 4)}), now);
+  const std::uint64_t generation = state.BuildSnapshot()->endpoints[0][0].generation;
+  state.RecordResult({0, 0, {false, generation, 0}, false}, now + 1ms);
+  state.RecordResult({0, 0, {false, generation, 0}, false}, now + 2ms);
+  state.ArmHalfOpen(0, 0, now + 6s);
+  auto first_cycle = state.BuildSnapshot();
+  auto first_probe = state.ClaimProbe(0, 0, *first_cycle);
+  ASSERT_TRUE(first_probe.has_value());
+  state.RecordResult({0, 0, *first_probe, false}, now + 7s);  // reopen
+  state.ArmHalfOpen(0, 0, now + 13s);                         // second cycle
+  auto second_cycle = state.BuildSnapshot();
+
+  std::atomic<int> stale_successes{0};
+  std::atomic<int> current_successes{0};
+  std::mutex ids_mutex;
+  std::vector<std::uint64_t> ids;
+  std::thread stale([&] {
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      if (state.ClaimProbe(0, 0, *first_cycle).has_value()) ++stale_successes;
+    }
+  });
+  std::thread current([&] {
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      const auto claim = state.ClaimProbe(0, 0, *second_cycle);
+      if (claim.has_value()) {
+        ++current_successes;
+        {
+          std::lock_guard<std::mutex> guard(ids_mutex);
+          ids.push_back(claim->probe_id);
+        }
+      }
+    }
+  });
+  stale.join();
+  current.join();
+  EXPECT_EQ(stale_successes.load(), 0) << "stale cycle claims must all be voided";
+  EXPECT_EQ(current_successes.load(), 4);
+  const std::set<std::uint64_t> distinct(ids.begin(), ids.end());
+  EXPECT_EQ(distinct.size(), 4U) << "no duplicate probe ids across concurrent claims";
 }
 
 TEST(CoordinatorStateTest, DuplicateProbeResultIsIgnored) {

@@ -67,9 +67,15 @@ void CoordinatorState::ArmHalfOpen(std::size_t route, std::size_t endpoint, Cloc
     const auto permit = breaker->Select(now);
     if (index == 0) base = permit.probe_id;
   }
-  state.probe_base = base;
-  state.slots.available.store(settings.half_open_probes, std::memory_order_release);
-  state.slots.claims.store(0, std::memory_order_release);
+  // Publish a fresh per-cycle slot object: workers claim from the object their
+  // snapshot holds, so a permit is always consistent with that snapshot.
+  auto slots = std::make_shared<ProbeSlotState>();
+  slots->remaining.store(settings.half_open_probes, std::memory_order_release);
+  slots->issued.store(0, std::memory_order_relaxed);
+  slots->probe_base = base;
+  slots->generation = breaker->Generation();
+  slots->quota = settings.half_open_probes;
+  state.probe_slots.store(std::move(slots), std::memory_order_release);
 }
 
 std::shared_ptr<const HealthCircuitSnapshot> CoordinatorState::BuildSnapshot() {
@@ -85,8 +91,12 @@ std::shared_ptr<const HealthCircuitSnapshot> CoordinatorState::BuildSnapshot() {
       if (state.breaker) {
         decision.breaker_state = static_cast<std::uint8_t>(state.breaker->StateNow());
         decision.generation = state.breaker->Generation();
-        decision.probe_base = state.probe_base;
-        decision.probe_quota = config_->routes[route].circuit_breaker->half_open_probes;
+        const auto slots = state.probe_slots.load(std::memory_order_acquire);
+        if (slots) {
+          decision.probe_base = slots->probe_base;
+          decision.probe_quota = slots->quota;
+        }
+        decision.probe_slots = slots;
       }
       snapshot->endpoints[route][endpoint] = decision;
     }
@@ -105,17 +115,26 @@ CoordinatorState::ClaimProbe(std::size_t route, std::size_t endpoint,
       static_cast<std::uint8_t>(resilience::CircuitBreaker::State::kHalfOpen)) {
     return std::nullopt;
   }
-  if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) {
-    return std::nullopt;
-  }
-  ProbeClaimSlots &slots = endpoints_[route][endpoint].slots;
-  std::uint32_t available = slots.available.load(std::memory_order_acquire);
-  while (available > 0) {
-    if (slots.available.compare_exchange_weak(available, available - 1,
-                                              std::memory_order_acq_rel,
-                                              std::memory_order_acquire)) {
-      const std::uint64_t index = slots.claims.fetch_add(1, std::memory_order_relaxed);
-      return AttemptPermit{true, decision.generation, decision.probe_base + index};
+  // Claim from the snapshot's own per-cycle object: the permit is always
+  // consistent with the snapshot it was requested from (R-058).
+  const auto slots = decision.probe_slots;
+  if (!slots) return std::nullopt;
+  std::uint32_t remaining = slots->remaining.load(std::memory_order_acquire);
+  while (remaining > 0) {
+    if (slots->remaining.compare_exchange_weak(remaining, remaining - 1,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+      const std::uint64_t index = slots->issued.fetch_add(1, std::memory_order_relaxed);
+      // Post-claim currency check: the permit is void if the coordinator has
+      // already moved to a new HalfOpen cycle.  No counters are rolled back —
+      // the old slot is no longer active, so the lost quota cannot pollute the
+      // new cycle, and had the permit been handed out its result would be
+      // rejected by the generation/probe_id validation.
+      if (route >= endpoints_.size() || endpoint >= endpoints_[route].size() ||
+          endpoints_[route][endpoint].probe_slots.load(std::memory_order_acquire) != slots) {
+        return std::nullopt;
+      }
+      return AttemptPermit{true, slots->generation, slots->probe_base + index};
     }
   }
   return std::nullopt;
@@ -123,7 +142,8 @@ CoordinatorState::ClaimProbe(std::size_t route, std::size_t endpoint,
 
 bool CoordinatorState::ProbeAvailable(std::size_t route, std::size_t endpoint) const noexcept {
   if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) return false;
-  return endpoints_[route][endpoint].slots.available.load(std::memory_order_acquire) > 0;
+  const auto slots = endpoints_[route][endpoint].probe_slots.load(std::memory_order_acquire);
+  return slots && slots->remaining.load(std::memory_order_acquire) > 0;
 }
 
 bool CoordinatorState::IsOpen(std::size_t route, std::size_t endpoint) const noexcept {
