@@ -9,10 +9,11 @@
 #include <unordered_set>
 #include <utility>
 
+#include "aegisgate/health/Coordinator.h"
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/proxy/UpstreamPool.h"
-#include "aegisgate/resilience/RouteAdmission.h"
+
 
 namespace aegisgate::proxy {
 namespace {
@@ -88,21 +89,23 @@ void StripHopByHopHeaders(http::HttpResponseHead &head) {
 
 ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                                    std::uint16_t upstream_port, http::HttpRequest request,
-                                   std::shared_ptr<resilience::RouteAdmission> admission)
+                                   std::optional<resilience::GlobalAdmission::Reservation> reservation)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
-      upstream_port_(upstream_port), request_(std::move(request)), admission_(std::move(admission)) {}
+      upstream_port_(upstream_port), request_(std::move(request)),
+      reservation_(std::move(reservation)) {}
 
 ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                                    config::Endpoint endpoint, http::HttpRequest request,
                                    std::shared_ptr<UpstreamPool> pool,
-                                   std::shared_ptr<resilience::RouteAdmission> admission,
+                                   std::optional<resilience::GlobalAdmission::Reservation> reservation,
                                    net::TimerQueue *timers, UpstreamPolicy policy,
                                    std::shared_ptr<observability::Metrics> metrics,
                                    std::string route_name, AttemptProvider attempt_provider,
                                    std::optional<std::weak_ptr<void>> gateway_lifetime)
     : loop_(loop), client_(&client), client_lifetime_(client.LifetimeToken()),
       gateway_lifetime_(std::move(gateway_lifetime)),
-      endpoint_(std::move(endpoint)), request_(std::move(request)), admission_(std::move(admission)),
+      endpoint_(std::move(endpoint)), request_(std::move(request)),
+      reservation_(std::move(reservation)),
       metrics_(std::move(metrics)), route_name_(std::move(route_name)), pool_(std::move(pool)),
       timers_(timers), attempt_provider_(std::move(attempt_provider)),
       policy_(std::move(policy)) {}
@@ -110,9 +113,9 @@ ProxyTransaction::ProxyTransaction(net::EventLoop &loop, net::ClientConnection &
 std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         std::uint16_t upstream_port, http::HttpRequest request,
-                        std::shared_ptr<resilience::RouteAdmission> admission) {
+                        std::optional<resilience::GlobalAdmission::Reservation> reservation) {
   const auto transaction = std::shared_ptr<ProxyTransaction>(
-      new ProxyTransaction(loop, client, upstream_port, std::move(request), std::move(admission)));
+      new ProxyTransaction(loop, client, upstream_port, std::move(request), std::move(reservation)));
   transaction->Begin();
   return transaction;
 }
@@ -121,16 +124,16 @@ std::shared_ptr<ProxyTransaction>
 ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         config::Endpoint endpoint, http::HttpRequest request,
                         std::shared_ptr<UpstreamPool> pool,
-                        std::shared_ptr<resilience::RouteAdmission> admission,
+                        std::optional<resilience::GlobalAdmission::Reservation> reservation,
                         net::TimerQueue *timers, UpstreamPolicy policy,
                         std::shared_ptr<observability::Metrics> metrics, std::string route_name,
                         AttemptProvider attempt_provider,
                         std::optional<std::weak_ptr<void>> gateway_lifetime) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
-      loop, client, std::move(endpoint), std::move(request), std::move(pool), std::move(admission),
-      timers, std::move(policy), std::move(metrics), std::move(route_name),
-      std::move(attempt_provider), std::move(gateway_lifetime)));
+      loop, client, std::move(endpoint), std::move(request), std::move(pool),
+      std::move(reservation), timers, std::move(policy), std::move(metrics),
+      std::move(route_name), std::move(attempt_provider), std::move(gateway_lifetime)));
   transaction->Begin();
   return transaction;
 }
@@ -152,13 +155,9 @@ void ProxyTransaction::Begin() {
       metrics_.reset();
     }
   }
-  if (admission_) {
-    reservation_ = admission_->TryAcquire(resilience::TokenBucket::Clock::now());
-    if (!reservation_) {
-      HandleAdmissionRejected();
-      return;
-    }
-  }
+  // The global admission (in-flight slot plus one lease token) was acquired
+  // by the worker data plane before this transaction started; the reservation
+  // is released exactly once at the terminal path or by RAII.
   // Wire the downstream stream notifications.  Both callbacks hold only a
   // weak reference so a live connection cannot retain a finished transaction;
   // every terminal path clears them via ClearClientStreamCallbacks().
@@ -187,16 +186,25 @@ bool ProxyTransaction::StartUpstream() {
   // The provider chooses an eligible endpoint and issues the attempt permit
   // (freshly per retry).  No candidate means do not connect.
   breaker_link_.reset();
+  coordinator_overloaded_ = false;
   if (attempt_provider_) {
-    auto selection = attempt_provider_();
-    if (!selection.has_value()) {
+    AttemptDecision decision = attempt_provider_();
+    if (!decision.selection.has_value()) {
+      // Record why there was no candidate so the terminal metric reason is
+      // honest (coordinator overload vs no healthy endpoint).
+      coordinator_overloaded_ = decision.coordinator_overloaded;
       // No candidate is not a new attempt: the previous attempt's guard and
       // accounting stay as they are (the old attempt already released its
       // active slot at its terminal point before the retry was queued).
       return false;
     }
-    endpoint_ = *selection->endpoint;
-    breaker_link_ = selection->link;
+    auto selection = std::move(decision.selection);
+    endpoint_ = selection->endpoint;
+    breaker_link_ = std::move(selection->link);
+    // Bind the request snapshot on the first successful selection; retries use
+    // the same provider (same snapshot), so this stays the request's own
+    // configuration (R-054).
+    request_snapshot_ = selection->snapshot;
     // Install the new attempt's active slot.  The previous slot is already
     // empty (released at the old attempt's terminal), so this move-assignment
     // releases nothing.
@@ -244,22 +252,6 @@ bool ProxyTransaction::StartUpstream() {
     HandleUpstream(net::UpstreamResult::kConnectError, {});
   }
   return true;
-}
-
-void ProxyTransaction::HandleAdmissionRejected() {
-  if (finished_) return;
-  finished_ = true;
-  CancelDeadlines();
-  CompleteMetric(429, true);
-  const auto client_lifetime = client_lifetime_.lock();
-  if (!client_lifetime) return;
-  ClearClientStreamCallbacks();
-  const auto self = shared_from_this();
-  try {
-    client_->SendResponse(http::HttpResponse{429, "Too Many Requests", {}, ""});
-  } catch (const std::logic_error &) {
-  } catch (const std::system_error &) {
-  }
 }
 
 void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResponse response) {
@@ -402,6 +394,10 @@ void ProxyTransaction::HandleClientAbort() {
   CancelDeadlines();
   reservation_.reset();
   active_reservation_.Release();
+  // A client abort consumes no breaker permit (R-034): cancel the outcome
+  // reservation so its credit is returned without accounting.  The abort is
+  // terminal, so no attempt will publish through this link.
+  breaker_link_.reset();
   // The client connection is gone: account the started response status (or
   // 502 when nothing was written) and consume no breaker permit.
   CompleteMetric(downstream_response_committed_ ? response_head_.status : 502);
@@ -455,22 +451,20 @@ void ProxyTransaction::ClearClientStreamCallbacks() noexcept {
 void ProxyTransaction::AccountSuccess() noexcept {
   if (!breaker_link_.has_value() || attempt_accounted_) return;
   attempt_accounted_ = true;
-  try {
-    breaker_link_->breaker->RecordSuccess(resilience::CircuitBreaker::Clock::now(),
-                                          breaker_link_->permit);
-  } catch (...) {
-    // Breaker accounting is best-effort; forwarding remains primary.
-  }
+  BreakerLink &link = *breaker_link_;
+  // Publish into the reservation's outcome channel.  The slot was reserved
+  // before the attempt connected, so this is infallible by the capacity
+  // invariant (R-053); the coordinator drains it and validates the permit.
+  link.outcome_reservation.Publish(
+      {link.route_index, link.endpoint_index, link.permit, true});
 }
 
 void ProxyTransaction::AccountFailure() noexcept {
   if (!breaker_link_.has_value() || attempt_accounted_) return;
   attempt_accounted_ = true;
-  try {
-    breaker_link_->breaker->RecordFailure(resilience::CircuitBreaker::Clock::now(),
-                                          breaker_link_->permit);
-  } catch (...) {
-  }
+  BreakerLink &link = *breaker_link_;
+  link.outcome_reservation.Publish(
+      {link.route_index, link.endpoint_index, link.permit, false});
 }
 
 void ProxyTransaction::FinishNoEndpoint() {
@@ -479,9 +473,13 @@ void ProxyTransaction::FinishNoEndpoint() {
   ++generation_;
   CancelDeadlines();
   reservation_.reset();
-  // No upstream was ever connected, so the 503 carries no upstream label.
+  // No upstream was ever connected, so the 503 carries no upstream label; the
+  // reason distinguishes a route with no healthy candidate from one whose
+  // outcome capacity is exhausted (R-053), so operators are not misled.
   try {
-    metric_request_.Complete(503, {}, false, "no_healthy_endpoint");
+    metric_request_.Complete(503, {}, false,
+                             coordinator_overloaded_ ? "coordinator_overloaded"
+                                                     : "no_healthy_endpoint");
   } catch (...) {
   }
   if (!client_lifetime_.lock()) return;

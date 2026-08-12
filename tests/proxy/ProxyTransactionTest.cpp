@@ -22,7 +22,9 @@
 #include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/proxy/ProxyTransaction.h"
 #include "aegisgate/proxy/UpstreamPool.h"
-#include "aegisgate/resilience/RouteAdmission.h"
+#include "aegisgate/health/Coordinator.h"
+#include "aegisgate/resilience/GlobalAdmission.h"
+#include "aegisgate/runtime/SelectionState.h"
 #include "aegisgate/routing/RouteTable.h"
 
 #include <set>
@@ -138,69 +140,6 @@ private:
   std::thread thread_;
 };
 
-TEST(ProxyTransactionTest, RejectsRouteAdmissionBeforeStartingUpstream) {
-  net::Socket listener = net::Socket::ListenLoopback();
-  const auto now = std::chrono::steady_clock::now();
-  const config::Route route{"limited", "test", "/", {}, 1, 1, 1};
-  const auto admission = std::make_shared<resilience::RouteAdmission>(route, now);
-  auto held = admission->TryAcquire(now);
-  ASSERT_TRUE(held);
-
-  std::array<int, 2> sockets{};
-  std::array<int, 2> wake_sockets{};
-  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()), 0);
-  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_sockets.data()), 0);
-  net::EventLoop loop;
-  net::Channel wake_channel(loop, wake_sockets[0]);
-  bool watchdog_fired = false;
-  wake_channel.SetReadCallback([&] {
-    char byte = '\0';
-    if (::read(wake_sockets[0], &byte, 1) != 1 || byte == 't') watchdog_fired = true;
-    loop.Quit();
-  });
-  wake_channel.EnableReading();
-
-  std::shared_ptr<ProxyTransaction> transaction;
-  net::ClientConnection client(loop, sockets[0], [&](net::ClientConnection &connection,
-                                                       const http::HttpRequest &parsed) {
-    transaction = ProxyTransaction::Start(loop, connection, listener.BoundPort(), parsed, admission);
-  });
-  client.Start();
-  constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: test\r\n\r\n";
-  ASSERT_EQ(::write(sockets[1], request.data(), request.size()), static_cast<ssize_t>(request.size()));
-
-  WorkerResult peer_result;
-  constexpr std::string_view expected =
-      "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n";
-  std::thread peer([&] {
-    const auto response = ReadExactUntil(sockets[1], expected.size(), TestDeadline(), peer_result.error);
-    if (!response) return;
-    peer_result.received = *response;
-    peer_result.wire_ok = ::write(wake_sockets[1], "q", 1) == 1;
-    if (!peer_result.wire_ok) peer_result.error = "failed to wake event loop";
-  });
-  std::string watchdog_error;
-  LoopWatchdog watchdog(wake_sockets[1], watchdog_error);
-  loop.Loop();
-  watchdog.Stop();
-  peer.join();
-
-  pollfd descriptor{listener.Fd(), POLLIN, 0};
-  EXPECT_EQ(::poll(&descriptor, 1, 100), 0) << "rejected request opened an upstream connection";
-  EXPECT_FALSE(watchdog_fired);
-  EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
-  EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
-  EXPECT_EQ(peer_result.received, expected);
-  EXPECT_TRUE(peer_result.wire_ok);
-  EXPECT_TRUE(transaction);
-  held.reset();
-  client.Close();
-  wake_channel.Remove();
-  EXPECT_EQ(::close(sockets[1]), 0);
-  EXPECT_EQ(::close(wake_sockets[0]), 0);
-  EXPECT_EQ(::close(wake_sockets[1]), 0);
-}
-
 TEST(ProxyTransactionTest, ForwardsPostAndSegmentedResponseToClient) {
   net::Socket listener = net::Socket::ListenLoopback();
   // Framing and every hop-by-hop field, including fields nominated by
@@ -250,14 +189,15 @@ TEST(ProxyTransactionTest, ForwardsPostAndSegmentedResponseToClient) {
   });
   wake_channel.EnableReading();
   const config::Route route{"success", "origin.test", "/", {}, 2, 2, 1};
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
   std::weak_ptr<ProxyTransaction> transaction;
   bool request_callback_called = false;
   net::ClientConnection client(loop, sockets[0], [&](net::ClientConnection &connection,
                                                        const http::HttpRequest &parsed) {
     request_callback_called = true;
-    transaction = ProxyTransaction::Start(loop, connection, listener.BoundPort(), parsed, admission);
+    transaction = ProxyTransaction::Start(loop, connection, listener.BoundPort(), parsed, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)));
   });
   client.Start();
   ASSERT_EQ(::write(sockets[1], wire_request.data(), wire_request.size()),
@@ -284,7 +224,7 @@ TEST(ProxyTransactionTest, ForwardsPostAndSegmentedResponseToClient) {
   EXPECT_TRUE(transaction.expired());
   // The upstream completion terminates the transaction before downstream I/O
   // resumes; its route reservation must already be available again.
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(admission.inflight(), 0U);
   EXPECT_TRUE(server_result.error.empty()) << server_result.error;
   EXPECT_EQ(server_result.received, expected_request);
   EXPECT_TRUE(server_result.wire_ok);
@@ -510,7 +450,7 @@ TEST(ProxyTransactionTest, CancelsAllDeadlinesAfterARetrySucceeds) {
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 1;
     policy.retry_endpoints = {first, second};
-    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, nullptr, &timers,
+    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, std::nullopt, &timers,
                                           std::move(policy));
   });
   client.Start();
@@ -581,7 +521,7 @@ TEST(ProxyTransactionTest, DoesNotRetryWithoutADifferentCandidate) {
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 1;
     policy.retry_endpoints = {endpoint};
-    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr, nullptr,
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::nullopt, nullptr,
                                           std::move(policy));
   });
   client.Start();
@@ -621,31 +561,57 @@ TEST(ProxyTransactionTest, DoesNotRetryWithoutADifferentCandidate) {
   EXPECT_EQ(::close(wake_sockets[0]), 0);
   EXPECT_EQ(::close(wake_sockets[1]), 0);
 }
-// Builds the same provider shape the Gateway uses for a least-active route:
-// table-owned index scanning (with the tried set), breaker permit issuance,
-// and the per-attempt active reservation.
+// Builds the same provider shape the worker data plane uses for a
+// least-active route: worker-local selection over the coordinator snapshot
+// plus the per-attempt active reservation.  The coordinator is never started
+// here; its constructor already publishes the initial (all-eligible) snapshot.
 class LeastActiveProvider {
 public:
-  explicit LeastActiveProvider(routing::RouteTable &table, const config::Route &route)
-      : table_(table), route_(route) {}
+  LeastActiveProvider(runtime::SelectionState &selection, const config::Config &config,
+                      std::shared_ptr<health::Coordinator> coordinator)
+      : selection_(selection), config_(config), coordinator_(std::move(coordinator)),
+        request_snapshot_(std::make_shared<const runtime::ConfigSnapshot>(
+            runtime::ConfigSnapshot{1, config})) {}
 
-  std::optional<ProxyTransaction::AttemptSelection> Select() {
-    const auto index = table_.NextLeastActiveIndex(route_, tried_);
-    if (!index) return std::nullopt;
-    tried_.insert(*index);
-    const config::Endpoint &endpoint = route_.endpoints[*index];
-    std::optional<ProxyTransaction::BreakerLink> link;
-    if (resilience::CircuitBreaker *breaker = table_.BreakerFor(route_, endpoint)) {
-      link = ProxyTransaction::BreakerLink{
-          breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
+  ProxyTransaction::AttemptDecision Select() {
+    const auto snapshot = coordinator_->CurrentSnapshot();
+    if (!snapshot) return {std::nullopt, false};
+    const auto &endpoints = config_.routes[0].endpoints;
+    const auto eligible = [&](std::size_t endpoint_index) {
+      const auto &decision = snapshot->endpoints[0][endpoint_index];
+      if (!decision.healthy) return false;
+      if (decision.breaker_state ==
+          static_cast<std::uint8_t>(resilience::CircuitBreaker::State::kOpen)) {
+        return false;
+      }
+      return decision.breaker_state !=
+                 static_cast<std::uint8_t>(resilience::CircuitBreaker::State::kHalfOpen) ||
+             coordinator_->ProbeAvailable(0, endpoint_index);
+    };
+    for (;;) {
+      const auto index = selection_.NextLeastActiveIndex(0, tried_, eligible);
+      if (!index) return {std::nullopt, false};
+      tried_.insert(*index);
+      std::optional<ProxyTransaction::BreakerLink> link;
+      if (snapshot->endpoints[0][*index].generation != 0) {
+        link = ProxyTransaction::BreakerLink{
+            coordinator_, 0, *index,
+            {false, snapshot->endpoints[0][*index].generation, 0},
+            health::OutcomeChannel::Reservation{}};
+      }
+      return ProxyTransaction::AttemptDecision{
+          ProxyTransaction::AttemptSelection{endpoints[*index], std::move(link),
+                                             selection_.AcquireActive(0, *index),
+                                             request_snapshot_},
+          false};
     }
-    return ProxyTransaction::AttemptSelection{
-        &endpoint, std::move(link), table_.AcquireActive(route_, endpoint)};
   }
 
 private:
-  routing::RouteTable &table_;
-  const config::Route &route_;
+  runtime::SelectionState &selection_;
+  const config::Config &config_;
+  std::shared_ptr<health::Coordinator> coordinator_;
+  runtime::ConfigSnapshotRef request_snapshot_;
   std::set<std::size_t> tried_;
 };
 
@@ -678,11 +644,14 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnRetryableFailureBeforeRetr
 
   config::Route route{"least", "test", "/", {first, second}, 10, 10, 4};
   route.balance = config::BalancePolicy::kLeastActive;
-  routing::RouteTable table{config::Config{{route}}};
-  const config::Route *matched = table.Match("test", "/retry");
-  ASSERT_NE(matched, nullptr);
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  config::Config config{{route}};
+  runtime::SelectionState selection(config);
+  auto coordinator = std::make_shared<health::Coordinator>(
+      std::make_shared<config::Config>(config), health::Coordinator::Clock::now());
+  coordinator->Start();  // the seam and the snapshot need the runtime loop
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
 
   std::array<int, 2> client_sockets{};
   std::array<int, 2> wake_sockets{};
@@ -701,7 +670,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnRetryableFailureBeforeRetr
   wake_channel.EnableReading();
 
   std::shared_ptr<ProxyTransaction> transaction;
-  LeastActiveProvider provider(table, *matched);
+  LeastActiveProvider provider(selection, config, coordinator);
   net::ClientConnection client(loop, client_sockets[0],
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
     UpstreamPolicy policy;
@@ -710,7 +679,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnRetryableFailureBeforeRetr
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 1;
     transaction = ProxyTransaction::Start(
-        loop, connection, first, parsed, pool, admission, &timers, std::move(policy), nullptr, "least",
+        loop, connection, first, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy), nullptr, "least",
         [provider]() mutable { return provider.Select(); });
   });
   client.Start();
@@ -743,9 +712,9 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnRetryableFailureBeforeRetr
   EXPECT_TRUE(peer_result.wire_ok);
   // The first attempt's slot returned before the replacement started, and the
   // replacement's slot returned with its terminal success.
-  EXPECT_EQ(table.ActiveFor(*matched, first), 0U);
-  EXPECT_EQ(table.ActiveFor(*matched, second), 0U);
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(selection.ActiveFor(0, 0), 0U);
+  EXPECT_EQ(selection.ActiveFor(0, 1), 0U);
+  EXPECT_EQ(admission.inflight(), 0U);
   EXPECT_EQ(timers.PendingCount(), 0U);
   client.Close();
   wake_channel.Remove();
@@ -781,11 +750,14 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnSuccessAnd502) {
 
     config::Route route{"least", "test", "/", {endpoint}, 10, 10, 4};
     route.balance = config::BalancePolicy::kLeastActive;
-    routing::RouteTable table{config::Config{{route}}};
-    const config::Route *matched = table.Match("test", "/x");
-    ASSERT_NE(matched, nullptr);
-    const auto admission = std::make_shared<resilience::RouteAdmission>(
-        route, std::chrono::steady_clock::now());
+    config::Config config{{route}};
+    runtime::SelectionState selection(config);
+    auto coordinator = std::make_shared<health::Coordinator>(
+        std::make_shared<config::Config>(config), health::Coordinator::Clock::now());
+    coordinator->Start();  // the seam and the snapshot need the runtime loop
+    resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
 
     std::array<int, 2> client_sockets{};
     std::array<int, 2> wake_sockets{};
@@ -804,7 +776,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnSuccessAnd502) {
     wake_channel.EnableReading();
 
     std::shared_ptr<ProxyTransaction> transaction;
-    LeastActiveProvider provider(table, *matched);
+    LeastActiveProvider provider(selection, config, coordinator);
     net::ClientConnection client(loop, client_sockets[0],
                                  [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
       UpstreamPolicy policy;
@@ -813,7 +785,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnSuccessAnd502) {
       policy.total_timeout = std::chrono::seconds(2);
       policy.retry_budget = 0;
       transaction = ProxyTransaction::Start(
-          loop, connection, endpoint, parsed, pool, admission, &timers, std::move(policy), nullptr, "least",
+          loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy), nullptr, "least",
           [provider]() mutable { return provider.Select(); });
     });
     client.Start();
@@ -846,8 +818,8 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnSuccessAnd502) {
                                         ? "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
                                         : "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
     EXPECT_TRUE(peer_result.wire_ok);
-    EXPECT_EQ(table.ActiveFor(*matched, endpoint), 0U);
-    EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+    EXPECT_EQ(selection.ActiveFor(0, 0), 0U);
+    EXPECT_EQ(admission.inflight(), 0U);
     EXPECT_TRUE(transaction);
     client.Close();
     wake_channel.Remove();
@@ -877,11 +849,14 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnGatewayTimeout) {
 
   config::Route route{"least", "test", "/", {endpoint}, 10, 10, 4};
   route.balance = config::BalancePolicy::kLeastActive;
-  routing::RouteTable table{config::Config{{route}}};
-  const config::Route *matched = table.Match("test", "/x");
-  ASSERT_NE(matched, nullptr);
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  config::Config config{{route}};
+  runtime::SelectionState selection(config);
+  auto coordinator = std::make_shared<health::Coordinator>(
+      std::make_shared<config::Config>(config), health::Coordinator::Clock::now());
+  coordinator->Start();  // the seam and the snapshot need the runtime loop
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
 
   std::array<int, 2> client_sockets{};
   std::array<int, 2> wake_sockets{};
@@ -900,7 +875,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnGatewayTimeout) {
   wake_channel.EnableReading();
 
   std::shared_ptr<ProxyTransaction> transaction;
-  LeastActiveProvider provider(table, *matched);
+  LeastActiveProvider provider(selection, config, coordinator);
   net::ClientConnection client(loop, client_sockets[0],
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
     UpstreamPolicy policy;
@@ -909,7 +884,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnGatewayTimeout) {
     policy.total_timeout = std::chrono::milliseconds(100);
     policy.retry_budget = 0;
     transaction = ProxyTransaction::Start(
-        loop, connection, endpoint, parsed, pool, admission, &timers, std::move(policy), nullptr, "least",
+        loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy), nullptr, "least",
         [provider]() mutable { return provider.Select(); });
   });
   client.Start();
@@ -938,8 +913,8 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationOnGatewayTimeout) {
   EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
   EXPECT_EQ(peer_result.received, "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n");
   EXPECT_TRUE(peer_result.wire_ok);
-  EXPECT_EQ(table.ActiveFor(*matched, endpoint), 0U);
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(selection.ActiveFor(0, 0), 0U);
+  EXPECT_EQ(admission.inflight(), 0U);
   EXPECT_EQ(timers.PendingCount(), 0U);
   client.Close();
   wake_channel.Remove();
@@ -955,18 +930,21 @@ TEST(ProxyTransactionTest, NoCandidateDoesNotAcquireOrClearOldAttempt) {
   const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_listener.BoundPort(), 1};
   config::Route route{"least", "test", "/", {first, second}, 10, 10, 4};
   route.balance = config::BalancePolicy::kLeastActive;
-  route.health_check = config::HealthCheckSettings{1000, 200};
-  routing::RouteTable table{config::Config{{route}}};
-  const config::Route *matched = table.Match("test", "/x");
-  ASSERT_NE(matched, nullptr);
+  // No health_check config: the coordinator would otherwise probe the raw
+  // test listeners with GET /healthz and steal the backend's accept.  The
+  // coordinator seam drives the endpoint health state directly below.
+  config::Config config{{route}};
+  runtime::SelectionState selection(config);
+  auto coordinator = std::make_shared<health::Coordinator>(
+      std::make_shared<config::Config>(config), health::Coordinator::Clock::now());
+  coordinator->Start();  // the seam and the snapshot need the runtime loop
   // The only different candidate is unhealthy: the retry must terminate
   // without a new attempt, and the first attempt's slot must be released
   // exactly once (a leak would leave it at 1; a double release at UINT32_MAX).
-  health::EndpointHealth *health = table.HealthFor(*matched, matched->endpoints[1]);
-  ASSERT_NE(health, nullptr);
-  health->RecordCheckResult(false);
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  coordinator->RecordHealthAndWait(0, 1, false);
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
 
   constexpr std::string_view request =
       "GET /retry HTTP/1.1\r\nhost: test\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
@@ -995,7 +973,7 @@ TEST(ProxyTransactionTest, NoCandidateDoesNotAcquireOrClearOldAttempt) {
   wake_channel.EnableReading();
 
   std::shared_ptr<ProxyTransaction> transaction;
-  LeastActiveProvider provider(table, *matched);
+  LeastActiveProvider provider(selection, config, coordinator);
   net::ClientConnection client(loop, client_sockets[0],
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
     UpstreamPolicy policy;
@@ -1004,7 +982,7 @@ TEST(ProxyTransactionTest, NoCandidateDoesNotAcquireOrClearOldAttempt) {
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 1;
     transaction = ProxyTransaction::Start(
-        loop, connection, first, parsed, pool, admission, &timers, std::move(policy), nullptr, "least",
+        loop, connection, first, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy), nullptr, "least",
         [provider]() mutable { return provider.Select(); });
   });
   client.Start();
@@ -1038,9 +1016,9 @@ TEST(ProxyTransactionTest, NoCandidateDoesNotAcquireOrClearOldAttempt) {
   EXPECT_TRUE(peer_result.error.empty()) << peer_result.error;
   EXPECT_EQ(peer_result.received, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
   EXPECT_TRUE(peer_result.wire_ok);
-  EXPECT_EQ(table.ActiveFor(*matched, first), 0U);
-  EXPECT_EQ(table.ActiveFor(*matched, second), 0U);
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(selection.ActiveFor(0, 0), 0U);
+  EXPECT_EQ(selection.ActiveFor(0, 1), 0U);
+  EXPECT_EQ(admission.inflight(), 0U);
   client.Close();
   wake_channel.Remove();
   EXPECT_EQ(::close(client_sockets[1]), 0);
@@ -1078,11 +1056,14 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationWhenClientClosedEarly) {
 
   config::Route route{"least", "test", "/", {endpoint}, 10, 10, 4};
   route.balance = config::BalancePolicy::kLeastActive;
-  routing::RouteTable table{config::Config{{route}}};
-  const config::Route *matched = table.Match("test", "/x");
-  ASSERT_NE(matched, nullptr);
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  config::Config config{{route}};
+  runtime::SelectionState selection(config);
+  auto coordinator = std::make_shared<health::Coordinator>(
+      std::make_shared<config::Config>(config), health::Coordinator::Clock::now());
+  coordinator->Start();  // the seam and the snapshot need the runtime loop
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
 
   std::array<int, 2> client_sockets{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
@@ -1099,7 +1080,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationWhenClientClosedEarly) {
   wake_channel.EnableReading();
 
   std::weak_ptr<ProxyTransaction> transaction;
-  LeastActiveProvider provider(table, *matched);
+  LeastActiveProvider provider(selection, config, coordinator);
   net::ClientConnection client(loop, client_sockets[0],
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
     UpstreamPolicy policy;
@@ -1108,7 +1089,7 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationWhenClientClosedEarly) {
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 0;
     transaction = ProxyTransaction::Start(
-        loop, connection, endpoint, parsed, pool, admission, &timers, std::move(policy), nullptr, "least",
+        loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy), nullptr, "least",
         [provider]() mutable { return provider.Select(); });
   });
   client.Start();
@@ -1129,8 +1110,8 @@ TEST(ProxyTransactionTest, ReleasesActiveReservationWhenClientClosedEarly) {
   EXPECT_TRUE(backend_error.empty()) << backend_error;
   // The slot and the admission reservation were released before the expired
   // client lifetime was consulted; nothing is left in flight.
-  EXPECT_EQ(table.ActiveFor(*matched, endpoint), 0U);
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(selection.ActiveFor(0, 0), 0U);
+  EXPECT_EQ(admission.inflight(), 0U);
   EXPECT_TRUE(transaction.expired());
   client.Close();
   wake_channel.Remove();
@@ -1166,11 +1147,14 @@ TEST(ProxyTransactionTest, CallbackCanDestroyOwnerWhileActiveHeld) {
 
   config::Route route{"least", "test", "/", {endpoint}, 10, 10, 4};
   route.balance = config::BalancePolicy::kLeastActive;
-  routing::RouteTable table{config::Config{{route}}};
-  const config::Route *matched = table.Match("test", "/x");
-  ASSERT_NE(matched, nullptr);
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  config::Config config{{route}};
+  runtime::SelectionState selection(config);
+  auto coordinator = std::make_shared<health::Coordinator>(
+      std::make_shared<config::Config>(config), health::Coordinator::Clock::now());
+  coordinator->Start();  // the seam and the snapshot need the runtime loop
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
 
   std::array<int, 2> client_sockets{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_sockets.data()), 0);
@@ -1189,7 +1173,7 @@ TEST(ProxyTransactionTest, CallbackCanDestroyOwnerWhileActiveHeld) {
   std::weak_ptr<void> client_lifetime;
   std::weak_ptr<ProxyTransaction> transaction;
   std::unique_ptr<net::ClientConnection> client;
-  LeastActiveProvider provider(table, *matched);
+  LeastActiveProvider provider(selection, config, coordinator);
   client = std::make_unique<net::ClientConnection>(
       loop, client_sockets[0], [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
         client_lifetime = connection.LifetimeToken();
@@ -1199,7 +1183,7 @@ TEST(ProxyTransactionTest, CallbackCanDestroyOwnerWhileActiveHeld) {
         policy.total_timeout = std::chrono::seconds(2);
         policy.retry_budget = 0;
         transaction = ProxyTransaction::Start(
-            loop, connection, endpoint, parsed, pool, admission, &timers, std::move(policy), nullptr, "least",
+            loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy), nullptr, "least",
             [provider]() mutable { return provider.Select(); });
         // Destroy the owning client while the active reservation is in flight.
         client.reset();
@@ -1221,8 +1205,8 @@ TEST(ProxyTransactionTest, CallbackCanDestroyOwnerWhileActiveHeld) {
   EXPECT_TRUE(backend_error.empty()) << backend_error;
   EXPECT_TRUE(client_lifetime.expired());
   EXPECT_TRUE(transaction.expired());
-  EXPECT_EQ(table.ActiveFor(*matched, endpoint), 0U);
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(selection.ActiveFor(0, 0), 0U);
+  EXPECT_EQ(admission.inflight(), 0U);
   wake_channel.Remove();
   EXPECT_EQ(::close(wake_sockets[0]), 0);
   EXPECT_EQ(::close(wake_sockets[1]), 0);
@@ -1283,8 +1267,9 @@ TEST(ProxyTransactionTest, CancelAllTerminatesInFlightTransaction) {
   });
   wake_channel.EnableReading();
   const config::Route route{"limited", "test", "/", {}, 10, 10, 4};
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
   std::weak_ptr<ProxyTransaction> transaction;
   net::ClientConnection client(loop, client_sockets[0],
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
@@ -1293,7 +1278,7 @@ TEST(ProxyTransactionTest, CancelAllTerminatesInFlightTransaction) {
     policy.first_byte_timeout = std::chrono::seconds(1);
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 0;
-    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission,
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)),
                                           &timers, std::move(policy));
   });
   client.Start();
@@ -1323,8 +1308,7 @@ TEST(ProxyTransactionTest, CancelAllTerminatesInFlightTransaction) {
   pool->CancelAll();
 
   EXPECT_TRUE(transaction.expired()) << "transaction survived CancelAll";
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()))
-      << "admission reservation was not released";
+  EXPECT_EQ(admission.inflight(), 0U) << "admission reservation was not released";
   // Note: the attempt deadlines are not cancelled here (the transaction is
   // destroyed directly, with no terminal callback); their weak callbacks are
   // harmless no-ops once the transaction is gone.
@@ -1388,8 +1372,9 @@ TEST(ProxyTransactionTest, KeepAliveReuseDoesNotRetainTransaction) {
   });
   wake_channel.EnableReading();
   const config::Route route{"limited", "test", "/", {}, 10, 10, 4};
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
 
   // Request 1 on its own client connection.
   std::array<int, 2> first_sockets{};
@@ -1402,7 +1387,7 @@ TEST(ProxyTransactionTest, KeepAliveReuseDoesNotRetainTransaction) {
     policy.first_byte_timeout = std::chrono::seconds(1);
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 0;
-    first_transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission,
+    first_transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)),
                                                 &timers, std::move(policy));
   });
   first_client.Start();
@@ -1438,7 +1423,7 @@ TEST(ProxyTransactionTest, KeepAliveReuseDoesNotRetainTransaction) {
     policy.first_byte_timeout = std::chrono::seconds(1);
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 0;
-    (void)ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission, &timers,
+    (void)ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers,
                                   std::move(policy));
   });
   second_client.Start();
@@ -1459,7 +1444,7 @@ TEST(ProxyTransactionTest, KeepAliveReuseDoesNotRetainTransaction) {
   EXPECT_TRUE(second_peer_error.empty()) << second_peer_error;
   EXPECT_TRUE(backend_error.empty()) << backend_error;
   EXPECT_EQ(accepted, 1) << "second request did not reuse the idle connection";
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(admission.inflight(), 0U);
   first_client.Close();
   second_client.Close();
   wake_channel.Remove();
@@ -1482,8 +1467,9 @@ TEST(ProxyTransactionTest, StartWithExpiredGatewayTokenIsInert) {
   net::TimerQueue timers(loop);
   auto pool = std::make_shared<UpstreamPool>(loop);
   const config::Route route{"limited", "test", "/", {}, 10, 10, 4};
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
   // An already-expired gateway lifetime token.
   auto expired = std::make_shared<int>(0);
   std::optional<std::weak_ptr<void>> expired_token{std::weak_ptr<void>(expired)};
@@ -1499,11 +1485,11 @@ TEST(ProxyTransactionTest, StartWithExpiredGatewayTokenIsInert) {
     policy.total_timeout = std::chrono::seconds(2);
     policy.retry_budget = 0;
     transaction = ProxyTransaction::Start(
-        loop, connection, endpoint, parsed, pool, admission, &timers, std::move(policy),
+        loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy),
         nullptr, "least",
-        [&]() -> std::optional<ProxyTransaction::AttemptSelection> {
+        [&]() -> ProxyTransaction::AttemptDecision {
           provider_called = true;
-          return std::nullopt;
+          return {std::nullopt, false};
         },
         expired_token);
   });
@@ -1526,9 +1512,11 @@ TEST(ProxyTransactionTest, StartWithExpiredGatewayTokenIsInert) {
 
   EXPECT_TRUE(transaction);
   EXPECT_FALSE(provider_called) << "provider was consulted with an expired token";
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()))
-      << "an admission slot was taken";
   EXPECT_EQ(timers.PendingCount(), 0U) << "a deadline was armed";
+  // The pre-acquired global reservation is released when the inert
+  // transaction is destroyed (RAII), never leaked on the early-return path.
+  transaction.reset();
+  EXPECT_EQ(admission.inflight(), 0U) << "an admission slot was taken";
   pollfd pending{listener.Fd(), POLLIN, 0};
   EXPECT_EQ(::poll(&pending, 1, 100), 0) << "the inert transaction connected upstream";
   // The client must not have received any downstream bytes (no spurious 503):
@@ -1629,7 +1617,7 @@ TEST(ProxyTransactionTest, HeaderCommitDisablesRetry) {
     UpstreamPolicy policy;
     policy.retry_budget = 1;
     policy.retry_endpoints = {first, second};
-    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, nullptr, &timers,
+    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, std::nullopt, &timers,
                                           std::move(policy));
   });
   client.Start();
@@ -1705,7 +1693,7 @@ TEST(ProxyTransactionTest, HeaderCommittedEofTruncatesWithoutSecondResponse) {
   net::ClientConnection client(loop, client_sockets[0],
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
     UpstreamPolicy policy;
-    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr, &timers,
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::nullopt, &timers,
                                           std::move(policy));
   });
   client.Start();
@@ -1788,7 +1776,7 @@ TEST(ProxyTransactionTest, HeaderCommittedTimeoutTruncates) {
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
     UpstreamPolicy policy;
     policy.total_timeout = std::chrono::milliseconds(50);
-    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr, &timers,
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::nullopt, &timers,
                                           std::move(policy));
   });
   client.Start();
@@ -1864,7 +1852,7 @@ TEST(ProxyTransactionTest, UnsupportedResponseDoesNotRetry) {
     UpstreamPolicy policy;
     policy.retry_budget = 1;
     policy.retry_endpoints = {first, second};
-    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, nullptr, &timers,
+    transaction = ProxyTransaction::Start(loop, connection, first, parsed, pool, std::nullopt, &timers,
                                           std::move(policy));
   });
   client.Start();
@@ -1966,13 +1954,14 @@ TEST(ProxyTransactionTest, ClientCloseCancelsUpstream) {
   });
   wake_channel.EnableReading();
   const config::Route route{"api", "test", "/", {}, 2, 2, 1};
-  const auto admission = std::make_shared<resilience::RouteAdmission>(
-      route, std::chrono::steady_clock::now());
+  resilience::GlobalAdmission admission(route, std::chrono::steady_clock::now());
+  auto reservation = admission.TryAcquireInflight();
+  ASSERT_TRUE(reservation);
   const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
   std::shared_ptr<ProxyTransaction> transaction;
   net::ClientConnection client(loop, client_sockets[0],
                                [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
-    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, admission,
+    transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)),
                                           &timers, {});
   });
   client.Start();
@@ -1993,7 +1982,7 @@ TEST(ProxyTransactionTest, ClientCloseCancelsUpstream) {
   EXPECT_FALSE(watchdog_fired);
   EXPECT_TRUE(watchdog_error.empty()) << watchdog_error;
   EXPECT_TRUE(backend_error.empty()) << backend_error;
-  EXPECT_TRUE(admission->TryAcquire(std::chrono::steady_clock::now()));
+  EXPECT_EQ(admission.inflight(), 0U);
   EXPECT_TRUE(transaction);
   EXPECT_EQ(timers.PendingCount(), 0U);
   client.Close();
@@ -2043,7 +2032,7 @@ TEST(ProxyTransactionTest, LowWaterNotificationWithoutPauseDoesNotReenter) {
   net::ClientConnection client(
       loop, client_sockets[0],
       [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
-        transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr,
+        transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::nullopt,
                                               &timers);
       },
       net::StreamFlowControl{256 * 1024, 4});
@@ -2132,7 +2121,7 @@ TEST(ProxyTransactionTest, ClientDestroyedBeforeCommittedFailureIsSafe) {
   std::unique_ptr<net::ClientConnection> client = std::make_unique<net::ClientConnection>(
       loop, client_sockets[0],
       [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
-        transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr,
+        transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, std::nullopt,
                                               &timers);
       });
   client->Start();
@@ -2246,8 +2235,8 @@ TEST(ProxyTransactionTest, ClearsClientStreamCallbacksAtTerminal) {
       std::make_unique<net::ClientConnection>(
           loop, client_sockets[0],
           [&](net::ClientConnection &connection, const http::HttpRequest &parsed) {
-            transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool, nullptr,
-                                                  &timers);
+            transaction = ProxyTransaction::Start(loop, connection, endpoint, parsed, pool,
+                                                  std::nullopt, &timers);
           });
   client->SetRequestAbortCallback([&] { ++abort_calls; });
   client->Start();

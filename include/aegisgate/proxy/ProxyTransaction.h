@@ -15,18 +15,20 @@
 #include "aegisgate/net/UpstreamConnection.h"
 #include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/observability/Metrics.h"
-#include "aegisgate/resilience/CircuitBreaker.h"
-#include "aegisgate/resilience/InflightLimiter.h"
+#include "aegisgate/health/CoordinatorState.h"
+#include "aegisgate/health/OutcomeChannel.h"
+#include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/routing/ActiveReservation.h"
+#include "aegisgate/runtime/ConfigSnapshot.h"
 
 namespace aegisgate::net {
 class ClientConnection;
 class EventLoop;
 } // namespace aegisgate::net
 
-namespace aegisgate::resilience {
-class RouteAdmission;
-} // namespace aegisgate::resilience
+namespace aegisgate::health {
+class Coordinator;
+} // namespace aegisgate::health
 
 namespace aegisgate::proxy {
 
@@ -46,34 +48,51 @@ public:
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, std::uint16_t upstream_port,
         http::HttpRequest request,
-        std::shared_ptr<resilience::RouteAdmission> admission = nullptr);
-  // One breaker link per upstream attempt: the non-owning breaker owned by
-  // the route table (lives at least as long as the gateway) plus the permit
-  // this attempt was admitted with.  nullopt means the route has no breaker
-  // and outcomes are not accounted.
+        std::optional<resilience::GlobalAdmission::Reservation> reservation = std::nullopt);
+  // One breaker link per upstream attempt: the outcome reservation the worker
+  // claimed before connecting (R-053), the route/endpoint indices and the
+  // permit this attempt was admitted with.  The terminal outcome is published
+  // into the reservation's channel; client abort or a never-started attempt
+  // cancels it (returns the credit without accounting).  The coordinator
+  // validates the permit (generation, probe id) on its own loop; nullopt means
+  // the route has no breaker and outcomes are not accounted.
   struct BreakerLink {
-    resilience::CircuitBreaker *breaker;
-    resilience::CircuitBreaker::RequestPermit permit;
+    std::shared_ptr<health::Coordinator> coordinator;
+    std::size_t route_index;
+    std::size_t endpoint_index;
+    health::AttemptPermit permit;
+    health::OutcomeChannel::Reservation outcome_reservation;
   };
-  // The outcome of choosing one upstream attempt: an eligible endpoint plus
-  // its breaker link (absent when the route has no breaker) plus the active
-  // slot it holds.  The reservation is released exactly once when the attempt
-  // terminates; a selection is only constructed when an attempt starts.
+  // The outcome of choosing one upstream attempt: a value-copied endpoint from
+  // the request-bound config snapshot plus its breaker link (absent when the
+  // route has no breaker) plus the active slot it holds plus that same
+  // snapshot.  No pointer into snapshot internals is ever kept (R-054); the
+  // transaction stores the snapshot so a later retry stays on the request's
+  // configuration.
   struct AttemptSelection {
-    const config::Endpoint *endpoint;
+    config::Endpoint endpoint;
     std::optional<BreakerLink> link;
     routing::ActiveReservation active;
+    runtime::ConfigSnapshotRef snapshot;
+  };
+  // The provider's answer: a selection, or the reason there was none.  Both
+  // "no candidate" and "coordinator overloaded" mean do not connect; the two
+  // are distinguished so the terminal metric reason is honest (R-053).
+  struct AttemptDecision {
+    std::optional<AttemptSelection> selection;
+    bool coordinator_overloaded = false;
   };
   // Chooses the endpoint for the initial attempt and for every retry, so
-  // unhealthy or open candidates are never connected to.  nullopt means no
-  // eligible candidate remains; the initial call terminates with a unique
-  // 503 and a retry call terminates the transaction.
-  using AttemptProvider = std::function<std::optional<AttemptSelection>()>;
+  // unhealthy or open candidates are never connected to.  A nullopt selection
+  // means no eligible candidate remains (or the route's outcome capacity is
+  // exhausted); the initial call terminates with a unique 503 and a retry call
+  // terminates the transaction.
+  using AttemptProvider = std::function<AttemptDecision()>;
 
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
         http::HttpRequest request, std::shared_ptr<UpstreamPool> pool,
-                        std::shared_ptr<resilience::RouteAdmission> admission = nullptr,
+        std::optional<resilience::GlobalAdmission::Reservation> reservation = std::nullopt,
         net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
         std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {},
         AttemptProvider attempt_provider = {},
@@ -82,11 +101,11 @@ public:
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                    std::uint16_t upstream_port, http::HttpRequest request,
-                   std::shared_ptr<resilience::RouteAdmission> admission);
+                   std::optional<resilience::GlobalAdmission::Reservation> reservation);
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
                    config::Endpoint endpoint, http::HttpRequest request,
                    std::shared_ptr<UpstreamPool> pool,
-                   std::shared_ptr<resilience::RouteAdmission> admission,
+                   std::optional<resilience::GlobalAdmission::Reservation> reservation,
                    net::TimerQueue *timers, UpstreamPolicy policy,
                    std::shared_ptr<observability::Metrics> metrics, std::string route_name,
                    AttemptProvider attempt_provider,
@@ -123,7 +142,6 @@ private:
   void FinishGatewayTimeout();
   void AccountSuccess() noexcept;
   void AccountFailure() noexcept;
-  void HandleAdmissionRejected();
   void HandleUpstream(net::UpstreamResult result, http::HttpResponse response);
   void CompleteMetric(int status, bool rate_limited = false,
                      std::string_view reason = {}) noexcept;
@@ -135,9 +153,18 @@ private:
   std::optional<std::weak_ptr<void>> gateway_lifetime_;
   std::uint16_t upstream_port_;
   std::optional<config::Endpoint> endpoint_;
+  // The request-bound configuration snapshot selected by the provider; held for
+  // the whole transaction so no retry re-reads the current global snapshot
+  // (R-054).  Null when the provider is absent (caller-owned lifetime).
+  runtime::ConfigSnapshotRef request_snapshot_;
+  // True when the provider reported coordinator overload (outcome capacity
+  // exhausted) for the terminal "no selection" decision; distinguishes the 503
+  // reason from a plain no-healthy-endpoint (R-053).
+  bool coordinator_overloaded_ = false;
   http::HttpRequest request_;
-  std::shared_ptr<resilience::RouteAdmission> admission_;
-  std::optional<resilience::InflightLimiter::Reservation> reservation_;
+  // Pre-acquired by the caller (worker data plane) from the global
+  // admission; released exactly once at the terminal path or by RAII.
+  std::optional<resilience::GlobalAdmission::Reservation> reservation_;
   std::shared_ptr<observability::Metrics> metrics_;
   std::string route_name_;
   observability::Metrics::RequestHandle metric_request_;

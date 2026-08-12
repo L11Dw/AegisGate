@@ -1,237 +1,231 @@
 #include "aegisgate/gateway/Gateway.h"
 
 #include <chrono>
-#include <set>
+#include <cstdio>
+#include <future>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include <unistd.h>
 
-#include "aegisgate/http/HttpResponse.h"
+#include "aegisgate/health/Coordinator.h"
 #include "aegisgate/net/Acceptor.h"
-#include "aegisgate/net/ClientConnection.h"
-#include "aegisgate/net/EventLoop.h"
-#include "aegisgate/net/TimerQueue.h"
-#include "aegisgate/observability/Metrics.h"
-#include "aegisgate/proxy/ProxyTransaction.h"
-#include "aegisgate/proxy/UpstreamPool.h"
+#include "aegisgate/resilience/GlobalAdmission.h"
 
 namespace aegisgate::gateway {
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port, net::StreamFlowControl flow_control)
-    : lifetime_token_(std::make_shared<int>(0)), loop_(loop),
-      state_(std::make_shared<State>()), routes_(std::move(config)),
-      metrics_(std::make_shared<observability::Metrics>()),
-      upstream_pool_(std::make_shared<proxy::UpstreamPool>(loop)),
-      timers_(std::make_unique<net::TimerQueue>(loop)),
+    : loop_(loop), lifetime_token_(std::make_shared<int>(0)),
+      config_snapshot_(std::make_shared<runtime::ConfigSnapshot>(
+          runtime::ConfigSnapshot{1, std::move(config)})),
+      routes_(config_snapshot_->config), worker_shared_(std::make_shared<runtime::WorkerShared>()),
+      coordinator_(std::make_shared<health::Coordinator>(
+          std::make_shared<config::Config>(config_snapshot_->config),
+          health::Coordinator::Clock::now())),
       acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)),
       flow_control_(flow_control) {
-  state_->owner = this;
-  acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
-  for (const config::Route &route : routes_.Config().routes) {
-    if (!route.health_check.has_value()) continue;
-    const auto &settings = *route.health_check;
-    for (const config::Endpoint &endpoint : route.endpoints) {
-      health_checkers_.push_back(std::make_unique<health::HealthChecker>(
-          loop_, *timers_, endpoint,
-          health::HealthCheckConfig{std::chrono::milliseconds(settings.interval_ms),
-                                    std::chrono::milliseconds(settings.timeout_ms)},
-          [this, &route, &endpoint](bool healthy) {
-            // The table owns the state for the lifetime of this gateway; the
-            // checker's generation guards stale callbacks after Stop().
-            if (health::EndpointHealth *state = routes_.HealthFor(route, endpoint)) {
-              state->RecordCheckResult(healthy);
-            }
-          }));
-      health_checkers_.back()->Start();
-    }
+  worker_shared_->config_snapshot.store(config_snapshot_, std::memory_order_release);
+  worker_shared_->coordinator = coordinator_;
+  worker_shared_->worker_count = config_snapshot_->config.workers;
+  worker_shared_->flow_control = flow_control_;
+  worker_shared_->lifetime_token = lifetime_token_;
+  const auto now = resilience::GlobalAdmission::Clock::now();
+  for (const config::Route &route : config_snapshot_->config.routes) {
+    admissions_.push_back(std::make_shared<resilience::GlobalAdmission>(route, now));
   }
+  worker_shared_->admissions = admissions_;
+  coordinator_->SetAdmissions(admissions_);
+  worker_shared_->metrics_renderer = [this] { return RenderMetrics(); };
+  worker_metrics_.resize(worker_shared_->worker_count);
+  client_counts_.resize(worker_shared_->worker_count);
+  for (std::size_t index = 0; index < worker_shared_->worker_count; ++index) {
+    worker_metrics_[index] = std::make_shared<observability::Metrics>();
+    client_counts_[index] = std::make_shared<std::atomic<std::uint64_t>>(0);
+  }
+  acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
 }
 
 Gateway::~Gateway() {
-  // Fixed shutdown order (R-040): invalidate the lifetime token first so any
-  // late callback sees the gateway as down, stop the health checkers (their
-  // timer cancellations still find a live TimerQueue), then terminate every
-  // in-flight upstream exchange so transactions release via RAII instead of
-  // waiting for an upstream EOF or timeout, then drop the clients.
+  // Fixed shutdown order (R-040 extended, R-062): invalidate the lifetime
+  // token first so any late callback sees the gateway as down; stop accepting;
+  // refuse every new outcome reservation (no attempt may start against a
+  // stopping channel); tear down each worker on its own thread (CancelAll and
+  // connection teardown release their outcome reservations via RAII); join
+  // them; only then drain the remaining published outcomes on the coordinator
+  // loop and stop the coordinator — a worker still publishing to a stopped
+  // coordinator would lose breaker accounting.
+  lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
-  state_->owner = nullptr;
-  health_checkers_.clear();
-  upstream_pool_->CancelAll();
-  clients_.clear();
+  acceptor_.reset();
+  coordinator_->BeginOutcomeStopping();
+  // Original-index teardown (R-057): worker_datas_[i] always corresponds to
+  // workers_->At(i), so a partially initialized set cannot misalign.
+  for (std::size_t index = 0; index < worker_datas_.size(); ++index) {
+    if (!worker_datas_[index]) continue;
+    auto &data = worker_datas_[index];
+    auto &worker = workers_->At(index);
+    // The destroy task must run on the worker thread (loop-attached objects);
+    // it captures `data` (a reference into this member vector, alive until the
+    // join below) and resets it when it runs.  R-063/R-067: the reserved
+    // shutdown slot is always accepted while the worker runs, so the destroy
+    // task is guaranteed to execute on its owner thread — a rejection means the
+    // worker is already gone, which is an explicit shutdown failure (abort),
+    // never a silent leak.
+    if (!worker.PostShutdown([&data](net::EventLoop &) mutable { data.reset(); })) {
+      (void)std::fprintf(stderr, "fatal: worker %zu destroy task not accepted\n", index);
+      std::terminate();
+    }
+  }
+  if (workers_) workers_->StopAll();
+  // The coordinator drains every published-but-undrained outcome on its own
+  // loop before stopping.
+  coordinator_->DrainOutcomesAndWait();
+  coordinator_->Stop();
+  // worker_datas_ entries are all empty: the destroy tasks ran on their workers.
 }
 
-void Gateway::Start() { acceptor_->Listen(); }
+void Gateway::Start() {
+  if (lifecycle_ != Lifecycle::kNotStarted) {
+    throw std::logic_error("gateway cannot be started twice");
+  }
+  lifecycle_ = Lifecycle::kStarting;
+  coordinator_->Start();
+  workers_ = std::make_unique<runtime::WorkerSet>(config_snapshot_->config.workers);
+  workers_->Start();
+  worker_datas_.resize(workers_->size());
+  for (std::size_t index = 0; index < workers_->size(); ++index) {
+    std::promise<void> ready;
+    auto future = ready.get_future();
+    auto &slot = worker_datas_[index];
+    auto &worker = workers_->At(index);
+    if (!worker.PostWithLoop([this, index, &slot, &ready](net::EventLoop &loop) {
+          try {
+            slot = std::make_shared<runtime::WorkerData>(
+                loop, worker_shared_, static_cast<std::uint32_t>(index), worker_metrics_[index],
+                client_counts_[index]);
+            ready.set_value();
+          } catch (...) {
+            ready.set_exception(std::current_exception());
+          }
+        })) {
+      throw std::logic_error("worker init task was not accepted");
+    }
+    future.get();
+  }
+  acceptor_->Listen();
+  lifecycle_ = Lifecycle::kRunning;
+}
 
 std::uint16_t Gateway::port() const { return acceptor_->port(); }
 
-std::size_t Gateway::ClientCount() const noexcept { return clients_.size(); }
+std::size_t Gateway::ClientCount() const noexcept {
+  std::size_t total = 0;
+  for (const auto &count : client_counts_) {
+    total += count->load(std::memory_order_acquire);
+  }
+  return total;
+}
 
-std::string Gateway::MetricsText() {
-  // Refresh the route x endpoint protection state, then render everything
-  // through Metrics so label escaping and exposition stay centralized.
-  // State refresh is best-effort: allocation failure in observability must
-  // never break serving /metrics.
-  try {
-    for (const config::Route &route : routes_.Config().routes) {
-    for (const config::Endpoint &endpoint : route.endpoints) {
-      const std::string upstream = endpoint.host + ":" + std::to_string(endpoint.port);
-      if (const resilience::CircuitBreaker *breaker = routes_.BreakerFor(route, endpoint)) {
-        const char *state = "closed";
-        switch (breaker->StateNow()) {
-        case resilience::CircuitBreaker::State::kOpen: state = "open"; break;
-        case resilience::CircuitBreaker::State::kHalfOpen: state = "half_open"; break;
-        case resilience::CircuitBreaker::State::kClosed: break;
-        }
-        metrics_->SetCircuitState(route.name, upstream, state);
-      }
-      if (const health::EndpointHealth *state = routes_.HealthFor(route, endpoint)) {
-        metrics_->SetUpstreamHealth(route.name, upstream, state->Healthy());
-      }
-    }
+std::string Gateway::MetricsText() { return RenderMetrics(); }
+
+bool Gateway::EndpointHealthy(std::size_t route_index,
+                              std::size_t endpoint_index) const noexcept {
+  const auto snapshot = coordinator_->CurrentSnapshot();
+  if (!snapshot) return true;
+  if (route_index >= snapshot->endpoints.size() ||
+      endpoint_index >= snapshot->endpoints[route_index].size()) {
+    return true;
   }
-  } catch (...) {
+  return snapshot->endpoints[route_index][endpoint_index].healthy;
+}
+
+resilience::CircuitBreaker::State
+Gateway::BreakerState(std::size_t route_index, std::size_t endpoint_index) const noexcept {
+  const auto snapshot = coordinator_->CurrentSnapshot();
+  if (!snapshot) return resilience::CircuitBreaker::State::kClosed;
+  if (route_index >= snapshot->endpoints.size() ||
+      endpoint_index >= snapshot->endpoints[route_index].size()) {
+    return resilience::CircuitBreaker::State::kClosed;
   }
-  return metrics_->RenderPrometheus();
+  return static_cast<resilience::CircuitBreaker::State>(
+      snapshot->endpoints[route_index][endpoint_index].breaker_state);
+}
+
+void Gateway::SubmitResultAndWait(std::size_t route_index, std::size_t endpoint_index,
+                                  bool success) {
+  const auto snapshot = coordinator_->CurrentSnapshot();
+  if (!snapshot || route_index >= snapshot->endpoints.size() ||
+      endpoint_index >= snapshot->endpoints[route_index].size()) {
+    return;
+  }
+  const std::uint64_t generation = snapshot->endpoints[route_index][endpoint_index].generation;
+  coordinator_->SubmitResultAndWait(
+      {route_index, endpoint_index, {false, generation, 0}, success});
 }
 
 void Gateway::Accept(int fd) {
-  // Acceptor closes fd if its callback throws.  Once a ClientConnection owns
-  // that fd, this method must instead consume every setup failure itself: map
-  // erasure destroys the sole owner and this normally-returning callback keeps
-  // Acceptor from closing a potentially reused descriptor a second time.
-  std::uint64_t identifier = 0;
-  bool inserted = false;
-  if (next_client_identifier_ == 0) {
+  // The handoff task owns the fd: once accepted by a worker it is registered
+  // there and never touched by this thread; on a rejected post the fd is
+  // closed here (the submitting side owns the failure).  The task runs on
+  // the target worker, which owns the WorkerData slot it reads.
+  if (!workers_ || worker_datas_.empty()) {
     (void)::close(fd);
     return;
   }
-  try {
-    identifier = next_client_identifier_++;
-    // The default 256/128 KiB hysteresis bounds every downstream write queue;
-    // per-route values will arrive with the M4 immutable config snapshot.
-    auto client = std::make_unique<net::ClientConnection>(
-        loop_, fd, [this](net::ClientConnection &connection, const http::HttpRequest &request) {
-          HandleRequest(connection, request);
-        }, flow_control_);
-    client->SetCloseCallback([&loop = loop_, state = std::weak_ptr<State>(state_), identifier] {
-      NotifyClientClosed(loop, state, identifier);
-    });
-    const auto result = clients_.emplace(identifier, std::move(client));
-    if (!result.second) throw std::logic_error("duplicate accepted client identifier");
-    inserted = true;
-    metrics_->SetActiveConnections(clients_.size());
-    result.first->second->Start();
-  } catch (...) {
-    if (inserted) clients_.erase(identifier);
-    metrics_->SetActiveConnections(clients_.size());
-  }
-}
-
-void Gateway::HandleRequest(net::ClientConnection &client, const http::HttpRequest &request) {
-  if (request.method == "GET" && request.target == "/metrics") {
-    client.SendResponse(http::HttpResponse{200, "OK", {{"Content-Type", "text/plain; version=0.0.4; charset=utf-8"}},
-                                           MetricsText()});
-    return;
-  }
-  const config::Route *route = routes_.Match(request.Header("host"), request.target);
-  if (route == nullptr) {
-    try { metrics_->RecordImmediate("_unmatched", 404); } catch (...) {}
-    client.SendResponse(http::HttpResponse{404, "Not Found", {}, ""});
-    return;
-  }
-  proxy::UpstreamPolicy policy;
-  policy.connect_timeout = std::chrono::milliseconds(route->connect_timeout_ms);
-  policy.first_byte_timeout = std::chrono::milliseconds(route->first_byte_timeout_ms);
-  policy.total_timeout = std::chrono::milliseconds(route->total_timeout_ms);
-  policy.retry_budget = route->retry_budget;
-  // The provider chooses the endpoint for the initial attempt and every retry
-  // (eligible means healthy and not refused by its breaker) and issues the
-  // attempt permit plus its active slot; no candidate ever connects.
-  proxy::ProxyTransaction::AttemptProvider provider;
-  if (route->balance == config::BalancePolicy::kLeastActive) {
-    // Two-pass minimum-active scan in the route's weighted rotation order;
-    // tried holds table-owned endpoint indexes.  A defensively rejected
-    // permit joins tried and the selection is recomputed (unreachable after
-    // Eligible(), kept for future wiring changes).
-    provider = [this, route, tried = std::set<std::size_t>{}]() mutable
-        -> std::optional<proxy::ProxyTransaction::AttemptSelection> {
-      for (;;) {
-        const auto index = routes_.NextLeastActiveIndex(*route, tried);
-        if (!index) return std::nullopt;
-        tried.insert(*index);
-        const config::Endpoint &candidate = route->endpoints[*index];
-        std::optional<proxy::ProxyTransaction::BreakerLink> link;
-        if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, candidate)) {
-          link = proxy::ProxyTransaction::BreakerLink{
-              breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
-          if (link->permit.selection ==
-                  resilience::CircuitBreaker::Selection::kRejectedOpen ||
-              link->permit.selection ==
-                  resilience::CircuitBreaker::Selection::kRejectedHalfOpenQuota) {
-            continue;
-          }
-        }
-        return proxy::ProxyTransaction::AttemptSelection{
-            &candidate, std::move(link), routes_.AcquireActive(*route, candidate)};
-      }
-    };
-  } else {
-    // Weighted rotation scan; tried tracks table-owned endpoint indexes so a
-    // repeated weighted choice cannot loop and the identity never depends on
-    // the selector's internal copies (R-041).
-    provider = [this, route, tried = std::set<std::size_t>{}]() mutable
-        -> std::optional<proxy::ProxyTransaction::AttemptSelection> {
-      for (std::size_t attempts = 0; attempts < route->endpoints.size(); ++attempts) {
-        const auto index = routes_.NextWeightedIndex(*route);
-        if (!index || !tried.insert(*index).second) continue;
-        const config::Endpoint &candidate = route->endpoints[*index];
-        if (!routes_.Eligible(*route, candidate)) continue;
-        std::optional<proxy::ProxyTransaction::BreakerLink> link;
-        if (resilience::CircuitBreaker *breaker = routes_.BreakerFor(*route, candidate)) {
-          link = proxy::ProxyTransaction::BreakerLink{
-              breaker, breaker->Select(resilience::CircuitBreaker::Clock::now())};
-          // Defensive: a rejected permit never starts an attempt, so it also
-          // never takes an active slot.  The Eligible() pre-filter makes
-          // this unreachable in the single-loop design.
-          if (link->permit.selection == resilience::CircuitBreaker::Selection::kRejectedOpen ||
-              link->permit.selection ==
-                  resilience::CircuitBreaker::Selection::kRejectedHalfOpenQuota) {
-            continue;
-          }
-        }
-        return proxy::ProxyTransaction::AttemptSelection{
-            &candidate, std::move(link), routes_.AcquireActive(*route, candidate)};
-      }
-      return std::nullopt;
-    };
-  }
-  (void)proxy::ProxyTransaction::Start(
-      loop_, client, route->endpoints.front(), request, upstream_pool_,
-      routes_.AdmissionFor(*route), timers_.get(), std::move(policy), metrics_, route->name,
-      std::move(provider), std::weak_ptr<void>(lifetime_token_));
-}
-
-void Gateway::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,
-                                 std::uint64_t identifier) {
-  const auto state = weak_state.lock();
-  if (!state || state->owner == nullptr) return;
-  state->closed_clients.push_back(identifier);
-  if (state->cleanup_scheduled) return;
-  loop.QueueAfterCurrentBatch([state] {
-    state->cleanup_scheduled = false;
-    if (state->owner == nullptr) return;
-    auto identifiers = std::move(state->closed_clients);
-    state->closed_clients.clear();
-    state->owner->ReapClosedClients(std::move(identifiers));
+  const runtime::WorkerSet::WorkerHandle handle = workers_->Next();
+  // R-056: on success the handler adopts the move-only FdOwner; on rejection
+  // PostFd closes it, so the gateway never closes it twice.
+  (void)handle.worker.PostFd(fd, [this, worker_index = handle.index](net::FdOwner fd) {
+    auto &slot = worker_datas_[worker_index];
+    if (slot) {
+      slot->Accept(std::move(fd));
+    }
+    // If the slot is gone (worker tearing down), the FdOwner closes the
+    // descriptor on destruction.
   });
-  state->cleanup_scheduled = true;
 }
 
-void Gateway::ReapClosedClients(std::vector<std::uint64_t> identifiers) {
-  for (const std::uint64_t identifier : identifiers) clients_.erase(identifier);
-  metrics_->SetActiveConnections(clients_.size());
+std::string Gateway::RenderMetrics() const {
+  // Take the coordinator protection snapshot before the worker counters so the
+  // protection gauges and the counters are observed in one consistent order
+  // (R-059).
+  const auto snapshot = coordinator_->CurrentSnapshot();
+  observability::Metrics::Data aggregate;
+  for (const auto &metrics : worker_metrics_) {
+    observability::Metrics::MergeInto(aggregate, metrics->Snapshot());
+  }
+  std::vector<observability::Metrics::ProtectionSample> protection;
+  if (snapshot) {
+    // Iterate the config snapshot (the same boundary workers and the
+    // coordinator use), never the table's own copy (R-060).
+    const std::vector<config::Route> &routes = config_snapshot_->config.routes;
+    for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
+      if (!routes[route_index].circuit_breaker.has_value() &&
+          !routes[route_index].health_check.has_value()) {
+        continue;
+      }
+      if (route_index >= snapshot->endpoints.size()) continue;
+      for (std::size_t endpoint_index = 0; endpoint_index < routes[route_index].endpoints.size();
+           ++endpoint_index) {
+        if (endpoint_index >= snapshot->endpoints[route_index].size()) continue;
+        const health::EndpointDecision &decision = snapshot->endpoints[route_index][endpoint_index];
+        observability::Metrics::ProtectionSample sample;
+        sample.route = routes[route_index].name;
+        const config::Endpoint &endpoint = routes[route_index].endpoints[endpoint_index];
+        sample.upstream = endpoint.host + ":" + std::to_string(endpoint.port);
+        switch (decision.breaker_state) {
+        case 1: sample.state = "open"; break;
+        case 2: sample.state = "half_open"; break;
+        default: sample.state = "closed"; break;
+        }
+        sample.healthy = decision.healthy;
+        protection.push_back(std::move(sample));
+      }
+    }
+  }
+  return observability::Metrics::RenderPrometheus(aggregate, protection);
 }
 
 } // namespace aegisgate::gateway

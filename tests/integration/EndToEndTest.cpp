@@ -3,6 +3,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -17,6 +18,7 @@
 
 #include "aegisgate/config/Config.h"
 #include "aegisgate/gateway/Gateway.h"
+#include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/mock/MockBackend.h"
 
 #include "../support/WakeFd.h"
@@ -80,6 +82,18 @@ std::string ReadUntil(int fd, std::string_view needle, Deadline deadline, std::s
     return {};
   }
   return result;
+}
+
+// The coordinator processes breaker results asynchronously on its own loop:
+// a snapshot-state poll is the deterministic barrier the client side needs
+// before it may rely on the breaker being open (or closed again).
+bool WaitForBreakerState(const gateway::Gateway &gateway, std::size_t route_index,
+                         std::size_t endpoint_index,
+                         resilience::CircuitBreaker::State wanted, Deadline deadline) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (gateway.BreakerState(route_index, endpoint_index) == wanted) return true;
+  }
+  return false;
 }
 
 class BackendRunner {
@@ -253,7 +267,7 @@ void RunGateway(config::Config config, Client client,
   wake_channel.EnableReading();
   gateway::Gateway gateway(loop, std::move(config), "127.0.0.1", 0, flow_control);
   gateway.Start();
-  std::thread client_thread([&] { client(gateway.port(), wake[1]); });
+  std::thread client_thread([&] { client(gateway, gateway.port(), wake[1]); });
   loop.Loop();
   client_thread.join();
   wake_channel.Remove();
@@ -272,7 +286,7 @@ TEST(EndToEndTest, ForwardsNormalAnd5xxMockResultsAndExportsMetrics) {
   std::string metrics;
   RunGateway(config::Config{{Route("normal", "normal.e2e.test", Endpoint(normal.port())),
                              Route("fault", "fault.e2e.test", Endpoint(fault.port()))}},
-             [&](std::uint16_t port, int wake) {
+             [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view normal_request = "GET / HTTP/1.1\r\nHost: normal.e2e.test\r\n\r\n";
     constexpr std::string_view normal_expected = "HTTP/1.1 200 Mock Response\r\nContent-Length: 0\r\n\r\n";
@@ -305,7 +319,7 @@ TEST(EndToEndTest, MapsResetAndDelayedMocksTo502And504) {
   std::string delayed_response;
   RunGateway(config::Config{{Route("reset", "reset.e2e.test", Endpoint(reset.port())),
                              Route("delayed", "delayed.e2e.test", Endpoint(delayed.port()), 100, 100, 8, 50)}},
-             [&](std::uint16_t port, int wake) {
+             [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view reset_request = "GET / HTTP/1.1\r\nHost: reset.e2e.test\r\n\r\n";
     constexpr std::string_view delayed_request = "GET / HTTP/1.1\r\nHost: delayed.e2e.test\r\n\r\n";
@@ -335,7 +349,7 @@ TEST(EndToEndTest, EnforcesRateAndInflightAdmissionAgainstRealMocks) {
   std::string inflight_second;
   RunGateway(config::Config{{Route("rate", "rate.e2e.test", Endpoint(fast.port()), 1, 1, 8),
                              Route("inflight", "inflight.e2e.test", Endpoint(slow.port()), 100, 100, 1, 800)}},
-             [&](std::uint16_t port, int wake) {
+             [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket rate = net::Socket::ConnectLoopback(port);
     constexpr std::string_view rate_request = "GET / HTTP/1.1\r\nHost: rate.e2e.test\r\n\r\n";
     constexpr std::string_view ok = "HTTP/1.1 200 Mock Response\r\nContent-Length: 0\r\n\r\n";
@@ -373,7 +387,7 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
   std::string error;
   std::string metrics;
   std::string recovered_metrics;
-  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &gateway, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: guarded.e2e.test\r\n\r\n";
     constexpr std::string_view upstream_fail = "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n";
@@ -386,6 +400,17 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
           if (error.empty()) error = "expected upstream 503";
         }
       }
+    }
+    // The coordinator processes the two failures asynchronously: request 3
+    // must not race it (it would connect while the snapshot still says
+    // closed and consume the backend's 200).  The snapshot-state poll is the
+    // deterministic barrier before the request and before the metrics read.
+    // The route pointer must come from the gateway's own config copy
+    // (RouteIndexOf matches by pointer identity).
+    const std::optional<std::size_t> matched = gateway.Routes().Match("guarded.e2e.test", "/");
+    if (!WaitForBreakerState(gateway, *matched, 0,
+                             resilience::CircuitBreaker::State::kOpen, TestDeadline())) {
+      error = "breaker did not open in time";
     }
     // Open: the gateway answers 503 without connecting.
     if (error.empty() && WriteAll(client.Fd(), request, TestDeadline(), error)) {
@@ -402,6 +427,7 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
                                   TestDeadline(), error)) {
       metrics = ReadUntil(client.Fd(), circuit_needle, TestDeadline(), error);
     }
+
     // Poll until the open window elapses and the probe passes (backend 200);
     // keep retrying past transient 503 answers until the deadline.  A fresh
     // connection per attempt keeps the byte streams aligned.
@@ -419,11 +445,20 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    // The probe closed the breaker; the metrics now show closed, and the
-    // 503 reason label is still recorded.
+    // The probe closed the breaker asynchronously on the coordinator loop:
+    // the snapshot-state poll is the barrier before the recovered metrics
+    // read renders the closed gauge.
+    if (error.empty() &&
+        !WaitForBreakerState(gateway, *matched, 0,
+                             resilience::CircuitBreaker::State::kClosed, TestDeadline())) {
+      error = "breaker did not close after the probe";
+    }
+    const std::string closed_needle = "aegisgate_circuit_state{route=\"guarded\",upstream=\"127.0.0.1:" +
+                                      std::to_string(backend.port()) +
+                                      "\",state=\"closed\"} 1\n";
     if (error.empty() && WriteAll(client.Fd(), "GET /metrics HTTP/1.1\r\nHost: ignored.test\r\n\r\n",
                                   TestDeadline(), error)) {
-      recovered_metrics = ReadUntil(client.Fd(), "aegisgate_inflight_requests 0\n", TestDeadline(), error);
+      recovered_metrics = ReadUntil(client.Fd(), closed_needle, TestDeadline(), error);
     }
     if (::write(wake, "q", 1) != 1 && error.empty()) error = "wake failed";
   });
@@ -433,7 +468,10 @@ TEST(EndToEndTest, CircuitBreakerOpensAndRecovers) {
   EXPECT_NE(metrics.find("aegisgate_circuit_state{route=\"guarded\",upstream=\"127.0.0.1:" +
                          std::to_string(backend.port()) + "\",state=\"open\"} 1\n"),
             std::string::npos);
-  EXPECT_NE(metrics.find("aegisgate_requests_total{route=\"guarded\",status=\"503\",upstream=\"\",reason=\"no_healthy_endpoint\"} 1\n"),
+  // The 503-no-connect counter accrued both from request 3 and from the
+  // recovery loop's probes while the breaker was still open, so only the
+  // label prefix (not an exact count) is asserted on the recovered metrics.
+  EXPECT_NE(recovered_metrics.find("aegisgate_requests_total{route=\"guarded\",status=\"503\",upstream=\"\",reason=\"no_healthy_endpoint\"} "),
             std::string::npos);
   EXPECT_NE(recovered_metrics.find("aegisgate_circuit_state{route=\"guarded\",upstream=\"127.0.0.1:" +
                                    std::to_string(backend.port()) + "\",state=\"closed\"} 1\n"),
@@ -449,19 +487,29 @@ TEST(EndToEndTest, AllEndpointsUnavailableServesUnique503WithInflightZero) {
   std::string error;
   std::string metrics;
   std::string recovered_metrics;
-  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &gateway, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
+    const std::optional<std::size_t> matched = gateway.Routes().Match("guarded.e2e.test", "/");
+    if (error.empty() && !matched.has_value()) error = "route not matched";
     constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: guarded.e2e.test\r\n\r\n";
     constexpr std::string_view upstream_fail = "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n";
     constexpr std::string_view gateway_fail = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
     // One failing request opens the breaker (min_requests=1).
-    if (WriteAll(client.Fd(), request, TestDeadline(), error)) {
+    if (error.empty() && WriteAll(client.Fd(), request, TestDeadline(), error)) {
       if (ReadExact(client.Fd(), upstream_fail.size(), TestDeadline(), error) != upstream_fail) {
         if (error.empty()) error = "expected upstream 503";
       }
     }
     if (!error.empty() && error == "unexpected EOF or read error") {
       error += " (first response)";
+    }
+    // Deterministic barrier: the coordinator processes the first failure on its
+    // own loop asynchronously, so the client waits for the breaker to open
+    // before the second request relies on the open state (no timing guess).
+    if (error.empty() &&
+        !WaitForBreakerState(gateway, *matched, 0,
+                             resilience::CircuitBreaker::State::kOpen, TestDeadline())) {
+      error = "breaker did not open after the failing request";
     }
     // Open: the gateway answers 503 without connecting or retrying.
     if (error.empty() && WriteAll(client.Fd(), request, TestDeadline(), error)) {
@@ -505,7 +553,7 @@ TEST(EndToEndTest, LeastActiveSelectsBackendWithFewestInFlight) {
   std::string fast_response;
   std::string third_response;
   std::string metrics;
-  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &, std::uint16_t port, int wake) {
     constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: least.e2e.test\r\n\r\n";
     constexpr std::string_view slow_expected =
         "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n";
@@ -554,7 +602,7 @@ TEST(EndToEndTest, ConnectionCloseRequestClosesAfterStreamingResponse) {
   std::string error;
   std::string received;
   RunGateway(config::Config{{Route("close", "close.e2e.test", Endpoint(backend.port()))}},
-             [&](std::uint16_t port, int wake) {
+             [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view request =
         "GET / HTTP/1.1\r\nHost: close.e2e.test\r\nConnection: close\r\n\r\n";
@@ -628,7 +676,7 @@ TEST(EndToEndTest, StreamsLargeResponseUnderSlowClient) {
   // A small hysteresis makes the pause deterministic: the 128 KiB response
   // far exceeds the 8 KiB high watermark once the kernel send queue (64 KiB)
   // is saturated by the not-reading client.
-  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view request = "GET /slow HTTP/1.1\r\nHost: slow.e2e.test\r\n\r\n";
     if (!WriteAll(client.Fd(), request, TestDeadline(), error)) {
@@ -718,7 +766,7 @@ TEST(EndToEndTest, CommittedBodyFailureDoesNotRetry) {
   route.retry_budget = 1;
   std::string error;
   std::string received;
-  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view inbound = "GET /fail HTTP/1.1\r\nHost: fail.e2e.test\r\n\r\n";
     constexpr std::string_view committed = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\npart";
@@ -768,7 +816,10 @@ TEST(EndToEndTest, ClientDisconnectStopsUpstreamRead) {
     std::size_t written = 0;
     while (backend_error.empty() && written < kBodySize) {
       const std::size_t want = std::min(chunk.size(), kBodySize - written);
-      const ssize_t count = ::write(fd, chunk.data(), want);
+      // MSG_NOSIGNAL: the gateway cancels this upstream while the blocking
+      // write may still be in flight; EPIPE must not kill the test process
+      // (d2b80d2 fixed the same pattern in ProxyTransactionTest).
+      const ssize_t count = ::send(fd, chunk.data(), want, MSG_NOSIGNAL);
       if (count > 0) {
         written += static_cast<std::size_t>(count);
         continue;
@@ -794,7 +845,7 @@ TEST(EndToEndTest, ClientDisconnectStopsUpstreamRead) {
                       {Endpoint(listener.BoundPort())}, 100, 100, 8};
   route.total_timeout_ms = 5000;
   std::string error;
-  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view inbound = "GET /disconnect HTTP/1.1\r\nHost: disconnect.e2e.test\r\n\r\n";
     if (!WriteAll(client.Fd(), inbound, TestDeadline(), error)) {
@@ -860,7 +911,7 @@ TEST(EndToEndTest, UpstreamReuseIsIndependentOfDownstreamDrain) {
   std::string error;
   std::string first_wire;
   std::string second_wire;
-  RunGateway(config::Config{{route}}, [&](std::uint16_t port, int wake) {
+  RunGateway(config::Config{{route}}, [&](gateway::Gateway &, std::uint16_t port, int wake) {
     net::Socket first_client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view inbound = "GET /reuse HTTP/1.1\r\nHost: reuse.e2e.test\r\n\r\n";
     if (!WriteAll(first_client.Fd(), inbound, TestDeadline(), error)) {
