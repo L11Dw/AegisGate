@@ -45,21 +45,24 @@ void WorkerRuntime::Stop() noexcept {
   // wake descriptor is left to Run() so the loop never epolls a closed fd.
   const bool on_owner = std::this_thread::get_id() == owner_thread_.load(std::memory_order_acquire);
   {
+    // The final wake write is serialized with Run()'s exchange+close under the
+    // queue mutex (TSAN): a concurrent write and close of the same descriptor
+    // would otherwise race the fd number.
     std::lock_guard<std::mutex> guard(queue_mutex_);
     stopping_.store(true, std::memory_order_relaxed);
-  }
-  // Final wake: a worker parked in epoll_wait must observe the stop without
-  // waiting for another producer.  EINTR is retried; EAGAIN/EWOULDBLOCK means
-  // a wake is already pending; any other error is harmless because the queue
-  // state was frozen under the mutex above.
-  const int fd = wake_fd_.load(std::memory_order_relaxed);
-  if (fd >= 0) {
-    const std::uint64_t counter = 1;
-    for (;;) {
-      const ssize_t count = ::write(fd, &counter, sizeof(counter));
-      if (count == static_cast<ssize_t>(sizeof(counter))) break;
-      if (count < 0 && errno == EINTR) continue;
-      break;
+    // Final wake: a worker parked in epoll_wait must observe the stop without
+    // waiting for another producer.  EINTR is retried; EAGAIN/EWOULDBLOCK means
+    // a wake is already pending; any other error is harmless because the queue
+    // state was frozen under the mutex.
+    const int fd = wake_fd_.load(std::memory_order_relaxed);
+    if (fd >= 0) {
+      const std::uint64_t counter = 1;
+      for (;;) {
+        const ssize_t count = ::write(fd, &counter, sizeof(counter));
+        if (count == static_cast<ssize_t>(sizeof(counter))) break;
+        if (count < 0 && errno == EINTR) continue;
+        break;
+      }
     }
   }
   if (on_owner) return;
@@ -150,9 +153,15 @@ void WorkerRuntime::Run() {
   wake.EnableReading();
   loop.Loop();
   // Unregister before closing so the Channel destructor never touches the
-  // EventLoop with a closed descriptor (R-003).
+  // EventLoop with a closed descriptor (R-003).  The exchange is serialized
+  // with Stop()'s final wake write under the queue mutex (TSAN): once the
+  // descriptor is -1 here, no concurrent Stop can still write it.
   wake.Remove();
-  const int closed = wake_fd_.exchange(-1, std::memory_order_relaxed);
+  int closed = -1;
+  {
+    std::lock_guard<std::mutex> guard(queue_mutex_);
+    closed = wake_fd_.exchange(-1, std::memory_order_relaxed);
+  }
   if (closed >= 0) (void)::close(closed);
 }
 
