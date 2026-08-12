@@ -36,6 +36,9 @@ struct EndpointProtectionSnapshot {
   EndpointIdentity endpoint;
   EndpointHealthSnapshot health;
   std::optional<resilience::CircuitBreakerSnapshot> breaker;  // nullopt = no breaker config
+  // Source policy for equivalence comparison during import.
+  std::optional<config::HealthCheckSettings> source_health_policy;
+  std::optional<config::CircuitBreakerSettings> source_breaker_policy;
 };
 
 // Full protection snapshot for migration.

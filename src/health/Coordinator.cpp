@@ -88,7 +88,16 @@ void Coordinator::OnPreparedLoopInit(net::EventLoop &loop) {
   auto data = std::make_unique<LoopData>();
   data->timers = std::make_unique<net::TimerQueue>(loop);
   data->arm_timers.resize(config_->routes.size());
-  // Register outcome channel wake descriptors only; no health checkers,
+  // P1 #4: For reload candidates, health_check endpoints start as kUnknown.
+  // They will become kHealthy/kUnhealthy after Activate() runs the checkers.
+  for (std::size_t r = 0; r < config_->routes.size(); ++r) {
+    if (config_->routes[r].health_check.has_value()) {
+      for (std::size_t e = 0; e < config_->routes[r].endpoints.size(); ++e) {
+        state_->ImportHealthState(r, e, HealthState::kUnknown);
+      }
+    }
+  }
+  // Register outcome channel wake descriptors; no health checkers,
   // no admission refill started.
   for (std::size_t route = 0; route < outcome_channels_.size(); ++route) {
     OutcomeChannel *channel = outcome_channels_[route].get();
@@ -129,17 +138,15 @@ bool Coordinator::ImportProtectionSnapshotAndWait(
         if (completion->cancelled) return;
         try {
           const auto now = Clock::now();
-          // Import by identity matching.
+          // Import by identity + source policy matching (P1 #1).
           for (const auto &ep : snap.endpoints) {
             for (std::size_t r = 0; r < config_->routes.size(); ++r) {
               const auto &route = config_->routes[r];
               RouteIdentity rid{route.name, route.host, route.path_prefix};
               if (!SameRouteIdentity(rid, ep.route)) continue;
-              // Check policy equivalence.
-              if (!SameHealthPolicy(route.health_check,
-                                    config_->routes[r].health_check)) continue;
-              if (!SameBreakerPolicy(route.circuit_breaker,
-                                     config_->routes[r].circuit_breaker)) continue;
+              // Compare source policy (from snapshot) with target policy (new config).
+              if (!SameHealthPolicy(ep.source_health_policy, route.health_check)) continue;
+              if (!SameBreakerPolicy(ep.source_breaker_policy, route.circuit_breaker)) continue;
               for (std::size_t e = 0; e < route.endpoints.size(); ++e) {
                 const auto &endpoint = route.endpoints[e];
                 EndpointIdentity eid{endpoint.host, endpoint.address, endpoint.port};
@@ -149,6 +156,10 @@ bool Coordinator::ImportProtectionSnapshotAndWait(
                 // Import breaker state (P1 #2: real breaker migration).
                 if (ep.breaker.has_value()) {
                   state_->ImportBreakerSnapshot(r, e, *ep.breaker, now);
+                }
+                // Schedule arm timer for imported Open breakers (P1 #2).
+                if (state_->IsOpen(r, e)) {
+                  ScheduleArm(r, e);
                 }
               }
             }

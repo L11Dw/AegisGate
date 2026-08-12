@@ -54,26 +54,49 @@ void CoordinatorState::ImportBreakerSnapshot(std::size_t route, std::size_t endp
   auto &breaker = endpoints_[route][endpoint].breaker;
   if (!breaker) return;  // no breaker configured for this endpoint
   breaker->ImportSnapshot(snap, now);
-  // If import resulted in HalfOpen, set up probe slots.
+  // If import resulted in HalfOpen, create a fresh cycle.
   if (breaker->StateNow() == resilience::CircuitBreaker::State::kHalfOpen) {
-    const auto &settings = config_->routes[route].circuit_breaker;
-    if (settings) {
-      auto slots = std::make_shared<ProbeSlotState>();
-      slots->remaining.store(settings->half_open_probes, std::memory_order_release);
-      slots->issued.store(0, std::memory_order_relaxed);
-      // Issue probes to get probe_base.
-      std::uint64_t base = 0;
-      for (std::uint32_t i = 0; i < settings->half_open_probes; ++i) {
-        const auto permit = breaker->Select(now);
-        if (i == 0) base = permit.probe_id;
-      }
-      slots->probe_base = base;
-      slots->generation = breaker->Generation();
-      slots->quota = settings->half_open_probes;
-      endpoints_[route][endpoint].probe_slots.store(std::move(slots),
-                                                     std::memory_order_release);
-    }
+    CreateFreshHalfOpenCycle(route, endpoint, now);
   }
+}
+
+void CoordinatorState::CreateFreshHalfOpenCycle(std::size_t route, std::size_t endpoint,
+                                                 Clock::time_point now) {
+  if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) return;
+  auto &state = endpoints_[route][endpoint];
+  auto *breaker = state.breaker.get();
+  if (!breaker) return;
+  const auto &settings = config_->routes[route].circuit_breaker;
+  if (!settings) return;
+
+  // Transition to HalfOpen if not already there.  The first Select() both
+  // transitions the state and issues the first probe (half_open_issued_ = 1).
+  // Record the first probe_id as base.
+  std::uint64_t base = 0;
+  if (breaker->StateNow() != resilience::CircuitBreaker::State::kHalfOpen) {
+    const auto first = breaker->Select(now);
+    base = first.probe_id;
+  } else {
+    // Already HalfOpen (e.g. from ImportSnapshot).  Issue one probe to get base.
+    const auto first = breaker->Select(now);
+    base = first.probe_id;
+  }
+
+  // Issue the remaining quota - 1 probes.  After the transition above,
+  // half_open_issued_ = 1.  Each Select() increments it by 1.
+  for (std::uint32_t i = 1; i < settings->half_open_probes; ++i) {
+    (void)breaker->Select(now);
+  }
+
+  // Create ProbeSlotState with probe_base and ids matching breaker's
+  // pending_probes_ exactly.
+  auto slots = std::make_shared<ProbeSlotState>();
+  slots->remaining.store(settings->half_open_probes, std::memory_order_release);
+  slots->issued.store(0, std::memory_order_relaxed);
+  slots->probe_base = base;
+  slots->generation = breaker->Generation();
+  slots->quota = settings->half_open_probes;
+  state.probe_slots.store(std::move(slots), std::memory_order_release);
 }
 
 ProtectionSnapshot CoordinatorState::ExportProtectionSnapshot() {
@@ -90,6 +113,9 @@ ProtectionSnapshot CoordinatorState::ExportProtectionSnapshot() {
       ep.endpoint = eid;
       // Export real HealthState (P1 #4).
       ep.health.state = endpoints_[r][e].health.State();
+      // Export source policy for equivalence comparison (P1 #1).
+      ep.source_health_policy = route.health_check;
+      ep.source_breaker_policy = route.circuit_breaker;
       // Export real breaker snapshot (P1 #2).
       if (endpoints_[r][e].breaker) {
         ep.breaker = endpoints_[r][e].breaker->ExportSnapshot(now);
@@ -125,24 +151,7 @@ void CoordinatorState::ArmHalfOpen(std::size_t route, std::size_t endpoint, Cloc
     return;
   }
   if (now < breaker->OpenUntil()) return;
-  const config::CircuitBreakerSettings &settings = *config_->routes[route].circuit_breaker;
-  // The first Select() transitions Open -> HalfOpen; the remaining calls
-  // pre-issue the rest of the quota so pending_probes_ can validate every
-  // worker probe id exactly once (ids are consecutive from the first issue).
-  std::uint64_t base = 0;
-  for (std::uint32_t index = 0; index != settings.half_open_probes; ++index) {
-    const auto permit = breaker->Select(now);
-    if (index == 0) base = permit.probe_id;
-  }
-  // Publish a fresh per-cycle slot object: workers claim from the object their
-  // snapshot holds, so a permit is always consistent with that snapshot.
-  auto slots = std::make_shared<ProbeSlotState>();
-  slots->remaining.store(settings.half_open_probes, std::memory_order_release);
-  slots->issued.store(0, std::memory_order_relaxed);
-  slots->probe_base = base;
-  slots->generation = breaker->Generation();
-  slots->quota = settings.half_open_probes;
-  state.probe_slots.store(std::move(slots), std::memory_order_release);
+  CreateFreshHalfOpenCycle(route, endpoint, now);
 }
 
 std::shared_ptr<const HealthCircuitSnapshot> CoordinatorState::BuildSnapshot() {
