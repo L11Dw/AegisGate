@@ -461,7 +461,14 @@ std::string Gateway::RenderMetrics() const {
       }
     }
   }
-  return observability::Metrics::RenderPrometheus(aggregate, protection);
+  auto result = observability::Metrics::RenderPrometheus(aggregate, protection);
+  // Append logger stats if available.
+  if (logger_) {
+    result += "aegisgate_log_dropped_total " + std::to_string(logger_->dropped_total()) + "\n";
+    result += "aegisgate_log_io_dropped_total " + std::to_string(logger_->io_dropped_total()) + "\n";
+    result += "aegisgate_log_critical_overflow_total " + std::to_string(logger_->critical_overflow()) + "\n";
+  }
+  return result;
 }
 
 } // namespace aegisgate::gateway

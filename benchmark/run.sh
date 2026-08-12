@@ -318,12 +318,24 @@ read -r rps_mean rps_stddev <<< "$RPS_SUMMARY"
 read -r p50_mean p50_stddev <<< "$P50_SUMMARY"
 read -r p99_mean p99_stddev <<< "$P99_SUMMARY"
 
-# Read logger stats from the log file line count.
+# Read logger stats from the metrics endpoint.
 LOG_LINES=0
 if [ -f "$BENCH_LOG_PATH" ]; then
   LOG_LINES=$(wc -l < "$BENCH_LOG_PATH" 2>/dev/null || echo "0")
 fi
 DROPPED_COUNT=0
+IO_DROPPED=0
+CRITICAL_OVERFLOW=0
+METRICS=$(curl -s --noproxy '*' "http://127.0.0.1:$GATEWAY_PORT/metrics" 2>/dev/null || echo "")
+if echo "$METRICS" | grep -q "aegisgate_log_dropped_total"; then
+  DROPPED_COUNT=$(echo "$METRICS" | grep "aegisgate_log_dropped_total" | awk '{print $2}' || echo "0")
+fi
+if echo "$METRICS" | grep -q "aegisgate_log_io_dropped_total"; then
+  IO_DROPPED=$(echo "$METRICS" | grep "aegisgate_log_io_dropped_total" | awk '{print $2}' || echo "0")
+fi
+if echo "$METRICS" | grep -q "aegisgate_log_critical_overflow_total"; then
+  CRITICAL_OVERFLOW=$(echo "$METRICS" | grep "aegisgate_log_critical_overflow_total" | awk '{print $2}' || echo "0")
+fi
 
 cat > "$RESULT_FILE" <<EOF
 {
@@ -343,7 +355,9 @@ cat > "$RESULT_FILE" <<EOF
     "p99_us_stddev": $p99_stddev
   },
   "log_lines_written": $LOG_LINES,
-  "log_dropped_count": $DROPPED_COUNT,
+  "log_dropped_total": $DROPPED_COUNT,
+  "log_io_dropped_total": $IO_DROPPED,
+  "log_critical_overflow_total": $CRITICAL_OVERFLOW,
   "scenario_details": {
     "reload_count": $RELOAD_COUNT
   },
