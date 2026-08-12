@@ -61,6 +61,9 @@ Gateway::~Gateway() {
   acceptor_.reset();
   const auto generation = CurrentGeneration();
   if (generation) generation->coordinator()->BeginOutcomeStopping();
+  // Give already-retired generations a chance to schedule their worker-local
+  // lease returns while workers still own their EventLoops.
+  HandleGenerationEvents();
   // Original-index teardown (R-057): worker_datas_[i] always corresponds to
   // workers_->At(i), so a partially initialized set cannot misalign.
   for (std::size_t index = 0; index < worker_datas_.size(); ++index) {
@@ -80,6 +83,11 @@ Gateway::~Gateway() {
     }
   }
   if (workers_) workers_->StopAll();
+  workers_stopped_ = true;
+  // Worker shutdown can release the final request lease.  At this point it is
+  // safe to start any pending old-generation reaper directly: balances were
+  // returned by WorkerData::Shutdown and no worker owner APIs remain needed.
+  HandleGenerationEvents();
   // The coordinator drains every published-but-undrained outcome on its own
   // loop before stopping.
   if (generation) {
@@ -92,6 +100,31 @@ Gateway::~Gateway() {
   generation_mailbox_channel_.reset();
   generation_mailbox_->Close();
   // worker_datas_ entries are all empty: the destroy tasks ran on their workers.
+}
+
+bool Gateway::RequestReload(config::Config candidate) {
+  if (!loop_.IsOwnerThread() || lifecycle_ != Lifecycle::kRunning) return false;
+  const auto previous = CurrentGeneration();
+  if (!previous || candidate.workers != previous->snapshot()->config.workers) return false;
+
+  runtime::RuntimeGenerationRef replacement;
+  try {
+    replacement = std::make_shared<runtime::RuntimeGeneration>(previous->version() + 1,
+                                                                std::move(candidate));
+    replacement->coordinator()->Start();
+  } catch (...) {
+    // Nothing was published, so every old runtime object remains untouched.
+    return false;
+  }
+
+  // Publish only after every resource belonging to the candidate exists and
+  // its coordinator loop is running.  All worker request paths load this one
+  // pointer once; retries retain the old pointer through ProxyTransaction.
+  routes_ = routing::RouteTable(replacement->snapshot()->config);
+  current_generation_.store(replacement, std::memory_order_release);
+  worker_shared_->current_generation.store(replacement, std::memory_order_release);
+  RetireGeneration(previous);
+  return true;
 }
 
 void Gateway::RetireGeneration(runtime::RuntimeGenerationRef generation) {
@@ -137,7 +170,7 @@ void Gateway::HandleGenerationEvents() {
 }
 
 void Gateway::RequestWorkerBalanceReturn(const runtime::RuntimeGenerationRef &generation) {
-  if (worker_datas_.empty()) {
+  if (workers_stopped_ || worker_datas_.empty()) {
     StartRetirementReaper(generation);
     return;
   }

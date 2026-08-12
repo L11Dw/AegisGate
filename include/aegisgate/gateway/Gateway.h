@@ -60,6 +60,12 @@ public:
   enum class Lifecycle : std::uint8_t { kNotStarted, kStarting, kRunning, kStopped };
 
   void Start();
+  // Control-loop-owner only.  Publishes a fully prepared generation atomically
+  // when its worker count is compatible with the fixed WorkerSet.  Existing
+  // requests retain their old generation; new requests bind the replacement.
+  // A later ReloadController is responsible for parsing YAML off-thread and
+  // calls this method only with a validated candidate.
+  [[nodiscard]] bool RequestReload(config::Config candidate);
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
@@ -117,6 +123,7 @@ private:
   std::unique_ptr<net::Channel> generation_mailbox_channel_;
   std::unordered_map<std::uint64_t, RetiringGeneration> retiring_generations_;
   std::vector<std::thread> retirement_reapers_;
+  bool workers_stopped_ = false;
   net::StreamFlowControl flow_control_;
 };
 

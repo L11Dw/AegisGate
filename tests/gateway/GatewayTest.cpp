@@ -1875,6 +1875,24 @@ TEST(GatewayTest, GatewayDestructionTerminatesInFlightAttempt) {
   EXPECT_EQ(::close(wake_fds[1]), 0);
 }
 
+TEST(GatewayTest, ReloadPublishesOnlyCompatiblePreparedGeneration) {
+  net::EventLoop loop;
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
+  Gateway gateway(loop, config::Config{{{"api", "gateway.test", "/", {first}, 10, 10, 4}}},
+                  "127.0.0.1", 0);
+  gateway.Start();
+
+  const config::Endpoint replacement{"127.0.0.1", {127, 0, 0, 1}, 18081, 1};
+  EXPECT_TRUE(gateway.RequestReload(
+      config::Config{{{"api", "gateway.test", "/", {replacement}, 10, 10, 4}}}));
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
+
+  config::Config incompatible{{{"api", "gateway.test", "/", {first}, 10, 10, 4}}};
+  incompatible.workers = 2;
+  EXPECT_FALSE(gateway.RequestReload(std::move(incompatible)));
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
+}
+
 TEST(GatewayTest, GatewayDestroyDuringStreamingIsSafe) {
   net::Socket listener = net::Socket::ListenLoopback();
   const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, listener.BoundPort(), 1};
