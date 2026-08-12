@@ -36,6 +36,7 @@ add_executable(aegisgate_tests
     observability/AsyncLoggerTest.cpp
     mock/MockBackendTest.cpp
     integration/EndToEndTest.cpp
+    gateway/LoggerIntegrationTest.cpp
     http/HttpResponseTest.cpp
     http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp
