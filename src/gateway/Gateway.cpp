@@ -17,7 +17,8 @@
 namespace aegisgate::gateway {
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
-                 std::uint16_t listen_port, net::StreamFlowControl flow_control)
+                 std::uint16_t listen_port, net::StreamFlowControl flow_control,
+                 std::string config_path)
     : loop_(loop), lifetime_token_(std::make_shared<int>(0)),
       current_generation_(std::make_shared<runtime::RuntimeGeneration>(1, std::move(config))),
       routes_(CurrentGeneration()->snapshot()->config),
@@ -43,6 +44,12 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
       std::make_unique<net::Channel>(loop_, generation_mailbox_->wake_fd());
   generation_mailbox_channel_->SetReadCallback([this] { HandleGenerationEvents(); });
   generation_mailbox_channel_->EnableReading();
+  if (!config_path.empty()) {
+    reload_controller_ = std::make_unique<runtime::ReloadController>(std::move(config_path));
+    reload_channel_ = std::make_unique<net::Channel>(loop_, reload_controller_->wake_fd());
+    reload_channel_->SetReadCallback([this] { HandleReloadResults(); });
+    reload_channel_->EnableReading();
+  }
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
 }
 
@@ -59,6 +66,8 @@ Gateway::~Gateway() {
   lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
+  if (reload_controller_) reload_controller_->Stop();
+  reload_channel_.reset();
   const auto generation = CurrentGeneration();
   if (generation) generation->coordinator()->BeginOutcomeStopping();
   // Give already-retired generations a chance to schedule their worker-local
@@ -125,6 +134,24 @@ bool Gateway::RequestReload(config::Config candidate) {
   worker_shared_->current_generation.store(replacement, std::memory_order_release);
   RetireGeneration(previous);
   return true;
+}
+
+bool Gateway::RequestReload() {
+  if (lifecycle_ != Lifecycle::kRunning || !reload_controller_) return false;
+  return reload_controller_->Request();
+}
+
+void Gateway::HandleReloadResults() {
+  if (!loop_.IsOwnerThread() || !reload_controller_) std::terminate();
+  auto results = reload_controller_->Drain();
+  if (results.empty()) return;
+  // A burst may contain an obsolete completed parse followed by the coalesced
+  // latest file image.  Publishing only the newest result prevents an
+  // unnecessary transient generation; a failed newest parse leaves the live
+  // generation exactly as it was.
+  auto latest = std::move(results.back());
+  if (!latest.candidate.has_value()) return;
+  (void)RequestReload(std::move(*latest.candidate));
 }
 
 void Gateway::RetireGeneration(runtime::RuntimeGenerationRef generation) {

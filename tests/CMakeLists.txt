@@ -14,6 +14,7 @@ add_executable(aegisgate_tests
     runtime/WorkerSetTest.cpp
     runtime/WorkerDataTest.cpp
     runtime/RuntimeGenerationTest.cpp
+    runtime/ReloadControllerTest.cpp
     runtime/SelectionStateTest.cpp
     runtime/AttemptSelectorTest.cpp
     gateway/GatewayTest.cpp

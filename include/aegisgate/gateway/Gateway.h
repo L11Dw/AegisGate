@@ -16,6 +16,7 @@
 #include "aegisgate/routing/RouteTable.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
 #include "aegisgate/runtime/GenerationMailbox.h"
+#include "aegisgate/runtime/ReloadController.h"
 #include "aegisgate/runtime/WorkerData.h"
 #include "aegisgate/runtime/WorkerSet.h"
 #include "aegisgate/runtime/WorkerShared.h"
@@ -48,7 +49,8 @@ class Gateway {
 public:
   Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
           std::uint16_t listen_port,
-          net::StreamFlowControl flow_control = net::StreamFlowControl{});
+          net::StreamFlowControl flow_control = net::StreamFlowControl{},
+          std::string config_path = {});
   ~Gateway();
 
   Gateway(const Gateway &) = delete;
@@ -66,6 +68,11 @@ public:
   // A later ReloadController is responsible for parsing YAML off-thread and
   // calls this method only with a validated candidate.
   [[nodiscard]] bool RequestReload(config::Config candidate);
+  // Thread-safe trigger for the configured on-disk YAML.  Parsing happens on
+  // ReloadController's background thread; publication happens later from the
+  // control-loop callback.  False when this Gateway has no config path or is
+  // already stopping.
+  [[nodiscard]] bool RequestReload();
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
@@ -97,6 +104,7 @@ private:
   void HandleGenerationEvents();
   void RequestWorkerBalanceReturn(const runtime::RuntimeGenerationRef &generation);
   void StartRetirementReaper(const runtime::RuntimeGenerationRef &generation);
+  void HandleReloadResults();
   [[nodiscard]] runtime::RuntimeGenerationRef CurrentGeneration() const noexcept {
     return current_generation_.load(std::memory_order_acquire);
   }
@@ -121,6 +129,8 @@ private:
   std::unique_ptr<net::Acceptor> acceptor_;
   std::shared_ptr<runtime::GenerationMailbox> generation_mailbox_;
   std::unique_ptr<net::Channel> generation_mailbox_channel_;
+  std::unique_ptr<runtime::ReloadController> reload_controller_;
+  std::unique_ptr<net::Channel> reload_channel_;
   std::unordered_map<std::uint64_t, RetiringGeneration> retiring_generations_;
   std::vector<std::thread> retirement_reapers_;
   bool workers_stopped_ = false;

@@ -39,7 +39,8 @@ int main(int argc, char **argv) {
   try {
     aegisgate::net::EventLoop loop;
     aegisgate::gateway::Gateway gateway(
-        loop, aegisgate::config::LoadFromYaml(ReadFile(argv[1])), "0.0.0.0", ParsePort(argv[2]));
+        loop, aegisgate::config::LoadFromYaml(ReadFile(argv[1])), "0.0.0.0", ParsePort(argv[2]),
+        {}, argv[1]);
     gateway.Start();
     loop.Loop();
     return 0;

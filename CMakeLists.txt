@@ -31,6 +31,7 @@ add_library(aegisgate STATIC
     src/runtime/WorkerSet.cpp
     src/runtime/WorkerData.cpp
     src/runtime/GenerationMailbox.cpp
+    src/runtime/ReloadController.cpp
     src/runtime/RuntimeGeneration.cpp
     src/runtime/SelectionState.cpp
     src/runtime/AttemptSelector.cpp
