@@ -78,6 +78,12 @@ public:
     const auto generation = CurrentGeneration();
     return generation ? generation->version() : 0;
   }
+  // Control-loop owner only.  Returns the number of generations currently in
+  // the retirement pipeline.  Used for test observation and metrics; must not
+  // be called from worker threads.
+  [[nodiscard]] std::size_t RetiringGenerationCount() const noexcept {
+    return retiring_generations_.size();
+  }
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
   [[nodiscard]] Lifecycle lifecycle() const noexcept { return lifecycle_; }
