@@ -149,8 +149,14 @@ void Gateway::Log(std::string level, std::string event, std::string route,
 bool Gateway::RequestReload(config::Config candidate) {
   if (!loop_.IsOwnerThread() || lifecycle_ != Lifecycle::kRunning) return false;
   const auto previous = CurrentGeneration();
-  if (!previous || candidate.workers != previous->snapshot()->config.workers) return false;
-  if (retiring_generations_.size() >= kMaxRetiringGenerations) return false;
+  if (!previous || candidate.workers != previous->snapshot()->config.workers) {
+    Log("warn", "reload_rejected", {}, {}, 0, "workers_mismatch");
+    return false;
+  }
+  if (retiring_generations_.size() >= kMaxRetiringGenerations) {
+    Log("warn", "reload_rejected", {}, {}, 0, "too_many_retiring");
+    return false;
+  }
 
   runtime::RuntimeGenerationRef replacement;
   try {
@@ -164,10 +170,11 @@ bool Gateway::RequestReload(config::Config candidate) {
             *protection, std::chrono::seconds(2)) ||
         !replacement->coordinator()->Activate()) {
       replacement->coordinator()->Stop();
+      Log("error", "reload_failed", {}, {}, 0, "protection_migration");
       return false;
     }
   } catch (...) {
-    // Nothing was published, so every old runtime object remains untouched.
+    Log("error", "reload_failed", {}, {}, 0, "exception");
     return false;
   }
 
@@ -202,7 +209,10 @@ void Gateway::HandleReloadResults() {
   // unnecessary transient generation; a failed newest parse leaves the live
   // generation exactly as it was.
   auto latest = std::move(results.back());
-  if (!latest.candidate.has_value()) return;
+  if (!latest.candidate.has_value()) {
+    Log("warn", "reload_failed", {}, {}, 0, latest.error);
+    return;
+  }
   (void)RequestReload(std::move(*latest.candidate));
 }
 
