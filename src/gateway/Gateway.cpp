@@ -204,8 +204,9 @@ void Gateway::HandleGenerationEvents() {
         // All balances returned — stop health checkers, notify state machine,
         // and start the reaper for coordinator shutdown.
         event.generation->coordinator()->StopCheckers();
-        (void)event.generation->NotifyCheckersStopped();
-        StartRetirementReaper(event.generation);
+        if (event.generation->NotifyCheckersStopped()) {
+          StartRetirementReaper(event.generation);
+        }
       }
       continue;
     }
@@ -218,6 +219,11 @@ void Gateway::HandleGenerationEvents() {
 
 void Gateway::RequestWorkerBalanceReturn(const runtime::RuntimeGenerationRef &generation) {
   if (workers_stopped_ || worker_datas_.empty()) {
+    // The worker-stop path can release the last lease without producing a
+    // worker-balance callback.  It must still pass through checker shutdown
+    // and the six-state retirement machine before starting the reaper.
+    generation->coordinator()->StopCheckers();
+    if (!generation->NotifyCheckersStopped()) return;
     StartRetirementReaper(generation);
     return;
   }

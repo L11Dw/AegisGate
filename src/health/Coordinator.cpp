@@ -216,11 +216,28 @@ Coordinator::ReserveOutcome(std::size_t route_index) noexcept {
 }
 
 void Coordinator::StopCheckers() noexcept {
-  if (!loop_data_) return;
-  for (auto &checker : loop_data_->checkers) {
-    if (checker) checker->Stop();
+  // Checker channels, timers and connections belong to the coordinator
+  // EventLoop.  Even though callers normally arrive from the Gateway control
+  // loop, never touch loop_data_ directly here.
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return;
+  std::promise<void> stopped;
+  auto future = stopped.get_future();
+  if (!PostTask([this, &stopped] {
+        try {
+          for (auto &checker : loop_data_->checkers) {
+            if (checker) checker->Stop();
+          }
+          loop_data_->checkers.clear();
+          stopped.set_value();
+        } catch (...) {
+          stopped.set_exception(std::current_exception());
+        }
+      })) {
+    // A stopped coordinator's shutdown task owns destruction of loop_data_;
+    // this thread must not fall back to accessing checker-owned objects.
+    return;
   }
-  loop_data_->checkers.clear();
+  future.get();
 }
 
 void Coordinator::BeginOutcomeStopping() noexcept {

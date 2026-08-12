@@ -119,14 +119,9 @@ bool RuntimeGeneration::BeginReaping() noexcept {
   {
     std::lock_guard<std::mutex> guard(retirement_mutex_);
     const auto state = retirement_state_.load(std::memory_order_acquire);
-    // Accept from kCheckersStopped (leases already zero) or kWaitingForLeases.
-    if (state != RetirementState::kCheckersStopped &&
-        state != RetirementState::kWaitingForLeases) {
+    if (state != RetirementState::kWaitingForLeases ||
+        active_request_leases_.load(std::memory_order_acquire) != 0) {
       return false;
-    }
-    // If still in kCheckersStopped, advance to kWaitingForLeases first.
-    if (state == RetirementState::kCheckersStopped) {
-      retirement_state_.store(RetirementState::kWaitingForLeases, std::memory_order_release);
     }
     retirement_state_.store(RetirementState::kOutcomeDraining, std::memory_order_release);
     cb = on_state_change_;
