@@ -91,4 +91,38 @@ TEST(GlobalAdmissionTest, LeaseBatchClampsByWorkersAndBurst) {
 }
 
 } // namespace
+
+
+// R-068: a maximal time jump (or a huge configuration) must not overflow the
+// credit arithmetic.  Refill's accrual is bounded by `missing` (elapsed <
+// needed in the fractional branch, so rate x elapsed < missing + rate), and
+// Draw/Return clamp credit to [0, capacity]; these tests lock that contract.
+TEST(GlobalAdmissionTest, RefillAtMaxTimePointCapsAtCapacityWithoutOverflow) {
+  GlobalAdmission admission(Route(/*rate=*/1000, /*burst=*/100, /*max_inflight=*/100),
+                            GlobalAdmission::Clock::now());
+  EXPECT_EQ(admission.Draw(50), 50U);
+  // Jump to the far future: the refill fills straight to capacity (saturated),
+  // never overflowing into a negative or wrapped credit.
+  admission.Refill(GlobalAdmission::Clock::time_point::max());
+  EXPECT_EQ(admission.credit(), static_cast<std::int64_t>(100) * 1'000'000'000);
+  // Draw/Return stay bounded even at the extremes.
+  EXPECT_EQ(admission.Draw(100), 100U);
+  admission.Return(1'000'000);
+  EXPECT_LE(admission.credit(), static_cast<std::int64_t>(100) * 1'000'000'000);
+  EXPECT_GE(admission.credit(), 0);
+}
+
+TEST(GlobalAdmissionTest, HugeElapsedRefillAccruesWithoutOverflow) {
+  // rate near its uint32 bound and a burst large enough that a huge elapsed
+  // window must still saturate at capacity rather than wrapping.
+  GlobalAdmission admission(Route(/*rate=*/4'000'000'000U, /*burst=*/1000,
+                                  /*max_inflight=*/1000),
+                            GlobalAdmission::Clock::now());
+  EXPECT_EQ(admission.Draw(1000), 1000U);
+  admission.Refill(GlobalAdmission::Clock::now() + std::chrono::hours(24 * 365 * 100));
+  EXPECT_GE(admission.credit(), 0);
+  EXPECT_LE(admission.credit(), static_cast<std::int64_t>(1000) * 1'000'000'000);
+  EXPECT_EQ(admission.Draw(1000), 1000U);  // fully refilled, capped at burst
+}
+
 } // namespace aegisgate::resilience
