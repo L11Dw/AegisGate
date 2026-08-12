@@ -1,47 +1,64 @@
-# Reproducible benchmark procedure
+# AegisGate Benchmark
 
-This directory deliberately contains no claimed throughput or latency figures.
-Record a result only with the exact command, host details, gateway revision, configuration, and raw tool output.
-
-## Start the fixed demo
+## Quick Start
 
 ```bash
-docker compose -f deploy/docker-compose.yml up --build
+# Build release
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build/release -j$(nproc)
+
+# Run default benchmark (normal scenario, 1 worker, 5 runs)
+./benchmark/run.sh
+
+# Run with specific parameters
+./benchmark/run.sh normal 2 10 30 5
+#                  ^      ^ ^  ^  ^
+#                  |      | |  |  warmup seconds
+#                  |      | |  duration per run
+#                  |      | number of runs
+#                  |      workers
+#                  scenario
 ```
 
-Normal traffic uses `Host: normal.demo.local`; the fault route uses `Host: fault.demo.local` and its mock backend returns `503`.
+## Scenarios
 
-## Capture a baseline
+| Scenario | Description |
+|----------|-------------|
+| `normal` | Normal keep-alive requests (1/2/4 workers) |
+| `slow_client` | Slow client backpressure |
+| `breaker` | Breaker open/recovery |
+| `admission` | Global admission rate limiting |
+| `reload` | Reload during traffic |
 
-Use a separate terminal and retain the raw `wrk` output:
+## Output Format
 
-```bash
-wrk -t 2 -c 32 -d 30s -H 'Host: normal.demo.local' http://127.0.0.1:8080/
-curl -s -H 'Host: ignored.local' http://127.0.0.1:8080/metrics
+Results are written to `benchmark/results/` as JSON:
+
+```json
+{
+  "git_sha": "abc1234",
+  "cpu": "Intel i7-12700K",
+  "kernel": "6.5.0",
+  "workers": 2,
+  "scenario": "normal",
+  "duration_seconds": 10,
+  "runs": [
+    {"requests": 12345, "errors": 0, "duration_ms": 10000, "rps": 1234}
+  ],
+  "system": {"rss_kb": 12345, "cpu_percent": 45.2},
+  "timestamp": "2026-08-13T10:30:00+08:00"
+}
 ```
 
-For tail latency, use `wrk2` with an explicitly chosen fixed rate:
+## Measurement Discipline
 
-```bash
-wrk2 -t 2 -c 32 -R 500 -d 60s -H 'Host: normal.demo.local' http://127.0.0.1:8080/
-```
+- Each scenario: warmup + N runs × duration
+- Report mean, stddev, p50/p95/p99
+- Do not modify production code based on single-run results
+- P-1～P-5 optimizations require ≥3% throughput gain, ≤5% p99 regression
 
-## Result record template
+## Requirements
 
-```text
-revision:
-build type / compiler:
-CPU / RAM / kernel:
-container runtime version:
-command:
-gateway configuration checksum:
-duration / connections / threads / target rate:
-QPS:
-P50 / P99 latency:
-HTTP status distribution:
-CPU / RSS:
-raw-output file:
-comparison baseline and observed delta:
-```
-
-Do not compare results collected on different hosts, commands, connection counts, or configurations as an optimization result.
+- `wrk` (preferred) or `curl` for HTTP benchmarking
+- `jq` for JSON processing (optional)
+- Linux with epoll support
