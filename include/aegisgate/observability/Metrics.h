@@ -50,6 +50,8 @@ public:
     std::map<std::string, Histogram> duration;
     std::size_t active_connections{};
     std::size_t inflight{};
+    std::uint64_t upstream_read_pauses{};
+    std::uint64_t upstream_read_resumes{};
   };
 
   // One route x endpoint protection sample rendered as one-hot gauges.
@@ -82,6 +84,10 @@ public:
   void SetUpstreamHealth(std::string_view route, std::string_view upstream,
                          bool healthy);
   void SetActiveConnections(std::size_t count) noexcept;
+  // Streaming flow-control transitions. These are emitted at the transaction
+  // boundary, where one logical pause/resume is known exactly.
+  void RecordUpstreamReadPause() noexcept;
+  void RecordUpstreamReadResume() noexcept;
 
   // Thread-safe copy of the counters.
   [[nodiscard]] Data Snapshot() const;

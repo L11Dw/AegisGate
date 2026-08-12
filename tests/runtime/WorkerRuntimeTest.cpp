@@ -335,7 +335,7 @@ TEST(WorkerRuntimeTest, RejectsLoopTaskWhenFullOrStopped) {
   // be rejected without displacing it.
   ASSERT_TRUE(worker.Post([&] {
     char release = '\0';
-    (void)::read(gate[0], &release, 1);
+    [[maybe_unused]] auto _r = ::read(gate[0], &release, 1);
   }));
   EXPECT_FALSE(worker.PostWithLoop([](net::EventLoop &) {}));
   EXPECT_FALSE(worker.Post([] {}));
@@ -365,7 +365,7 @@ TEST(WorkerRuntimeTest, PostFdRejectsWhenFullAndClosesFd) {
   for (int index = 0; index != 2; ++index) {
     ASSERT_TRUE(worker.Post([&] {
       char release = '\0';
-      (void)::read(gate[0], &release, 1);
+      [[maybe_unused]] auto _r = ::read(gate[0], &release, 1);
       ++accepted_runs;
       (void)test::SignalWakeFd(done[1], 'd', error);
     }));
@@ -529,7 +529,7 @@ TEST(WorkerRuntimeTest, PostShutdownRunsDestroyTaskWhenQueueFull) {
   for (int index = 0; index != 2; ++index) {
     ASSERT_TRUE(worker.Post([&] {
       char release = '\0';
-      (void)::read(gate[0], &release, 1);
+      [[maybe_unused]] auto _r = ::read(gate[0], &release, 1);
     }));
   }
   // The reserved shutdown slot is accepted even with the queue full.

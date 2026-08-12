@@ -2049,7 +2049,7 @@ TEST(GatewayTest, InflightRequestRetainsOldGenerationAcrossReload) {
     char signal = '\0';
     if (::read(accepted[0], &signal, 1) != 1 || signal != 'a') {
       client_error = "first backend never accepted the old-generation request";
-      (void)::write(control[1], "q", 1);
+      [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
       return;
     }
     if (::write(control[1], "r", 1) != 1) client_error = "reload control signal failed";
@@ -2069,7 +2069,7 @@ TEST(GatewayTest, InflightRequestRetainsOldGenerationAcrossReload) {
     if (::write(release_first[1], "x", 1) != 1 && client_error.empty()) client_error = "release old request failed";
     const std::string old_response = ReadExact(old_request.Fd(), response_a.size(), TestDeadline(), client_error);
     if (old_response != response_a && client_error.empty()) client_error = "old request did not retain old generation";
-    (void)::write(control[1], "q", 1);
+    [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
   });
 
   loop.Loop();
@@ -2146,11 +2146,11 @@ TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
   auto check = std::make_shared<std::function<void()>>();
   *check = [&] {
     if (gateway.LastReloadResultSequence() > before) {
-      (void)::write(done[1], "d", 1);
+      [[maybe_unused]] auto _w = ::write(done[1], "d", 1);
       return;
     }
     if (std::chrono::steady_clock::now() >= deadline) {
-      (void)::write(done[1], "t", 1);
+      [[maybe_unused]] auto _w = ::write(done[1], "t", 1);
       return;
     }
     (void)check_timer.ScheduleAfter(std::chrono::milliseconds(5), *check);
@@ -2252,25 +2252,25 @@ TEST(GatewayTest, RetiredGenerationStopsOnlyAfterOldInflightRequestCompletes) {
     char signal = '\0';
     if (::read(accepted[0], &signal, 1) != 1 || signal != 'a') {
       client_error = "first backend never accepted";
-      (void)::write(control[1], "q", 1);
+      [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
       return;
     }
     if (::write(control[1], "r", 1) != 1) { client_error = "reload signal failed"; return; }
     if (::read(controller_reloaded[0], &signal, 1) != 1 || signal != 'r') {
       client_error = "reload completion signal failed";
-      (void)::write(control[1], "q", 1);
+      [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
       return;
     }
     if (::write(control[1], "c", 1) != 1) { client_error = "retire check signal failed"; return; }
     char retire_result = '\0';
     if (::read(retire_check[0], &retire_result, 1) != 1) {
       client_error = "retire check read failed";
-      (void)::write(control[1], "q", 1);
+      [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
       return;
     }
     if (retire_result != '1') {
       client_error = "v1 should still be retiring while old request in-flight";
-      (void)::write(control[1], "q", 1);
+      [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
       return;
     }
     if (::write(release_first[1], "x", 1) != 1) { client_error = "release old request failed"; return; }
@@ -2284,7 +2284,7 @@ TEST(GatewayTest, RetiredGenerationStopsOnlyAfterOldInflightRequestCompletes) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     if (!retired) client_error = "v1 retirement did not complete after old request finished";
-    (void)::write(control[1], "q", 1);
+    [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
   });
 
   std::thread client([&] {
@@ -2416,13 +2416,13 @@ TEST(GatewayTest, AdmissionTokensReturnToCorrectGenerationAfterReload) {
     char signal = '\0';
     if (::read(accepted[0], &signal, 1) != 1 || signal != 'a') {
       client_error = "first backend never accepted";
-      (void)::write(control[1], "q", 1);
+      [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
       return;
     }
     if (::write(control[1], "r", 1) != 1) { client_error = "reload signal failed"; return; }
     if (::read(controller_reloaded[0], &signal, 1) != 1 || signal != 'r') {
       client_error = "reload completion failed";
-      (void)::write(control[1], "q", 1);
+      [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
       return;
     }
     // Release old request.
@@ -2431,7 +2431,7 @@ TEST(GatewayTest, AdmissionTokensReturnToCorrectGenerationAfterReload) {
     if (::read(client_done[0], &signal, 1) != 1 || signal != 'd') {
       client_error = "client done signal failed";
     }
-    (void)::write(control[1], "q", 1);
+    [[maybe_unused]] auto _w = ::write(control[1], "q", 1);
   });
 
   std::thread client([&] {
@@ -2440,12 +2440,12 @@ TEST(GatewayTest, AdmissionTokensReturnToCorrectGenerationAfterReload) {
     char signal = '\0';
     if (::read(client_reloaded[0], &signal, 1) != 1 || signal != 'r') {
       client_error = "client reload signal failed";
-      (void)::write(client_done[1], "d", 1);
+      [[maybe_unused]] auto _w = ::write(client_done[1], "d", 1);
       return;
     }
     net::Socket new_request = net::Socket::ConnectLoopback(gateway.port());
     if (!WriteAll(new_request.Fd(), request, TestDeadline(), client_error)) {
-      (void)::write(client_done[1], "d", 1);
+      [[maybe_unused]] auto _w = ::write(client_done[1], "d", 1);
       return;
     }
     const std::string new_response = ReadExact(new_request.Fd(), response_new.size(), TestDeadline(), client_error);
@@ -2456,7 +2456,7 @@ TEST(GatewayTest, AdmissionTokensReturnToCorrectGenerationAfterReload) {
     if (old_response != response_old && client_error.empty()) {
       client_error = "old request did not retain old generation";
     }
-    (void)::write(client_done[1], "d", 1);
+    [[maybe_unused]] auto _w = ::write(client_done[1], "d", 1);
   });
 
   loop.Loop();

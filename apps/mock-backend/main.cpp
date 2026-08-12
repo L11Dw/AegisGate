@@ -27,7 +27,7 @@ Integer ParseUnsigned(std::string_view value, std::string_view name, unsigned lo
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    std::cerr << "usage: aegisgate_mock_backend <listen-port> [--status N] [--delay-ms N] [--reset] [--max-inflight N]\n";
+    std::cerr << "usage: aegisgate_mock_backend <listen-port> [--status N] [--delay-ms N] [--reset] [--max-inflight N] [--body-bytes N]\n";
     return 2;
   }
   try {
@@ -48,6 +48,8 @@ int main(int argc, char **argv) {
         options.delay = std::chrono::milliseconds(ParseUnsigned<long long>(value, "delay-ms", 600000));
       } else if (option == "--max-inflight") {
         options.max_inflight = ParseUnsigned<std::size_t>(value, "max-inflight", 1000000);
+      } else if (option == "--body-bytes") {
+        options.body_bytes = ParseUnsigned<std::size_t>(value, "body-bytes", 16 * 1024 * 1024);
       } else {
         throw std::invalid_argument("unknown option");
       }

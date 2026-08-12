@@ -133,13 +133,17 @@ ProxyTransaction::Start(net::EventLoop &loop, net::ClientConnection &client,
                         AttemptProvider attempt_provider,
                         std::optional<std::weak_ptr<void>> gateway_lifetime,
                         std::optional<runtime::RuntimeGeneration::RequestLease>
-                            request_generation_lease) {
+                            request_generation_lease,
+                        LogCallback log_callback,
+                        std::uint64_t request_generation_version) {
   if (!pool) throw std::invalid_argument("upstream pool is required");
   const auto transaction = std::shared_ptr<ProxyTransaction>(new ProxyTransaction(
       loop, client, std::move(endpoint), std::move(request), std::move(pool),
       std::move(reservation), timers, std::move(policy), std::move(metrics),
       std::move(route_name), std::move(attempt_provider), std::move(gateway_lifetime),
       std::move(request_generation_lease)));
+  transaction->log_callback_ = std::move(log_callback);
+  transaction->request_generation_version_ = request_generation_version;
   transaction->Begin();
   return transaction;
 }
@@ -296,6 +300,9 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
     // stays untouched (R-034: a client disconnect consumes no permit).
     CompleteMetric(downstream_response_committed_ ? response_head_.status
                                                   : response.status);
+    LogTerminal("info", "request_complete",
+                downstream_response_committed_ ? response_head_.status : response.status,
+                "client_gone");
     return;
   }
   if (downstream_response_committed_) {
@@ -308,6 +315,7 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
     } catch (const std::system_error &) {
     }
     CompleteMetric(response_head_.status);
+    LogTerminal("info", "request_complete", response_head_.status);
     if (response_head_.status >= 500) {
       AccountFailure();
     } else {
@@ -318,6 +326,7 @@ void ProxyTransaction::HandleUpstream(net::UpstreamResult result, http::HttpResp
   // A 5xx answer is an endpoint failure for the breaker; 4xx and success
   // responses are healthy answers.
   CompleteMetric(response.status);
+  LogTerminal("info", "request_complete", response.status);
   if (response.status >= 500) {
     AccountFailure();
   } else {
@@ -407,6 +416,9 @@ void ProxyTransaction::HandleClientAbort() {
   // The client connection is gone: account the started response status (or
   // 502 when nothing was written) and consume no breaker permit.
   CompleteMetric(downstream_response_committed_ ? response_head_.status : 502);
+  LogTerminal("info", "request_complete",
+              downstream_response_committed_ ? response_head_.status : 502,
+              "client_abort");
   if (client_lifetime_.lock()) {
     ClearClientStreamCallbacks();
     try {
@@ -439,12 +451,18 @@ void ProxyTransaction::HandleClientAbort() {
 }
 
 void ProxyTransaction::PauseUpstreamReading() noexcept {
+  if (upstream_read_paused_) return;
+  upstream_read_paused_ = true;
+  if (metrics_) metrics_->RecordUpstreamReadPause();
   if (pool_ && active_connection_) active_connection_->PauseReading();
   if (upstream_) upstream_->PauseReading();
 }
 
 void ProxyTransaction::ResumeUpstreamReading() noexcept {
   if (finished_ || GatewayDown()) return;
+  if (!upstream_read_paused_) return;
+  upstream_read_paused_ = false;
+  if (metrics_) metrics_->RecordUpstreamReadResume();
   if (pool_ && active_connection_) active_connection_->ResumeReading();
   if (upstream_) upstream_->ResumeReading();
 }
@@ -488,6 +506,8 @@ void ProxyTransaction::FinishNoEndpoint() {
                                                      : "no_healthy_endpoint");
   } catch (...) {
   }
+  LogTerminal("info", "request_complete", 503,
+              coordinator_overloaded_ ? "coordinator_overloaded" : "no_healthy_endpoint");
   if (!client_lifetime_.lock()) return;
   ClearClientStreamCallbacks();
   const auto self = shared_from_this();
@@ -517,6 +537,7 @@ void ProxyTransaction::FinishFailure() {
     // teardown, R-047): touch it only while its lifetime token is alive.
     CompleteMetric(502);
     AccountFailure();
+    LogTerminal("info", "request_complete", 502, "committed_truncated");
     if (client_lifetime_.lock()) {
       ClearClientStreamCallbacks();
       try {
@@ -528,6 +549,7 @@ void ProxyTransaction::FinishFailure() {
     return;
   }
   CompleteMetric(502);
+  LogTerminal("info", "request_complete", 502, "upstream_failure");
   if (!client_lifetime_.lock()) return;
   ClearClientStreamCallbacks();
   AccountFailure();
@@ -673,6 +695,7 @@ void ProxyTransaction::FinishGatewayTimeout() {
     // destroyed (R-047): touch it only while its lifetime token is alive.
     CompleteMetric(504);
     AccountFailure();
+    LogTerminal("info", "request_complete", 504, "timeout");
     if (client_lifetime_.lock()) {
       ClearClientStreamCallbacks();
       try {
@@ -684,6 +707,7 @@ void ProxyTransaction::FinishGatewayTimeout() {
     return;
   }
   CompleteMetric(504);
+  LogTerminal("info", "request_complete", 504, "timeout");
   if (!client_lifetime_.lock()) return;
   ClearClientStreamCallbacks();
   AccountFailure();
@@ -698,6 +722,19 @@ void ProxyTransaction::CompleteMetric(int status, bool rate_limited,
     metric_request_.Complete(status, UpstreamLabel(), rate_limited, reason);
   } catch (...) {
     // Metrics are best-effort; forwarding and lifetime cleanup remain primary.
+  }
+}
+
+void ProxyTransaction::LogTerminal(std::string level, std::string event,
+                                   std::uint16_t status, std::string reason,
+                                   std::uint64_t latency_us) noexcept {
+  if (logged_ || !log_callback_) return;
+  logged_ = true;
+  try {
+    log_callback_(std::move(level), std::move(event), status, std::move(reason),
+                  latency_us, retries_, request_bytes_, response_bytes_);
+  } catch (...) {
+    // Logging is best-effort.
   }
 }
 

@@ -18,7 +18,7 @@ namespace aegisgate::gateway {
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port, net::StreamFlowControl flow_control,
-                 std::string config_path)
+                 std::string config_path, std::string log_path)
     : loop_(loop), lifetime_token_(std::make_shared<int>(0)),
       current_generation_(std::make_shared<runtime::RuntimeGeneration>(1, std::move(config))),
       routes_(CurrentGeneration()->snapshot()->config),
@@ -34,6 +34,13 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
   worker_shared_->flow_control = flow_control_;
   worker_shared_->lifetime_token = lifetime_token_;
   worker_shared_->metrics_renderer = [this] { return RenderMetrics(); };
+  worker_shared_->log_callback = [this](std::string level, std::string event,
+                                        std::uint16_t status, std::string reason,
+                                        std::uint64_t latency_us, std::uint32_t retries,
+                                        std::uint64_t request_bytes, std::uint64_t response_bytes) {
+    Log(std::move(level), std::move(event), {}, {}, status, std::move(reason),
+        latency_us, retries, request_bytes, response_bytes);
+  };
   worker_metrics_.resize(generation->snapshot()->config.workers);
   client_counts_.resize(generation->snapshot()->config.workers);
   for (std::size_t index = 0; index < generation->snapshot()->config.workers; ++index) {
@@ -50,6 +57,10 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
     reload_channel_->SetReadCallback([this] { HandleReloadResults(); });
     reload_channel_->EnableReading();
   }
+  // AsyncLogger: optional structured JSON Lines logging.
+  if (!log_path.empty()) {
+    logger_ = std::make_unique<observability::AsyncLogger>(std::move(log_path));
+  }
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
 }
 
@@ -63,6 +74,7 @@ Gateway::~Gateway() {
   // loop and stop the coordinator — a worker still publishing to a stopped
   // coordinator would lose breaker accounting.
   if (!loop_.IsOwnerThread()) std::terminate();
+  Log("info", "gateway_stop");
   lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
@@ -111,11 +123,40 @@ Gateway::~Gateway() {
   // worker_datas_ entries are all empty: the destroy tasks ran on their workers.
 }
 
+void Gateway::Log(std::string level, std::string event, std::string route,
+                  std::string upstream, std::uint16_t status, std::string reason,
+                  std::uint64_t latency_us, std::uint32_t retries,
+                  std::uint64_t request_bytes, std::uint64_t response_bytes) {
+  if (!logger_) return;
+  observability::LogRecord record;
+  record.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  record.level = std::move(level);
+  record.event = std::move(event);
+  const auto gen = CurrentGeneration();
+  if (gen) record.generation = gen->version();
+  record.route = std::move(route);
+  record.upstream = std::move(upstream);
+  record.status = status;
+  record.reason = std::move(reason);
+  record.latency_us = latency_us;
+  record.retries = retries;
+  record.request_bytes = request_bytes;
+  record.response_bytes = response_bytes;
+  (void)logger_->Submit(std::move(record));
+}
+
 bool Gateway::RequestReload(config::Config candidate) {
   if (!loop_.IsOwnerThread() || lifecycle_ != Lifecycle::kRunning) return false;
   const auto previous = CurrentGeneration();
-  if (!previous || candidate.workers != previous->snapshot()->config.workers) return false;
-  if (retiring_generations_.size() >= kMaxRetiringGenerations) return false;
+  if (!previous || candidate.workers != previous->snapshot()->config.workers) {
+    Log("warn", "reload_rejected", {}, {}, 0, "workers_mismatch");
+    return false;
+  }
+  if (retiring_generations_.size() >= kMaxRetiringGenerations) {
+    Log("warn", "reload_rejected", {}, {}, 0, "too_many_retiring");
+    return false;
+  }
 
   runtime::RuntimeGenerationRef replacement;
   try {
@@ -129,10 +170,11 @@ bool Gateway::RequestReload(config::Config candidate) {
             *protection, std::chrono::seconds(2)) ||
         !replacement->coordinator()->Activate()) {
       replacement->coordinator()->Stop();
+      Log("error", "reload_failed", {}, {}, 0, "protection_migration");
       return false;
     }
   } catch (...) {
-    // Nothing was published, so every old runtime object remains untouched.
+    Log("error", "reload_failed", {}, {}, 0, "exception");
     return false;
   }
 
@@ -143,6 +185,7 @@ bool Gateway::RequestReload(config::Config candidate) {
   current_generation_.store(replacement, std::memory_order_release);
   worker_shared_->current_generation.store(replacement, std::memory_order_release);
   RetireGeneration(previous);
+  Log("info", "reload_succeeded");
   return true;
 }
 
@@ -166,7 +209,10 @@ void Gateway::HandleReloadResults() {
   // unnecessary transient generation; a failed newest parse leaves the live
   // generation exactly as it was.
   auto latest = std::move(results.back());
-  if (!latest.candidate.has_value()) return;
+  if (!latest.candidate.has_value()) {
+    Log("warn", "reload_failed", {}, {}, 0, latest.error);
+    return;
+  }
   (void)RequestReload(std::move(*latest.candidate));
 }
 
@@ -297,6 +343,7 @@ void Gateway::Start() {
   }
   acceptor_->Listen();
   lifecycle_ = Lifecycle::kRunning;
+  Log("info", "gateway_start");
 }
 
 std::uint16_t Gateway::port() const { return acceptor_->port(); }
@@ -414,7 +461,14 @@ std::string Gateway::RenderMetrics() const {
       }
     }
   }
-  return observability::Metrics::RenderPrometheus(aggregate, protection);
+  auto result = observability::Metrics::RenderPrometheus(aggregate, protection);
+  // Append logger stats if available.
+  if (logger_) {
+    result += "aegisgate_log_dropped_total " + std::to_string(logger_->dropped_total()) + "\n";
+    result += "aegisgate_log_io_dropped_total " + std::to_string(logger_->io_dropped_total()) + "\n";
+    result += "aegisgate_log_critical_overflow_total " + std::to_string(logger_->critical_overflow()) + "\n";
+  }
+  return result;
 }
 
 } // namespace aegisgate::gateway

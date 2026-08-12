@@ -30,3 +30,7 @@ Makefile
 /record_host.txt
 /docs/private/
 /.worktrees/
+
+# Local benchmark measurements and JSONL runtime logs are reproducible output,
+# not source-controlled fixtures.
+/benchmark/results/

@@ -99,6 +99,28 @@ TEST(MockBackendTest, ReturnsConfigured5xxOverRealTcp) {
   EXPECT_EQ(response, "HTTP/1.1 503 Mock Failure\r\nContent-Length: 0\r\n\r\n");
 }
 
+TEST(MockBackendTest, ReturnsConfiguredContentLengthBodyOverRealTcp) {
+  constexpr std::size_t kBodyBytes = 256 * 1024;
+  std::string error;
+  std::string response;
+  RunWithBackend(MockBackendOptions{.body_bytes = kBodyBytes}, [&](std::uint16_t port, int wake_fd) {
+    net::Socket socket = net::Socket::ConnectLoopback(port);
+    constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: mock.test\r\n\r\n";
+    const std::string expected_head = "HTTP/1.1 200 Mock Response\r\nContent-Length: " +
+                                      std::to_string(kBodyBytes) + "\r\n\r\n";
+    if (WriteAll(socket.Fd(), request, TestDeadline(), error)) {
+      response = ReadExact(socket.Fd(), expected_head.size() + kBodyBytes, TestDeadline(), error);
+    }
+    if (::write(wake_fd, "q", 1) != 1 && error.empty()) error = "wake failed";
+  });
+  EXPECT_TRUE(error.empty()) << error;
+  const std::string expected_head = "HTTP/1.1 200 Mock Response\r\nContent-Length: " +
+                                    std::to_string(kBodyBytes) + "\r\n\r\n";
+  ASSERT_EQ(response.size(), expected_head.size() + kBodyBytes);
+  EXPECT_EQ(response.substr(0, expected_head.size()), expected_head);
+  EXPECT_EQ(response.substr(expected_head.size()), std::string(kBodyBytes, 'x'));
+}
+
 TEST(MockBackendTest, ResetsConnectionWithoutWritingAnHttpResponse) {
   std::string error;
   ssize_t received = -2;

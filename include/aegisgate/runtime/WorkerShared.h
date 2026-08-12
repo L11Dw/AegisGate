@@ -22,6 +22,10 @@ struct WorkerShared {
   // Renders the aggregated /metrics text (worker-local counters summed plus
   // the coordinator protection state); callable from any worker thread.
   std::function<std::string()> metrics_renderer;
+  // Log callback for request terminal events.  Set by Gateway.
+  std::function<void(std::string, std::string, std::uint16_t, std::string,
+                     std::uint64_t, std::uint32_t, std::uint64_t, std::uint64_t)>
+      log_callback;
 };
 
 } // namespace aegisgate::runtime

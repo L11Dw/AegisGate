@@ -196,7 +196,7 @@ TEST(ReloadWatcherTest, WatchRetryIsRateLimitedAndDoesNotDuplicateTriggers) {
   (void)timeout.ScheduleAfter(std::chrono::milliseconds(700), [&] {
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
     if (fd >= 0) {
-      (void)::write(fd, "new\n", 4);
+      [[maybe_unused]] auto _w = ::write(fd, "new\n", 4);
       (void)::close(fd);
     }
   });
