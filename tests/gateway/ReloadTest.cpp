@@ -83,32 +83,87 @@ TEST(ReloadTest, WorkersMismatchRejectsReload) {
 // (Two consecutive reloads each publish a new generation.)
 // ---------------------------------------------------------------------------
 TEST(ReloadTest, ConsecutiveReloadsIncrementVersion) {
-  GatewayFixture fix;
-  fix.Init(SimpleConfig());
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    [[maybe_unused]] auto _ = ::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
 
-  const auto v0 = fix.gateway->CurrentGenerationVersion();
-  EXPECT_TRUE(fix.gateway->RequestReload(SimpleConfig()));
-  EXPECT_EQ(fix.gateway->CurrentGenerationVersion(), v0 + 1);
-  EXPECT_TRUE(fix.gateway->RequestReload(SimpleConfig()));
-  EXPECT_EQ(fix.gateway->CurrentGenerationVersion(), v0 + 2);
+  Gateway gateway(loop, SimpleConfig(), "127.0.0.1", 0);
+  gateway.Start();
+
+  const auto v0 = gateway.CurrentGenerationVersion();
+
+  // First reload.
+  EXPECT_TRUE(gateway.RequestReload(SimpleConfig()));
+  net::TimerQueue timers(loop);
+  (void)timers.ScheduleAfter(std::chrono::milliseconds(200), [&] {
+    if (gateway.CurrentGenerationVersion() > v0) {
+      // Second reload.
+      EXPECT_TRUE(gateway.RequestReload(SimpleConfig()));
+      (void)timers.ScheduleAfter(std::chrono::milliseconds(200), [&] {
+        [[maybe_unused]] auto _ = ::write(wake_fds[1], "q", 1);
+      });
+    } else {
+      (void)timers.ScheduleAfter(std::chrono::milliseconds(100), [&] {
+        [[maybe_unused]] auto _ = ::write(wake_fds[1], "q", 1);
+      });
+    }
+  });
+  loop.Loop();
+
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), v0 + 2);
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
 }
 
 // ---------------------------------------------------------------------------
 // A4 Test 3: SuccessfulReloadPublishesNewGeneration
 // ---------------------------------------------------------------------------
 TEST(ReloadTest, SuccessfulReloadPublishesNewGeneration) {
-  GatewayFixture fix;
-  fix.Init(SimpleConfig());
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    [[maybe_unused]] auto _ = ::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
 
-  const auto old_version = fix.gateway->CurrentGenerationVersion();
+  Gateway gateway(loop, SimpleConfig(), "127.0.0.1", 0);
+  gateway.Start();
+
+  const auto old_version = gateway.CurrentGenerationVersion();
 
   // A valid candidate with the same worker count.
-  config::Config candidate = SimpleConfig();
-  EXPECT_TRUE(fix.gateway->RequestReload(std::move(candidate)));
-  EXPECT_EQ(fix.gateway->CurrentGenerationVersion(), old_version + 1);
+  EXPECT_TRUE(gateway.RequestReload(SimpleConfig()));
 
-  // The old generation should be in the retirement pipeline.
-  EXPECT_GE(fix.gateway->RetiringGenerationCount(), 1u);
+  // Wait for the async prepare to complete and the control loop to process it.
+  net::TimerQueue timers(loop);
+  (void)timers.ScheduleAfter(std::chrono::milliseconds(200), [&] {
+    if (gateway.CurrentGenerationVersion() > old_version) {
+      [[maybe_unused]] auto _ = ::write(wake_fds[1], "q", 1);
+    } else {
+      (void)timers.ScheduleAfter(std::chrono::milliseconds(100), [&] {
+        [[maybe_unused]] auto _ = ::write(wake_fds[1], "q", 1);
+      });
+    }
+  });
+  loop.Loop();
+
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), old_version + 1);
+  EXPECT_GE(gateway.RetiringGenerationCount(), 1u);
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,19 +171,38 @@ TEST(ReloadTest, SuccessfulReloadPublishesNewGeneration) {
 // (After reload, the old generation enters the retirement pipeline.)
 // ---------------------------------------------------------------------------
 TEST(ReloadTest, OldGenerationRetiresAfterReload) {
-  GatewayFixture fix;
-  fix.Init(SimpleConfig());
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    [[maybe_unused]] auto _ = ::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
 
-  const auto v0 = fix.gateway->CurrentGenerationVersion();
-  EXPECT_EQ(fix.gateway->RetiringGenerationCount(), 0u);
+  Gateway gateway(loop, SimpleConfig(), "127.0.0.1", 0);
+  gateway.Start();
 
-  // Reload — old generation should enter the retirement pipeline.
-  EXPECT_TRUE(fix.gateway->RequestReload(SimpleConfig()));
-  EXPECT_EQ(fix.gateway->CurrentGenerationVersion(), v0 + 1);
-  EXPECT_GE(fix.gateway->RetiringGenerationCount(), 1u);
+  const auto v0 = gateway.CurrentGenerationVersion();
+  EXPECT_EQ(gateway.RetiringGenerationCount(), 0u);
 
-  // The retired generation should eventually complete (the test's ctest
-  // timeout is the assertion — if retirement hangs, the test times out).
+  EXPECT_TRUE(gateway.RequestReload(SimpleConfig()));
+
+  // Wait for async prepare + publish.
+  net::TimerQueue timers(loop);
+  (void)timers.ScheduleAfter(std::chrono::milliseconds(300), [&] {
+    [[maybe_unused]] auto _ = ::write(wake_fds[1], "q", 1);
+  });
+  loop.Loop();
+
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), v0 + 1);
+  EXPECT_GE(gateway.RetiringGenerationCount(), 1u);
+
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -272,24 +346,36 @@ TEST(ReloadTest, NoConfigPathDisablesFileReload) {
 // ---------------------------------------------------------------------------
 
 TEST(ReloadTest, PrepareBuildsSelectionStateOnWorkerOwner) {
-  // A successful reload proves that SelectionState was built on the worker
-  // thread (the prepare task ran via PostWithLoop).
-  GatewayFixture fix;
-  fix.Init(SimpleConfig());
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    [[maybe_unused]] auto _ = ::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
 
-  const auto v0 = fix.gateway->CurrentGenerationVersion();
-  EXPECT_TRUE(fix.gateway->RequestReload(SimpleConfig()));
-  EXPECT_EQ(fix.gateway->CurrentGenerationVersion(), v0 + 1);
-  // The new generation was published — prepare succeeded.
+  Gateway gateway(loop, SimpleConfig(), "127.0.0.1", 0);
+  gateway.Start();
+
+  const auto v0 = gateway.CurrentGenerationVersion();
+  EXPECT_TRUE(gateway.RequestReload(SimpleConfig()));
+
+  net::TimerQueue timers(loop);
+  (void)timers.ScheduleAfter(std::chrono::milliseconds(200), [&] {
+    [[maybe_unused]] auto _ = ::write(wake_fds[1], "q", 1);
+  });
+  loop.Loop();
+
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), v0 + 1);
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
 }
 
 TEST(ReloadTest, ProtectionStateMigratesHealthOnReload) {
-  // Reload with the same config and a health-checked route.
-  // The protection state (health) should be migrated from the old
-  // coordinator to the new one.  This test proves the migration
-  // path executes without error; the health state assertion is that
-  // the reload succeeds (ImportProtectionSnapshot didn't throw).
-  GatewayFixture fix;
   config::HealthCheckSettings hc;
   hc.interval_ms = 10000;
   hc.timeout_ms = 5000;
@@ -297,12 +383,34 @@ TEST(ReloadTest, ProtectionStateMigratesHealthOnReload) {
   const config::Config config{
       {{"health", "health.test", "/", {ep}, 100, 50, 10, 5000, 5000, 30000, 1,
         std::nullopt, hc}}};
-  fix.Init(config);
 
-  const auto v0 = fix.gateway->CurrentGenerationVersion();
-  // Reload with the same config — health state should migrate.
-  EXPECT_TRUE(fix.gateway->RequestReload(config));
-  EXPECT_EQ(fix.gateway->CurrentGenerationVersion(), v0 + 1);
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    [[maybe_unused]] auto _ = ::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  const auto v0 = gateway.CurrentGenerationVersion();
+  EXPECT_TRUE(gateway.RequestReload(config));
+
+  net::TimerQueue timers(loop);
+  (void)timers.ScheduleAfter(std::chrono::milliseconds(200), [&] {
+    [[maybe_unused]] auto _ = ::write(wake_fds[1], "q", 1);
+  });
+  loop.Loop();
+
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), v0 + 1);
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
 }
 
 } // namespace

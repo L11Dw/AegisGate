@@ -110,6 +110,10 @@ Gateway::~Gateway() {
   lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
+  // Cancel any pending prepare so late worker tasks are harmless.
+  if (pending_prepare_) {
+    pending_prepare_->cancelled.store(true, std::memory_order_release);
+  }
   if (reload_watcher_) reload_watcher_->Stop();
   sighup_channel_.reset();
   inotify_channel_.reset();
@@ -216,11 +220,9 @@ bool Gateway::RequestReload(config::Config candidate) {
       new_admissions.push_back(std::make_shared<resilience::GlobalAdmission>(route, now));
     }
     coord->SetAdmissions(new_admissions);
-    // Empty selection states — will be filled by worker prepare tasks.
-    std::vector<std::shared_ptr<runtime::SelectionState>> empty_sel;
     replacement = std::make_shared<runtime::RuntimeGeneration>(
         snapshot->version, snapshot, std::move(coord), std::move(new_admissions),
-        std::move(empty_sel));
+        std::vector<std::shared_ptr<runtime::SelectionState>>{});
   } catch (...) {
     return false;
   }
@@ -244,85 +246,97 @@ bool Gateway::RequestReload(config::Config candidate) {
   }
 
   // 5. Prepare per-worker selection states on worker owner threads.
-  auto sel_states = std::make_shared<std::vector<std::shared_ptr<runtime::SelectionState>>>(
-      worker_datas_.size());
-  auto pending = std::make_shared<std::atomic<std::size_t>>(worker_datas_.size());
-  auto failed = std::make_shared<std::atomic<bool>>(false);
+  //    This is event-driven: each worker wakes the control loop when done.
+  //    A generation token prevents late prepares from a rolled-back candidate.
+  auto prepare = std::make_shared<PendingPrepare>();
+  prepare->generation = replacement;
+  prepare->sel_states.resize(worker_datas_.size());
+  prepare->pending.store(worker_datas_.size(), std::memory_order_release);
+  prepare->failed.store(false, std::memory_order_release);
+  prepare->cancelled.store(false, std::memory_order_release);
+  pending_prepare_ = prepare;
+
   auto config_copy = replacement->snapshot()->config;
   auto version = replacement->version();
+  auto mb = generation_mailbox_;
 
   for (std::size_t i = 0; i < worker_datas_.size(); ++i) {
     if (!worker_datas_[i]) {
-      // Worker not initialized — mark as done.
-      if (pending->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        // Last worker — all done.
+      // Worker not initialized — count as done.
+      if (prepare->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        (void)mb->Wake();
       }
       continue;
     }
     auto &worker = workers_->At(i);
     auto wd = worker_datas_[i];
-    auto sel = sel_states;
-    auto p = pending;
-    auto f = failed;
-    auto coord = replacement->coordinator();
     if (!worker.PostWithLoop(
-            [wd, i, config_copy, version, sel, p, f, coord](net::EventLoop &) {
+            [wd, i, config_copy, version, prepare, mb](net::EventLoop &) {
+              // If the candidate was cancelled, skip.
+              if (prepare->cancelled.load(std::memory_order_acquire)) {
+                if (prepare->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                  (void)mb->Wake();
+                }
+                return;
+              }
               auto state = wd->PrepareSelectionState(config_copy, version);
               if (!state) {
-                f->store(true, std::memory_order_release);
+                prepare->failed.store(true, std::memory_order_release);
               } else {
-                (*sel)[i] = std::move(state);
+                prepare->sel_states[i] = std::move(state);
               }
-              if (p->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                // Last worker — wake the control loop.
-                // The control loop will check failed and proceed or rollback.
+              if (prepare->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                (void)mb->Wake();
               }
             })) {
-      // Worker stopped — count as done, but mark as failed.
-      failed->store(true, std::memory_order_release);
-      if (pending->fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        // Last worker.
+      // Worker stopped — count as done, mark as failed.
+      prepare->failed.store(true, std::memory_order_release);
+      if (prepare->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        (void)mb->Wake();
       }
     }
   }
 
-  // Wait for all prepares to complete (synchronous barrier).
-  // In a real async design this would be event-driven, but for simplicity
-  // we spin-wait with a short sleep.
-  while (pending->load(std::memory_order_acquire) > 0) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-
-  // 6. Check if any prepare failed.
-  if (failed->load(std::memory_order_acquire)) {
-    // Rollback: stop the candidate coordinator, don't publish.
-    replacement->coordinator()->Stop();
-    return false;
-  }
-
-  // 7. Set the prepared selection states on the replacement generation.
-  replacement->SetSelectionStates(std::move(*sel_states));
-
-  // 8. Activate the coordinator (starts health checkers).
-  try {
-    replacement->coordinator()->Activate();
-  } catch (...) {
-    replacement->coordinator()->Stop();
-    return false;
-  }
-
-  // 9. Publish atomically.
-  auto old_gen = current;
-  routes_ = routing::RouteTable(replacement->snapshot()->config);
-  current_generation_.store(replacement, std::memory_order_release);
-  worker_shared_->config_snapshot.store(replacement->snapshot(), std::memory_order_release);
-  worker_shared_->current_generation.store(replacement, std::memory_order_release);
-  worker_shared_->coordinator = replacement->coordinator();
-  worker_shared_->admissions = replacement->admissions();
-
-  // 10. Retire old generation via A5 pipeline.
-  RetireGeneration(old_gen);
+  // RequestReload returns immediately.  The control loop will call
+  // HandlePrepareCompletion() when all workers report back.
   return true;
+}
+
+void Gateway::HandlePrepareCompletion() {
+  if (!pending_prepare_ || pending_prepare_->pending.load(std::memory_order_acquire) > 0) {
+    return; // Not ready yet.
+  }
+
+  auto prepare = std::move(pending_prepare_);
+  if (!prepare) return;
+
+  // Check if any prepare failed.
+  if (prepare->failed.load(std::memory_order_acquire)) {
+    // Rollback: stop the candidate coordinator.  Old generation unchanged.
+    prepare->generation->coordinator()->Stop();
+    return;
+  }
+
+  // All prepares succeeded.  Set selection states and activate.
+  prepare->generation->SetSelectionStates(std::move(prepare->sel_states));
+  try {
+    prepare->generation->coordinator()->Activate();
+  } catch (...) {
+    prepare->generation->coordinator()->Stop();
+    return;
+  }
+
+  // Publish atomically.
+  auto old_gen = current_generation_.load(std::memory_order_acquire);
+  routes_ = routing::RouteTable(prepare->generation->snapshot()->config);
+  current_generation_.store(prepare->generation, std::memory_order_release);
+  worker_shared_->config_snapshot.store(prepare->generation->snapshot(), std::memory_order_release);
+  worker_shared_->current_generation.store(prepare->generation, std::memory_order_release);
+  worker_shared_->coordinator = prepare->generation->coordinator();
+  worker_shared_->admissions = prepare->generation->admissions();
+
+  // Retire old generation via A5 pipeline.
+  RetireGeneration(old_gen);
 }
 
 bool Gateway::RequestReload() {
@@ -447,6 +461,9 @@ void Gateway::HandleGenerationEvents() {
   if (!loop_.IsOwnerThread()) std::terminate();
   // Drain the wake counter (always returns bool).
   (void)generation_mailbox_->Drain();
+
+  // Check if a pending prepare has completed.
+  HandlePrepareCompletion();
 
   // Scan every retiring generation and drive the state machine.
   for (auto it = retiring_generations_.begin(); it != retiring_generations_.end();) {

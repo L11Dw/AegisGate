@@ -113,9 +113,18 @@ private:
     bool reaper_started = false;
   };
 
+  struct PendingPrepare {
+    runtime::RuntimeGenerationRef generation;
+    std::vector<std::shared_ptr<runtime::SelectionState>> sel_states;
+    std::atomic<std::size_t> pending{0};
+    std::atomic<bool> failed{false};
+    std::atomic<bool> cancelled{false};
+  };
+
   void Accept(int fd);
   void RetireGeneration(runtime::RuntimeGenerationRef generation);
   void HandleGenerationEvents();
+  void HandlePrepareCompletion();
   void HandleReloadResults();
   [[nodiscard]] std::string RenderMetrics() const;
 
@@ -144,6 +153,7 @@ private:
   std::unique_ptr<net::Channel> inotify_channel_;
   std::unique_ptr<net::Channel> watcher_timer_channel_;
   std::shared_ptr<runtime::GenerationMailbox> generation_mailbox_;
+  std::shared_ptr<PendingPrepare> pending_prepare_;
   std::unique_ptr<net::Channel> generation_mailbox_channel_;
   std::unordered_map<std::uint64_t, RetiringGeneration> retiring_generations_;
   std::vector<std::thread> retirement_reapers_;
