@@ -1,7 +1,6 @@
 #pragma once
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -9,7 +8,7 @@
 
 #include "aegisgate/config/Config.h"
 #include "aegisgate/health/EndpointHealth.h"
-#include "aegisgate/resilience/CircuitBreaker.h"
+#include "aegisgate/resilience/CircuitBreakerSnapshot.h"
 
 namespace aegisgate::health {
 
@@ -31,28 +30,12 @@ struct EndpointHealthSnapshot {
   HealthState state = HealthState::kImplicitHealthy;
 };
 
-// Pure-value bucket snapshot with relative age (not absolute time_point).
-struct BucketSnapshot {
-  std::chrono::steady_clock::duration age_from_export{};
-  std::uint32_t success = 0;
-  std::uint32_t failure = 0;
-};
-
-// Pure-value circuit breaker snapshot for migration.
-struct CircuitBreakerSnapshot {
-  resilience::CircuitBreaker::State state = resilience::CircuitBreaker::State::kClosed;
-  std::vector<BucketSnapshot> buckets;
-  std::chrono::steady_clock::duration open_remaining{};
-  std::uint32_t half_open_quota = 0;
-  // Not exported: generation, probe_id, issued/completed
-};
-
 // Complete protection snapshot for one endpoint.
 struct EndpointProtectionSnapshot {
   RouteIdentity route;
   EndpointIdentity endpoint;
   EndpointHealthSnapshot health;
-  std::optional<CircuitBreakerSnapshot> breaker;  // nullopt = no breaker config
+  std::optional<resilience::CircuitBreakerSnapshot> breaker;  // nullopt = no breaker config
 };
 
 // Full protection snapshot for migration.

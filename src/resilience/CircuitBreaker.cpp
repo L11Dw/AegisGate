@@ -181,4 +181,83 @@ bool CircuitBreaker::ConsumeProbe(std::uint64_t probe_id) noexcept {
   return true;
 }
 
+CircuitBreakerSnapshot CircuitBreaker::ExportSnapshot(Clock::time_point now) const {
+  CircuitBreakerSnapshot snap;
+  snap.state = static_cast<CircuitBreakerState>(static_cast<std::uint8_t>(state_));
+  snap.half_open_quota = config_.half_open_probes;
+
+  // Export open remaining as relative duration.
+  if (state_ == State::kOpen && now < open_until_) {
+    snap.open_remaining = open_until_ - now;
+  }
+
+  // Export buckets with relative age from 'now'.
+  for (const auto &bucket : buckets_) {
+    if (bucket.success == 0 && bucket.failure == 0) continue;
+    const auto age = now - bucket.start;
+    if (age < config_.window) {
+      snap.buckets.push_back({age, bucket.success, bucket.failure});
+    }
+  }
+
+  return snap;
+}
+
+void CircuitBreaker::ImportSnapshot(const CircuitBreakerSnapshot &snap, Clock::time_point now) {
+  // Reset to fresh state with new generation.
+  generation_ = 1;
+  next_probe_id_ = 1;
+  pending_probes_.clear();
+  half_open_issued_ = 0;
+  half_open_completed_ = 0;
+  epoch_ = now;
+  initialized_ = false;
+  active_index_ = 0;
+  for (auto &bucket : buckets_) bucket = Bucket{};
+
+  // Import state.
+  state_ = static_cast<State>(static_cast<std::uint8_t>(snap.state));
+
+  switch (state_) {
+  case State::kClosed:
+    // Rebuild buckets from relative ages.
+    {
+      const auto bucket_duration =
+          std::chrono::duration_cast<Clock::duration>(config_.window) /
+          static_cast<int>(kBucketCount);
+      initialized_ = true;
+      active_start_ = now;
+      for (const auto &bsnap : snap.buckets) {
+        const auto bucket_start = now - bsnap.age_from_export;
+        const auto offset = (bucket_start - epoch_) / bucket_duration;
+        const auto index = static_cast<std::size_t>(offset) % kBucketCount;
+        buckets_[index] = {bucket_start, bsnap.success, bsnap.failure};
+      }
+    }
+    break;
+
+  case State::kOpen:
+    // Rebuild open_until from remaining duration.
+    if (snap.open_remaining > Clock::duration::zero()) {
+      open_until_ = now + snap.open_remaining;
+    } else {
+      // Window already expired; transition to HalfOpen immediately.
+      state_ = State::kHalfOpen;
+      ++generation_;
+      half_open_issued_ = 1;
+      half_open_completed_ = 0;
+      pending_probes_.push_back(next_probe_id_++);
+    }
+    break;
+
+  case State::kHalfOpen:
+    // Fresh HalfOpen with new probe slot.
+    ++generation_;
+    half_open_issued_ = 1;
+    half_open_completed_ = 0;
+    pending_probes_.push_back(next_probe_id_++);
+    break;
+  }
+}
+
 } // namespace aegisgate::resilience

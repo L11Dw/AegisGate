@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "aegisgate/resilience/CircuitBreakerSnapshot.h"
+
 namespace aegisgate::resilience {
 
 // Startup-time value object for one route x endpoint breaker.  The window is
@@ -76,6 +78,16 @@ public:
     }
     return false;
   }
+
+  // Export the breaker state as a pure-value snapshot.  Buckets are exported
+  // with relative age from 'now'; only buckets within the window are included.
+  // Must be called on the owner thread (coordinator loop).
+  [[nodiscard]] CircuitBreakerSnapshot ExportSnapshot(Clock::time_point now) const;
+
+  // Import a migrated snapshot.  Resets generation to 1, rebuilds buckets
+  // using 'now' as the reference, and sets the state.  Must be called on
+  // the new coordinator's owner loop before Activate().
+  void ImportSnapshot(const CircuitBreakerSnapshot &snap, Clock::time_point now);
 
 private:
   struct Bucket {
