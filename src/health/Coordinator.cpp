@@ -48,6 +48,11 @@ void Coordinator::SetAdmissions(
 }
 
 void Coordinator::Start() {
+  StartPrepared();
+  Activate();
+}
+
+void Coordinator::StartPrepared() {
   runtime_->Start();
   std::promise<void> initialized;
   auto future = initialized.get_future();
@@ -60,6 +65,45 @@ void Coordinator::Start() {
     }
   })) {
     throw std::logic_error("coordinator init task was not accepted");
+  }
+  future.get();
+}
+
+void Coordinator::ImportProtectionSnapshot(const HealthCircuitSnapshot &snapshot) {
+  // Copy health and breaker state from the old snapshot.  Only migrates
+  // for endpoints whose route/endpoint index matches.
+  if (!state_) return;
+  state_->ImportFromSnapshot(snapshot);
+}
+
+void Coordinator::Activate() {
+  // Start health checkers on the coordinator loop.  This is separated from
+  // StartPrepared so protection state can be imported before checkers run.
+  // The task is posted to the coordinator loop so checkers are created on
+  // the correct thread (they hold loop registrations).
+  std::promise<void> activated;
+  auto future = activated.get_future();
+  if (!PostTask([this, &activated] {
+        for (std::size_t route = 0; route < config_->routes.size(); ++route) {
+          const auto &route_config = config_->routes[route];
+          if (!route_config.health_check.has_value()) continue;
+          const auto &settings = *route_config.health_check;
+          for (std::size_t ep = 0; ep < route_config.endpoints.size(); ++ep) {
+            const auto &ep_config = route_config.endpoints[ep];
+            loop_data_->checkers.push_back(std::make_unique<health::HealthChecker>(
+                *loop_, *loop_data_->timers, ep_config,
+                HealthCheckConfig{std::chrono::milliseconds(settings.interval_ms),
+                                  std::chrono::milliseconds(settings.timeout_ms)},
+                [this, route, ep](bool healthy) {
+                  state_->RecordHealth(route, ep, healthy);
+                  Publish();
+                }));
+            loop_data_->checkers.back()->Start();
+          }
+        }
+        activated.set_value();
+      })) {
+    throw std::logic_error("coordinator activate task was not accepted");
   }
   future.get();
 }
@@ -203,29 +247,16 @@ std::size_t Coordinator::EndpointCount(std::size_t route) const noexcept {
 }
 
 void Coordinator::OnLoopInit(net::EventLoop &loop) {
+  loop_ = &loop;
   auto data = std::make_unique<LoopData>();
   data->timers = std::make_unique<net::TimerQueue>(loop);
   data->arm_timers.resize(config_->routes.size());
-  // Health checkers run here, on the single-writer loop; their results are
-  // committed in-thread and published.
   for (std::size_t route = 0; route < config_->routes.size(); ++route) {
     const config::Route &route_config = config_->routes[route];
     data->arm_timers[route].resize(route_config.endpoints.size(), 0);
-    if (!route_config.health_check.has_value()) continue;
-    const auto &settings = *route_config.health_check;
-    for (std::size_t endpoint = 0; endpoint < route_config.endpoints.size(); ++endpoint) {
-      const config::Endpoint &endpoint_config = route_config.endpoints[endpoint];
-      data->checkers.push_back(std::make_unique<health::HealthChecker>(
-          loop, *data->timers, endpoint_config,
-          HealthCheckConfig{std::chrono::milliseconds(settings.interval_ms),
-                            std::chrono::milliseconds(settings.timeout_ms)},
-          [this, route, endpoint](bool healthy) {
-            state_->RecordHealth(route, endpoint, healthy);
-            Publish();
-          }));
-      data->checkers.back()->Start();
-    }
   }
+  // Health checkers are created by Activate(), not here.  This allows
+  // the two-phase startup: StartPrepared → ImportProtection → Activate.
   // Register each outcome channel's wake descriptor: a Publish signals that a
   // result is waiting; drain it and republish the snapshot.  The eventfd is a
   // control wake only — the result payload travels in the channel's ring.

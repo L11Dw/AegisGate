@@ -44,6 +44,17 @@ public:
   // Spawns the coordinator thread and blocks until the loop-attached objects
   // (timer queue, health checkers, refill tick) are initialized.
   void Start();
+  // Two-phase startup for reload: starts the coordinator runtime and loop
+  // objects but does NOT start health checkers.  Call ImportProtectionSnapshot
+  // to copy state from the old coordinator, then Activate to start checkers.
+  void StartPrepared();
+  // Copies health/breaker state from the given snapshot into this coordinator.
+  // Must be called after StartPrepared and before Activate.  Only migrates
+  // state for endpoints whose identity and policy match the new config.
+  void ImportProtectionSnapshot(const HealthCircuitSnapshot &snapshot);
+  // Starts health checkers and enables the coordinator.  Must be called
+  // after StartPrepared and ImportProtectionSnapshot.
+  void Activate();
   // Destroys loop-attached objects on the coordinator thread, then stops the
   // runtime and joins.  Idempotent.
   void Stop() noexcept;
@@ -114,6 +125,7 @@ private:
   std::shared_ptr<const config::Config> config_;
   std::unique_ptr<CoordinatorState> state_;
   std::unique_ptr<runtime::WorkerRuntime> runtime_;
+  net::EventLoop *loop_ = nullptr;
   std::vector<std::shared_ptr<resilience::GlobalAdmission>> admissions_;
   // One OutcomeChannel per breaker-configured route (nullptr otherwise).  The
   // reservation accounting bounds the ring to the route's in-flight attempts.

@@ -202,7 +202,7 @@ bool Gateway::RequestReload(config::Config candidate) {
   // 1. Validate workers count matches.
   if (candidate.workers != current->snapshot()->config.workers) return false;
 
-  // 2. Create candidate RuntimeGeneration.
+  // 2. Create candidate RuntimeGeneration (without selection states yet).
   runtime::RuntimeGenerationRef replacement;
   try {
     auto snapshot = std::make_shared<runtime::ConfigSnapshot>(
@@ -216,29 +216,102 @@ bool Gateway::RequestReload(config::Config candidate) {
       new_admissions.push_back(std::make_shared<resilience::GlobalAdmission>(route, now));
     }
     coord->SetAdmissions(new_admissions);
-    // Build per-worker selection states on the control loop (placeholder;
-    // A4 prepare moves this to worker threads).
-    std::vector<std::shared_ptr<runtime::SelectionState>> sel_states;
-    sel_states.reserve(snapshot->config.workers);
-    for (std::uint32_t i = 0; i < snapshot->config.workers; ++i) {
-      sel_states.push_back(
-          std::make_shared<runtime::SelectionState>(snapshot->config, snapshot->version));
-    }
+    // Empty selection states — will be filled by worker prepare tasks.
+    std::vector<std::shared_ptr<runtime::SelectionState>> empty_sel;
     replacement = std::make_shared<runtime::RuntimeGeneration>(
         snapshot->version, snapshot, std::move(coord), std::move(new_admissions),
-        std::move(sel_states));
+        std::move(empty_sel));
   } catch (...) {
     return false;
   }
 
-  // 3. Start coordinator in prepared mode.
+  // 3. Start coordinator in prepared mode (no health checkers yet).
   try {
-    replacement->coordinator()->Start();
+    replacement->coordinator()->StartPrepared();
   } catch (...) {
     return false;
   }
 
-  // 4. Publish atomically.
+  // 4. Migrate protection state from old coordinator.
+  try {
+    const auto old_snapshot = current->coordinator()->CurrentSnapshot();
+    if (old_snapshot) {
+      replacement->coordinator()->ImportProtectionSnapshot(*old_snapshot);
+    }
+  } catch (...) {
+    replacement->coordinator()->Stop();
+    return false;
+  }
+
+  // 5. Prepare per-worker selection states on worker owner threads.
+  auto sel_states = std::make_shared<std::vector<std::shared_ptr<runtime::SelectionState>>>(
+      worker_datas_.size());
+  auto pending = std::make_shared<std::atomic<std::size_t>>(worker_datas_.size());
+  auto failed = std::make_shared<std::atomic<bool>>(false);
+  auto config_copy = replacement->snapshot()->config;
+  auto version = replacement->version();
+
+  for (std::size_t i = 0; i < worker_datas_.size(); ++i) {
+    if (!worker_datas_[i]) {
+      // Worker not initialized — mark as done.
+      if (pending->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        // Last worker — all done.
+      }
+      continue;
+    }
+    auto &worker = workers_->At(i);
+    auto wd = worker_datas_[i];
+    auto sel = sel_states;
+    auto p = pending;
+    auto f = failed;
+    auto coord = replacement->coordinator();
+    if (!worker.PostWithLoop(
+            [wd, i, config_copy, version, sel, p, f, coord](net::EventLoop &) {
+              auto state = wd->PrepareSelectionState(config_copy, version);
+              if (!state) {
+                f->store(true, std::memory_order_release);
+              } else {
+                (*sel)[i] = std::move(state);
+              }
+              if (p->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                // Last worker — wake the control loop.
+                // The control loop will check failed and proceed or rollback.
+              }
+            })) {
+      // Worker stopped — count as done, but mark as failed.
+      failed->store(true, std::memory_order_release);
+      if (pending->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        // Last worker.
+      }
+    }
+  }
+
+  // Wait for all prepares to complete (synchronous barrier).
+  // In a real async design this would be event-driven, but for simplicity
+  // we spin-wait with a short sleep.
+  while (pending->load(std::memory_order_acquire) > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // 6. Check if any prepare failed.
+  if (failed->load(std::memory_order_acquire)) {
+    // Rollback: stop the candidate coordinator, don't publish.
+    replacement->coordinator()->Stop();
+    return false;
+  }
+
+  // 7. Set the prepared selection states on the replacement generation.
+  replacement->SetSelectionStates(std::move(*sel_states));
+
+  // 8. Activate the coordinator (starts health checkers).
+  try {
+    replacement->coordinator()->Activate();
+  } catch (...) {
+    replacement->coordinator()->Stop();
+    return false;
+  }
+
+  // 9. Publish atomically.
   auto old_gen = current;
   routes_ = routing::RouteTable(replacement->snapshot()->config);
   current_generation_.store(replacement, std::memory_order_release);
@@ -247,7 +320,7 @@ bool Gateway::RequestReload(config::Config candidate) {
   worker_shared_->coordinator = replacement->coordinator();
   worker_shared_->admissions = replacement->admissions();
 
-  // 5. Retire old generation via A5 pipeline.
+  // 10. Retire old generation via A5 pipeline.
   RetireGeneration(old_gen);
   return true;
 }

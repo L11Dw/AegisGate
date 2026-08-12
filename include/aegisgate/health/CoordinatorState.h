@@ -96,6 +96,11 @@ public:
   [[nodiscard]] bool IsOpen(std::size_t route, std::size_t endpoint) const noexcept;
   [[nodiscard]] Clock::time_point OpenUntil(std::size_t route, std::size_t endpoint) const noexcept;
 
+  // M4-A: imports health/breaker state from an old coordinator's snapshot.
+  // Only migrates for endpoints whose route/endpoint index matches.
+  // Health state is copied; breaker state is reset (conservative).
+  void ImportFromSnapshot(const HealthCircuitSnapshot &snapshot);
+
   // --- observation (tests; single-threaded use) ---
   [[nodiscard]] std::size_t RouteCount() const noexcept;
   [[nodiscard]] std::size_t EndpointCount(std::size_t route) const noexcept;

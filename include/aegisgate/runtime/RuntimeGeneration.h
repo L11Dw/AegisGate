@@ -82,6 +82,10 @@ public:
   selection_states() const noexcept {
     return selection_states_;
   }
+  // Sets the per-worker selection states after a successful prepare.
+  void SetSelectionStates(std::vector<std::shared_ptr<SelectionState>> states) {
+    selection_states_ = std::move(states);
+  }
 
   // --- request lease (any thread) ---
   [[nodiscard]] std::optional<RequestLease> TryAcquireRequestLease();

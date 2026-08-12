@@ -185,4 +185,18 @@ std::uint64_t CoordinatorState::Generation(std::size_t route, std::size_t endpoi
   return breaker ? breaker->Generation() : 0;
 }
 
+void CoordinatorState::ImportFromSnapshot(const HealthCircuitSnapshot &snapshot) {
+  // Copy health state for matching route/endpoint indices.
+  // Breaker state is intentionally NOT migrated (conservative reset).
+  for (std::size_t r = 0; r < endpoints_.size() && r < snapshot.endpoints.size(); ++r) {
+    for (std::size_t e = 0; e < endpoints_[r].size() && e < snapshot.endpoints[r].size(); ++e) {
+      const auto &old_decision = snapshot.endpoints[r][e];
+      endpoints_[r][e].health.RecordCheckResult(old_decision.healthy);
+      // Breaker state is reset — the new coordinator starts fresh.
+      // Full breaker migration (Open remaining, HalfOpen probe cycle,
+      // Closed bucket window) is a future enhancement.
+    }
+  }
+}
+
 } // namespace aegisgate::health
