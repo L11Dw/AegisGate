@@ -131,6 +131,7 @@ private:
   // StartPrepared() changes this to kPrepared before a candidate is exposed.
   std::atomic<Lifecycle> lifecycle_{Lifecycle::kActive};
   bool prepared_only_ = false;
+  bool runtime_started_ = false;
 };
 
 } // namespace aegisgate::health

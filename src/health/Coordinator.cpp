@@ -62,11 +62,13 @@ void Coordinator::Start() {
 }
 
 void Coordinator::StartPrepared() {
+  if (runtime_started_) throw std::logic_error("coordinator already started");
   Lifecycle expected = Lifecycle::kActive;
   if (!lifecycle_.compare_exchange_strong(expected, Lifecycle::kPrepared,
                                            std::memory_order_acq_rel)) {
     throw std::logic_error("coordinator already started");
   }
+  runtime_started_ = true;
   runtime_->Start();
   prepared_only_ = true;
   std::promise<void> initialized;
