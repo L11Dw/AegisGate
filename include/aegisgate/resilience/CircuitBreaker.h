@@ -8,6 +8,21 @@
 
 namespace aegisgate::resilience {
 
+struct CircuitBreakerBucketSnapshot {
+  std::chrono::milliseconds age{};
+  std::uint32_t success = 0;
+  std::uint32_t failure = 0;
+};
+
+struct CircuitBreakerSnapshot {
+  std::uint8_t state = 0;
+  std::uint64_t generation = 0;
+  std::chrono::milliseconds open_remaining{};
+  std::uint32_t half_open_issued = 0;
+  std::uint32_t half_open_completed = 0;
+  std::vector<CircuitBreakerBucketSnapshot> buckets;
+};
+
 // Startup-time value object for one route x endpoint breaker.  The window is
 // the fixed statistical horizon, min_requests the sample floor before the
 // failure rate may open the breaker, failure_threshold_permille the rate
@@ -76,6 +91,9 @@ public:
     }
     return false;
   }
+
+  [[nodiscard]] CircuitBreakerSnapshot ExportSnapshot(Clock::time_point now) const;
+  void ImportSnapshot(const CircuitBreakerSnapshot &snapshot, Clock::time_point now) noexcept;
 
 private:
   struct Bucket {

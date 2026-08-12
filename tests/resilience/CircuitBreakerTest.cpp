@@ -244,4 +244,59 @@ TEST(CircuitBreakerTest, HalfOpenWaitsForFullProbeQuota) {
   EXPECT_EQ(breaker.StateNow(), State::kClosed);
 }
 
+TEST(CircuitBreakerTest, ClosedWindowSnapshotRoundTrips) {
+  const auto now = Clock::now();
+  CircuitBreaker source(Config(20, 900, 2), now);
+  for (int i = 0; i < 3; ++i) {
+    const auto at = now + std::chrono::milliseconds(i);
+    source.RecordFailure(at, source.Select(at));
+  }
+  const auto snapshot = source.ExportSnapshot(now + std::chrono::milliseconds(10));
+  CircuitBreaker target(Config(20, 900, 2), now + std::chrono::milliseconds(10));
+  target.ImportSnapshot(snapshot, now + std::chrono::milliseconds(10));
+  const auto restored = target.ExportSnapshot(now + std::chrono::milliseconds(10));
+  ASSERT_EQ(restored.state, static_cast<std::uint8_t>(State::kClosed));
+  std::uint32_t failures = 0;
+  for (const auto &bucket : restored.buckets) failures += bucket.failure;
+  EXPECT_EQ(failures, 3U);
+}
+
+TEST(CircuitBreakerTest, OpenSnapshotPreservesRemainingWindow) {
+  const auto now = Clock::now();
+  CircuitBreaker source(Config(1, 999, 1), now);
+  source.RecordFailure(now, source.Select(now));
+  ASSERT_EQ(source.StateNow(), State::kOpen);
+  const auto snapshot = source.ExportSnapshot(now + std::chrono::milliseconds(10));
+  CircuitBreaker target(Config(1, 999, 1), now + std::chrono::milliseconds(10));
+  target.ImportSnapshot(snapshot, now + std::chrono::milliseconds(10));
+  EXPECT_EQ(target.StateNow(), State::kOpen);
+  EXPECT_GT(target.OpenUntil(), now + std::chrono::milliseconds(10));
+}
+
+TEST(CircuitBreakerTest, HalfOpenSnapshotCreatesFreshGeneration) {
+  const auto now = Clock::now();
+  CircuitBreaker source(Config(1, 999, 2), now);
+  source.RecordFailure(now, source.Select(now));
+  const auto old_generation = source.Generation();
+  ASSERT_EQ(source.Select(now + std::chrono::milliseconds(60)).selection, Selection::kProbe);
+  const auto snapshot = source.ExportSnapshot(now + std::chrono::milliseconds(60));
+  CircuitBreaker target(Config(1, 999, 2), now + std::chrono::milliseconds(60));
+  target.ImportSnapshot(snapshot, now + std::chrono::milliseconds(60));
+  EXPECT_EQ(target.StateNow(), State::kHalfOpen);
+  EXPECT_GT(target.Generation(), old_generation);
+  EXPECT_EQ(target.Select(now + std::chrono::milliseconds(61)).selection, Selection::kProbe);
+}
+
+TEST(CircuitBreakerTest, ExpiredOpenSnapshotResumesHalfOpen) {
+  const auto now = Clock::now();
+  CircuitBreaker source(Config(1, 999, 1), now);
+  source.RecordFailure(now, source.Select(now));
+  auto snapshot = source.ExportSnapshot(now + std::chrono::milliseconds(100));
+  ASSERT_EQ(snapshot.state, static_cast<std::uint8_t>(State::kOpen));
+  ASSERT_EQ(snapshot.open_remaining, std::chrono::milliseconds::zero());
+  CircuitBreaker target(Config(1, 999, 1), now + std::chrono::milliseconds(100));
+  target.ImportSnapshot(snapshot, now + std::chrono::milliseconds(100));
+  EXPECT_EQ(target.StateNow(), State::kHalfOpen);
+}
+
 } // namespace aegisgate::resilience

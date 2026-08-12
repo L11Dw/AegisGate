@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "aegisgate/config/Config.h"
@@ -33,12 +34,21 @@ struct ProbeSlotState {
 // probe_slots is the per-cycle claim object this snapshot was built with (null
 // when the endpoint is not half-open).
 struct EndpointDecision {
+  std::string route_name;
+  std::string route_host;
+  std::string route_path_prefix;
+  std::string endpoint_host;
+  std::uint16_t endpoint_port = 0;
+  std::optional<config::HealthCheckSettings> health_policy;
+  std::optional<config::CircuitBreakerSettings> breaker_policy;
   bool healthy = true;
+  EndpointHealth::State health_state = EndpointHealth::State::kImplicitHealthy;
   std::uint8_t breaker_state = 0;
   std::uint64_t generation = 0;
   std::uint64_t probe_base = 0;
   std::uint32_t probe_quota = 0;
   std::shared_ptr<const ProbeSlotState> probe_slots;
+  std::optional<resilience::CircuitBreakerSnapshot> breaker_snapshot;
 };
 
 // Immutable, versioned coordination snapshot.  Published with
@@ -96,9 +106,8 @@ public:
   [[nodiscard]] bool IsOpen(std::size_t route, std::size_t endpoint) const noexcept;
   [[nodiscard]] Clock::time_point OpenUntil(std::size_t route, std::size_t endpoint) const noexcept;
 
-  // M4-A: imports health/breaker state from an old coordinator's snapshot.
-  // Only migrates for endpoints whose route/endpoint index matches.
-  // Health state is copied; breaker state is reset (conservative).
+  // M4-A: imports protection state only when route/endpoint identity and both
+  // protection policies match.  Breaker epochs and probe ids are regenerated.
   void ImportFromSnapshot(const HealthCircuitSnapshot &snapshot);
 
   // --- observation (tests; single-threaded use) ---

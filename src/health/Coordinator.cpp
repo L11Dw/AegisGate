@@ -74,6 +74,13 @@ void Coordinator::ImportProtectionSnapshot(const HealthCircuitSnapshot &snapshot
   // for endpoints whose route/endpoint index matches.
   if (!state_) return;
   state_->ImportFromSnapshot(snapshot);
+  // Imported Open breakers retain their remaining duration.  Re-arm the
+  // owner-loop timer so an imported breaker still transitions to HalfOpen.
+  for (std::size_t route = 0; route < config_->routes.size(); ++route) {
+    for (std::size_t endpoint = 0; endpoint < config_->routes[route].endpoints.size(); ++endpoint) {
+      if (state_->IsOpen(route, endpoint)) ScheduleArm(route, endpoint);
+    }
+  }
 }
 
 void Coordinator::Activate() {

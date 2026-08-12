@@ -1,6 +1,7 @@
 #include "aegisgate/resilience/CircuitBreaker.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace aegisgate::resilience {
 
@@ -179,6 +180,64 @@ bool CircuitBreaker::ConsumeProbe(std::uint64_t probe_id) noexcept {
   if (position == pending_probes_.end()) return false;
   pending_probes_.erase(position);
   return true;
+}
+
+CircuitBreakerSnapshot CircuitBreaker::ExportSnapshot(Clock::time_point now) const {
+  CircuitBreakerSnapshot snapshot;
+  snapshot.state = static_cast<std::uint8_t>(state_);
+  snapshot.generation = generation_;
+  if (state_ == State::kOpen && open_until_ > now) {
+    snapshot.open_remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(open_until_ - now);
+  }
+  snapshot.half_open_issued = half_open_issued_;
+  snapshot.half_open_completed = half_open_completed_;
+  snapshot.buckets.reserve(kBucketCount);
+  for (const Bucket &bucket : buckets_) {
+    CircuitBreakerBucketSnapshot out;
+    if (bucket.start < now) {
+      out.age = std::chrono::duration_cast<std::chrono::milliseconds>(now - bucket.start);
+    }
+    out.success = bucket.success;
+    out.failure = bucket.failure;
+    snapshot.buckets.push_back(out);
+  }
+  return snapshot;
+}
+
+void CircuitBreaker::ImportSnapshot(const CircuitBreakerSnapshot &snapshot,
+                                    Clock::time_point now) noexcept {
+  for (Bucket &bucket : buckets_) bucket = Bucket{};
+  initialized_ = true;
+  active_start_ = now;
+  active_index_ = 0;
+  for (std::size_t i = 0; i < snapshot.buckets.size() && i < kBucketCount; ++i) {
+    const auto &in = snapshot.buckets[i];
+    const auto age = std::min(in.age, config_.window);
+    buckets_[i] = Bucket{now - age, in.success, in.failure};
+  }
+  state_ = State::kClosed;
+  open_until_ = {};
+  pending_probes_.clear();
+  half_open_issued_ = 0;
+  half_open_completed_ = 0;
+  // Never reuse an old permit epoch or probe id after a reload.
+  generation_ = std::max(generation_ + 1, snapshot.generation + 1);
+  next_probe_id_ = 1;
+  const auto imported = static_cast<State>(snapshot.state);
+  if (imported == State::kOpen) {
+    if (snapshot.open_remaining > std::chrono::milliseconds::zero()) {
+      state_ = State::kOpen;
+      open_until_ = now + snapshot.open_remaining;
+      return;
+    }
+    // An Open window that elapsed while the candidate was being prepared
+    // resumes directly in a fresh HalfOpen cycle.
+    state_ = State::kHalfOpen;
+  } else if (imported == State::kHalfOpen) {
+    state_ = State::kHalfOpen;
+    // CoordinatorState will issue a fresh cycle, so no old probe is retained.
+  }
 }
 
 } // namespace aegisgate::resilience

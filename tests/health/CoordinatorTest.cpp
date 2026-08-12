@@ -182,6 +182,50 @@ TEST(CoordinatorStateTest, StaleSnapshotProbeClaimIsRejected) {
             second_cycle->endpoints[0][0].probe_base + 2U);
 }
 
+TEST(CoordinatorStateTest, ProtectionImportMatchesEndpointIdentityNotArrayIndex) {
+  const auto now = Clock::now();
+  auto old_config = std::make_shared<config::Config>();
+  config::Route old_route{"api", "api.test", "/",
+                          {config::Endpoint{"a", {127, 0, 0, 1}, 9101, 1},
+                           config::Endpoint{"b", {127, 0, 0, 1}, 9102, 1}}};
+  old_route.max_inflight = 8;
+  old_route.circuit_breaker = config::CircuitBreakerSettings{10, 1, 999, 5, 1};
+  old_route.health_check = config::HealthCheckSettings{1000, 100};
+  old_config->routes = {old_route};
+  CoordinatorState old_state(old_config, now);
+  old_state.RecordHealth(0, 0, false);
+  const auto initial = old_state.BuildSnapshot();
+  old_state.RecordResult({0, 1, {false, initial->endpoints[0][1].generation, 0}, false}, now + 1ms);
+  ASSERT_EQ(old_state.BreakerState(0, 1), State::kOpen);
+  const auto exported = old_state.BuildSnapshot();
+
+  auto new_config = std::make_shared<config::Config>();
+  std::swap(old_route.endpoints[0], old_route.endpoints[1]);
+  new_config->routes = {old_route};
+  CoordinatorState new_state(new_config, now);
+  new_state.ImportFromSnapshot(*exported);
+
+  EXPECT_FALSE(new_state.Healthy(0, 1));  // endpoint a moved to index 1
+  EXPECT_EQ(new_state.BreakerState(0, 0), State::kOpen);  // endpoint b moved to index 0
+  EXPECT_EQ(new_state.BreakerState(0, 1), State::kClosed);
+}
+
+TEST(CoordinatorStateTest, ProtectionImportResetsBreakerWhenPolicyChanges) {
+  const auto now = Clock::now();
+  auto config = ConfigWith({RouteWithBreaker("api", 10, 1, 999, 5, 1)});
+  CoordinatorState old_state(config, now);
+  const auto initial = old_state.BuildSnapshot();
+  old_state.RecordResult({0, 0, {false, initial->endpoints[0][0].generation, 0}, false}, now + 1ms);
+  ASSERT_EQ(old_state.BreakerState(0, 0), State::kOpen);
+  const auto exported = old_state.BuildSnapshot();
+
+  auto changed = std::make_shared<config::Config>(*config);
+  changed->routes[0].circuit_breaker->open_seconds = 9;
+  CoordinatorState new_state(changed, now);
+  new_state.ImportFromSnapshot(*exported);
+  EXPECT_EQ(new_state.BreakerState(0, 0), State::kClosed);
+}
+
 // R-058: concurrent claims from one cycle never exceed the quota and never
 // issue duplicate probe ids.
 TEST(CoordinatorStateTest, ConcurrentClaimsBoundedByQuotaNoDuplicates) {

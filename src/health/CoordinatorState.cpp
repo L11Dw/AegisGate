@@ -2,8 +2,32 @@
 
 #include <stdexcept>
 #include <utility>
+#include <algorithm>
 
 namespace aegisgate::health {
+
+namespace {
+bool SameHealth(const std::optional<config::HealthCheckSettings> &a,
+                const std::optional<config::HealthCheckSettings> &b) {
+  if (a.has_value() != b.has_value()) return false;
+  return !a || (a->interval_ms == b->interval_ms && a->timeout_ms == b->timeout_ms);
+}
+bool SameBreaker(const std::optional<config::CircuitBreakerSettings> &a,
+                 const std::optional<config::CircuitBreakerSettings> &b) {
+  if (a.has_value() != b.has_value()) return false;
+  return !a || (a->window_seconds == b->window_seconds &&
+                a->min_requests == b->min_requests &&
+                a->failure_threshold_permille == b->failure_threshold_permille &&
+                a->open_seconds == b->open_seconds &&
+                a->half_open_probes == b->half_open_probes);
+}
+bool SameIdentity(const config::Route &route, const config::Endpoint &ep,
+                  const EndpointDecision &old) {
+  return route.name == old.route_name && route.host == old.route_host &&
+         route.path_prefix == old.route_path_prefix && ep.host == old.endpoint_host &&
+         ep.port == old.endpoint_port;
+}
+} // namespace
 
 CoordinatorState::CoordinatorState(std::shared_ptr<const config::Config> config,
                                    Clock::time_point now)
@@ -87,7 +111,17 @@ std::shared_ptr<const HealthCircuitSnapshot> CoordinatorState::BuildSnapshot() {
     for (std::size_t endpoint = 0; endpoint < endpoints_[route].size(); ++endpoint) {
       const EndpointState &state = endpoints_[route][endpoint];
       EndpointDecision decision;
+      const auto &route_config = config_->routes[route];
+      const auto &endpoint_config = route_config.endpoints[endpoint];
+      decision.route_name = route_config.name;
+      decision.route_host = route_config.host;
+      decision.route_path_prefix = route_config.path_prefix;
+      decision.endpoint_host = endpoint_config.host;
+      decision.endpoint_port = endpoint_config.port;
+      decision.health_policy = route_config.health_check;
+      decision.breaker_policy = route_config.circuit_breaker;
       decision.healthy = state.health.Healthy();
+      decision.health_state = state.health.state();
       if (state.breaker) {
         decision.breaker_state = static_cast<std::uint8_t>(state.breaker->StateNow());
         decision.generation = state.breaker->Generation();
@@ -97,6 +131,7 @@ std::shared_ptr<const HealthCircuitSnapshot> CoordinatorState::BuildSnapshot() {
           decision.probe_quota = slots->quota;
         }
         decision.probe_slots = slots;
+        decision.breaker_snapshot = state.breaker->ExportSnapshot(Clock::now());
       }
       snapshot->endpoints[route][endpoint] = decision;
     }
@@ -186,15 +221,38 @@ std::uint64_t CoordinatorState::Generation(std::size_t route, std::size_t endpoi
 }
 
 void CoordinatorState::ImportFromSnapshot(const HealthCircuitSnapshot &snapshot) {
-  // Copy health state for matching route/endpoint indices.
-  // Breaker state is intentionally NOT migrated (conservative reset).
-  for (std::size_t r = 0; r < endpoints_.size() && r < snapshot.endpoints.size(); ++r) {
-    for (std::size_t e = 0; e < endpoints_[r].size() && e < snapshot.endpoints[r].size(); ++e) {
-      const auto &old_decision = snapshot.endpoints[r][e];
-      endpoints_[r][e].health.RecordCheckResult(old_decision.healthy);
-      // Breaker state is reset — the new coordinator starts fresh.
-      // Full breaker migration (Open remaining, HalfOpen probe cycle,
-      // Closed bucket window) is a future enhancement.
+  for (std::size_t r = 0; r < endpoints_.size(); ++r) {
+    const auto &route = config_->routes[r];
+    for (std::size_t e = 0; e < endpoints_[r].size(); ++e) {
+      const auto &endpoint = route.endpoints[e];
+      const EndpointDecision *match = nullptr;
+      for (const auto &old_route : snapshot.endpoints) {
+        for (const auto &old : old_route) {
+          if (SameIdentity(route, endpoint, old)) { match = &old; break; }
+        }
+        if (match) break;
+      }
+      if (!match || !SameHealth(route.health_check, match->health_policy)) continue;
+      endpoints_[r][e].health.SetState(match->health_state);
+      if (endpoints_[r][e].breaker && SameBreaker(route.circuit_breaker, match->breaker_policy) &&
+          match->breaker_snapshot.has_value()) {
+        auto *breaker = endpoints_[r][e].breaker.get();
+        breaker->ImportSnapshot(*match->breaker_snapshot, Clock::now());
+        if (breaker->StateNow() == resilience::CircuitBreaker::State::kHalfOpen) {
+          const auto quota = route.circuit_breaker->half_open_probes;
+          std::uint64_t base = 0;
+          for (std::uint32_t i = 0; i < quota; ++i) {
+            const auto permit = breaker->Select(Clock::now());
+            if (i == 0) base = permit.probe_id;
+          }
+          auto slots = std::make_shared<ProbeSlotState>();
+          slots->remaining.store(quota, std::memory_order_release);
+          slots->probe_base = base;
+          slots->generation = breaker->Generation();
+          slots->quota = quota;
+          endpoints_[r][e].probe_slots.store(std::move(slots), std::memory_order_release);
+        }
+      }
     }
   }
 }
