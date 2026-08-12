@@ -401,4 +401,18 @@ TEST(CoordinatorRuntimeTest, BeginOutcomeStoppingRejectsNewReserve) {
 }
 
 } // namespace
+
+
+// Test seams must fail loudly instead of busy-looping when the coordinator is
+// stopped or its queue is broken.
+TEST(CoordinatorRuntimeTest, TestSeamsThrowInsteadOfSpinningWhenStopped) {
+  const auto now = Clock::now();
+  Coordinator coordinator(ConfigWith({PlainRoute("plain")}), now);
+  coordinator.Start();
+  coordinator.Stop();
+  EXPECT_THROW(coordinator.SubmitResultAndWait({0, 0, {false, 1, 0}, true}),
+               std::logic_error);
+  EXPECT_THROW(coordinator.RecordHealthAndWait(0, 0, true), std::logic_error);
+}
+
 } // namespace aegisgate::health

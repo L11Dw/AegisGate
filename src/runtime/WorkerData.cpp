@@ -8,29 +8,6 @@
 #include "aegisgate/routing/RouteTable.h"
 
 namespace aegisgate::runtime {
-namespace {
-
-// R-065: the accepted descriptor is owned by RAII until ClientConnection takes
-// ownership, so an allocation failure in the construction path can never leak
-// the fd.  release() transfers ownership; the destructor closes otherwise.
-class FdOwner {
-public:
-  explicit FdOwner(int fd) : fd_(fd) {}
-  ~FdOwner() { if (fd_ >= 0) (void)::close(fd_); }
-  FdOwner(const FdOwner &) = delete;
-  FdOwner &operator=(const FdOwner &) = delete;
-  [[nodiscard]] int get() const noexcept { return fd_; }
-  [[nodiscard]] int release() noexcept {
-    const int fd = fd_;
-    fd_ = -1;
-    return fd;
-  }
-
-private:
-  int fd_;
-};
-
-} // namespace
 
 WorkerData::WorkerData(net::EventLoop &loop, std::shared_ptr<WorkerShared> shared,
                        std::uint32_t worker_index,
@@ -57,19 +34,17 @@ WorkerData::~WorkerData() {
   Shutdown();
 }
 
-void WorkerData::Accept(int fd) {
-  // R-065: the descriptor is RAII-owned here and released only once
-  // ClientConnection has been constructed and taken ownership; an allocation
-  // failure in the construction path closes it instead of leaking.  The
-  // handoff task (PostFd) owns the fd until Accept runs.
-  FdOwner owned(fd);
+void WorkerData::Accept(net::FdOwner fd) {
+  // R-065: the descriptor is RAII-owned and released only once ClientConnection
+  // has been constructed and taken ownership; an allocation failure in the
+  // construction path closes it (via the FdOwner) instead of leaking.
   std::uint64_t identifier = 0;
   bool inserted = false;
   if (next_client_identifier_ == 0) return;  // FdOwner closes
   try {
     identifier = next_client_identifier_++;
     auto client = std::make_unique<net::ClientConnection>(
-        loop_, owned.get(),
+        loop_, fd.get(),
         [this](net::ClientConnection &connection, const http::HttpRequest &request) {
           // R-066: an unexpected request-handling exception must not leave
           // the connection paused with the request half-processed; answer with
@@ -92,7 +67,7 @@ void WorkerData::Accept(int fd) {
           }
         },
         shared_->flow_control);
-    (void)owned.release();  // ClientConnection owns the descriptor from here
+    (void)fd.release();  // ClientConnection owns the descriptor from here
     client->SetCloseCallback([&loop = loop_, state = std::weak_ptr<State>(state_),
                               identifier] { NotifyClientClosed(loop, state, identifier); });
     const auto result = clients_.emplace(identifier, std::move(client));

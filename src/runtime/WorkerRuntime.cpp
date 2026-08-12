@@ -118,19 +118,35 @@ bool WorkerRuntime::PostTask(Task task) {
   }
 }
 
-bool WorkerRuntime::PostFd(int fd, std::function<void(int)> handler) {
+bool WorkerRuntime::PostShutdown(std::function<void(net::EventLoop &)> task) {
+  if (!task) return false;
+  std::lock_guard<std::mutex> guard(queue_mutex_);
+  if (stopping_.load(std::memory_order_relaxed) || shutdown_task_) return false;
+  shutdown_task_ = std::move(task);
+  // Wake the worker so the shutdown task runs even when it is parked.
+  const int fd = wake_fd_.load(std::memory_order_relaxed);
+  if (fd >= 0) {
+    const std::uint64_t counter = 1;
+    for (;;) {
+      const ssize_t count = ::write(fd, &counter, sizeof(counter));
+      if (count == static_cast<ssize_t>(sizeof(counter))) break;
+      if (count < 0 && errno == EINTR) continue;
+      break;
+    }
+  }
+  return true;
+}
+
+bool WorkerRuntime::PostFd(int fd, std::function<void(net::FdOwner)> handler) {
   if (fd < 0 || !handler) {
     if (fd >= 0) (void)::close(fd);
     return false;
   }
   auto wrapped = [fd, handler = std::move(handler)]() mutable {
-    try {
-      handler(fd);
-    } catch (...) {
-      // The handler failed after taking over the descriptor: close it so a
-      // partially initialized resource can never leak the fd.
-      (void)::close(fd);
-    }
+    // The handler adopts the move-only owner; a throw destroys it and closes
+    // the descriptor exactly once, whether or not it was already handed on.
+    net::FdOwner owned(fd);
+    handler(std::move(owned));
   };
   if (!PostTask(Task(std::move(wrapped)))) {
     // Rejected: the task was popped and destroyed without running, and its
@@ -180,10 +196,26 @@ void WorkerRuntime::HandleWake(net::EventLoop &loop) {
     }
   }
   DrainQueue(loop);
+  DrainShutdownTask(loop);
   {
     std::lock_guard<std::mutex> guard(queue_mutex_);
-    if (stopping_.load(std::memory_order_relaxed) && tasks_.empty()) {
+    if (stopping_.load(std::memory_order_relaxed) && tasks_.empty() && !shutdown_task_) {
       loop.Quit();
+    }
+  }
+}
+
+void WorkerRuntime::DrainShutdownTask(net::EventLoop &loop) {
+  std::function<void(net::EventLoop &)> task;
+  {
+    std::lock_guard<std::mutex> guard(queue_mutex_);
+    task = std::move(shutdown_task_);
+  }
+  if (task) {
+    try {
+      task(loop);
+    } catch (...) {
+      // A shutdown task must never break the stop decision.
     }
   }
 }

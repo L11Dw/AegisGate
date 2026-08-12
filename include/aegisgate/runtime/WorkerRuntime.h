@@ -9,6 +9,8 @@
 #include <thread>
 #include <utility>
 
+#include "aegisgate/net/Fd.h"
+
 namespace aegisgate::net {
 class EventLoop;
 } // namespace aegisgate::net
@@ -59,13 +61,22 @@ public:
   // runs, so loop-attached objects (TimerQueue, Channels) can be constructed
   // and destroyed on their owner thread.  Same acceptance rules as Post().
   [[nodiscard]] bool PostWithLoop(std::function<void(net::EventLoop &)> task);
+  // Reserved shutdown/destroy slot (R-063/R-067): a single task that is always
+  // accepted while the worker runs, even when the control queue is full, and is
+  // drained on the worker thread before the loop quits.  This is how an owner
+  // tears down its loop-attached objects without spinning on a full queue and
+  // without leaking them.  Returns false only when the worker is already
+  // stopping or a shutdown task is already pending — the caller must treat that
+  // as an explicit shutdown failure, never as a leak to swallow.
+  [[nodiscard]] bool PostShutdown(std::function<void(net::EventLoop &)> task);
   // fd handoff with an explicit ownership contract (R-056): on success the
-  // worker runs handler(fd) and the handler is the sole fd owner from then on;
-  // on any rejection (not started, queue full, stopping, wake failure) the API
-  // closes `fd` itself and returns false, so the caller must not close it.  A
-  // throwing handler is absorbed and its fd closed by the wrapper, so a
-  // partially initialized resource can never leak the descriptor.
-  [[nodiscard]] bool PostFd(int fd, std::function<void(int)> handler);
+  // worker runs handler(fd) and the handler adopts the move-only FdOwner (moves
+  // it into its storage or release()s it into a connection); on any rejection
+  // (not started, queue full, stopping, wake failure) the API closes the
+  // descriptor itself and returns false.  A throwing handler destroys its
+  // FdOwner, closing the descriptor exactly once — the raw int is never passed,
+  // so the wrapper can never double-close an adopted fd.
+  [[nodiscard]] bool PostFd(int fd, std::function<void(net::FdOwner)> handler);
 
 private:
   struct Task {
@@ -79,6 +90,7 @@ private:
   void Run();
   void HandleWake(net::EventLoop &loop);
   void DrainQueue(net::EventLoop &loop);
+  void DrainShutdownTask(net::EventLoop &loop);
   [[nodiscard]] bool PostTask(Task task);
 
   std::size_t task_capacity_;
@@ -89,6 +101,8 @@ private:
   std::atomic<int> wake_fd_;
   std::mutex queue_mutex_;
   std::deque<Task> tasks_;
+  // The reserved shutdown/destroy task; guarded by queue_mutex_.
+  std::function<void(net::EventLoop &)> shutdown_task_;
   std::atomic_bool started_{false};
   std::atomic_bool stopping_{false};
   std::atomic<std::thread::id> owner_thread_{};

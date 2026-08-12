@@ -9,7 +9,10 @@
 
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <sys/resource.h>
 #include <poll.h>
+#include <sys/wait.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -269,4 +272,41 @@ TEST(OutcomeChannelTest, CapacityOverflowRejected) {
 }
 
 } // namespace
+
+
+// R-065: a constructor failure before eventfd() must not close a reused
+// descriptor through the partially-constructed State destructor (in particular
+// stdin, fd 0).  wake_fd defaults to -1, so the destructor closes nothing.
+// The failure injection runs in a forked child because exhausting RLIMIT_NOFILE
+// in-process breaks a sanitizer runtime's own descriptors; under a sanitizer
+// build the test is skipped (the -1 default is a plain code property).  The
+// preprocessor guard lives inside one TEST so gtest_add_tests never sees a
+// duplicate name.
+TEST(OutcomeChannelTest, EventfdFailureDoesNotCloseStdin) {
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+  GTEST_SKIP() << "setrlimit-based fd exhaustion is incompatible with sanitizer runtimes";
+#else
+  const pid_t pid = ::fork();
+  ASSERT_NE(pid, -1);
+  if (pid == 0) {
+    struct rlimit limit{};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) _exit(10);
+    limit.rlim_cur = 0;  // exhaust the descriptor table so eventfd() fails
+    if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) _exit(11);
+    try {
+      (void)OutcomeChannel(8);
+      _exit(12);  // construction unexpectedly succeeded
+    } catch (const std::system_error &) {
+    } catch (...) {
+      _exit(13);
+    }
+    _exit(::fcntl(0, F_GETFD) == -1 ? 14 : 0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+  ASSERT_TRUE(WIFEXITED(status)) << "child crashed during failure injection";
+  EXPECT_EQ(WEXITSTATUS(status), 0) << "child reported " << WEXITSTATUS(status);
+#endif
+}
+
 } // namespace aegisgate::health

@@ -19,6 +19,7 @@
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
 #include "aegisgate/runtime/WorkerData.h"
+#include "aegisgate/net/Fd.h"
 #include "aegisgate/runtime/WorkerRuntime.h"
 #include "aegisgate/runtime/WorkerShared.h"
 
@@ -139,7 +140,7 @@ TEST(WorkerDataTest, LeaseReturnedOnWorkerStop) {
 
   std::array<int, 2> fds{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds.data()), 0);
-  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data->Accept(fds[1]); }));
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data->Accept(net::FdOwner(fds[1])); }));
 
   std::string error;
   constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: lease.test\r\n\r\n";
@@ -208,7 +209,7 @@ TEST(WorkerDataTest, LeaseReturnedAfterCoordinatorStops) {
   }
   std::array<int, 2> fds{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds.data()), 0);
-  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data->Accept(fds[1]); }));
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data->Accept(net::FdOwner(fds[1])); }));
   std::string error;
   constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: lease.test\r\n\r\n";
   ASSERT_TRUE(WriteAll(fds[0], request, TestDeadline(), error)) << error;

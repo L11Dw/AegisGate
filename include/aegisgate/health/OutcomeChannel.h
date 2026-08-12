@@ -115,7 +115,9 @@ private:
     std::atomic<std::uint32_t> tail{0};  // next dequeue slot (consumer only)
     std::atomic<std::uint64_t> rejected{0};
     std::uint32_t capacity{};
-    int wake_fd{};
+    // Defaults to -1 so a constructor failure before eventfd() never closes a
+    // reused descriptor (in particular stdin) through the destructor.
+    int wake_fd{-1};
     std::unique_ptr<Slot[]> slots;
 
     void Enqueue(AttemptResult result) noexcept;

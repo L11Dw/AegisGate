@@ -53,8 +53,10 @@ public:
   GlobalAdmission(const GlobalAdmission &) = delete;
   GlobalAdmission &operator=(const GlobalAdmission &) = delete;
 
-  // Coordinator-loop refill (single writer, but atomic and callable from any
-  // thread): accrues rate tokens per elapsed second, capped at burst.
+  // Coordinator-loop refill: accrues rate tokens per elapsed second, capped at
+  // burst.  The credit counter is atomic, but last_refill_ is a plain member,
+  // so Refill must only be called from the coordinator loop (or a single test
+  // thread); it is not safe for concurrent callers.
   void Refill(Clock::time_point now) noexcept;
   // Worker-side lease draw: takes up to `want` whole tokens from the global
   // credit.  Safe from any thread.

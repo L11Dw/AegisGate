@@ -14,21 +14,6 @@
 #include "aegisgate/resilience/GlobalAdmission.h"
 
 namespace aegisgate::gateway {
-namespace {
-// Bounded shutdown-destroy retries: a live, draining worker always accepts the
-// destroy task on the first tries, so exhausting this bound means the worker
-// thread is gone and retrying would spin forever (R-063).
-constexpr int kShutdownPostAttempts = 256;
-
-// Fatal-crash leak holder: when a worker thread died without accepting its
-// destroy task, the WorkerData is kept alive here rather than destroyed
-// off-thread (its loop-attached objects can only be torn down on the worker
-// thread).  Reached only when the worker has already crashed.
-std::vector<std::shared_ptr<runtime::WorkerData>> &WorkerDataLeaks() {
-  static std::vector<std::shared_ptr<runtime::WorkerData>> leaks;
-  return leaks;
-}
-} // namespace
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port, net::StreamFlowControl flow_control)
@@ -71,6 +56,7 @@ Gateway::~Gateway() {
   // them; only then drain the remaining published outcomes on the coordinator
   // loop and stop the coordinator — a worker still publishing to a stopped
   // coordinator would lose breaker accounting.
+  lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
   coordinator_->BeginOutcomeStopping();
@@ -82,24 +68,14 @@ Gateway::~Gateway() {
     auto &worker = workers_->At(index);
     // The destroy task must run on the worker thread (loop-attached objects);
     // it captures `data` (a reference into this member vector, alive until the
-    // join below) and resets it when it runs.  R-063: bounded retry, never an
-    // infinite spin — a live draining worker always accepts, so a rejection
-    // means the worker thread is gone; abandon the worker data rather than
-    // burn a core (it cannot be safely destroyed off-thread).
-    bool accepted = false;
-    for (int attempt = 0; attempt < kShutdownPostAttempts; ++attempt) {
-      if (worker.PostWithLoop([&data](net::EventLoop &) mutable { data.reset(); })) {
-        accepted = true;
-        break;
-      }
-      std::this_thread::yield();
-    }
-    if (!accepted && data) {
-      (void)std::fprintf(stderr,
-                         "fatal: worker destroy task not accepted; worker data leaked\n");
-      // Keep the WorkerData alive instead of destroying it off-thread (its
-      // loop-attached objects can only be torn down on the worker thread).
-      WorkerDataLeaks().push_back(std::move(data));
+    // join below) and resets it when it runs.  R-063/R-067: the reserved
+    // shutdown slot is always accepted while the worker runs, so the destroy
+    // task is guaranteed to execute on its owner thread — a rejection means the
+    // worker is already gone, which is an explicit shutdown failure (abort),
+    // never a silent leak.
+    if (!worker.PostShutdown([&data](net::EventLoop &) mutable { data.reset(); })) {
+      (void)std::fprintf(stderr, "fatal: worker %zu destroy task not accepted\n", index);
+      std::terminate();
     }
   }
   if (workers_) workers_->StopAll();
@@ -107,11 +83,14 @@ Gateway::~Gateway() {
   // loop before stopping.
   coordinator_->DrainOutcomesAndWait();
   coordinator_->Stop();
-  // worker_datas_ entries are all empty: the destroy tasks ran on their
-  // workers (or were intentionally abandoned after the bounded retry gave up).
+  // worker_datas_ entries are all empty: the destroy tasks ran on their workers.
 }
 
 void Gateway::Start() {
+  if (lifecycle_ != Lifecycle::kNotStarted) {
+    throw std::logic_error("gateway cannot be started twice");
+  }
+  lifecycle_ = Lifecycle::kStarting;
   coordinator_->Start();
   workers_ = std::make_unique<runtime::WorkerSet>(config_snapshot_->config.workers);
   workers_->Start();
@@ -136,6 +115,7 @@ void Gateway::Start() {
     future.get();
   }
   acceptor_->Listen();
+  lifecycle_ = Lifecycle::kRunning;
 }
 
 std::uint16_t Gateway::port() const { return acceptor_->port(); }
@@ -195,15 +175,15 @@ void Gateway::Accept(int fd) {
     return;
   }
   const runtime::WorkerSet::WorkerHandle handle = workers_->Next();
-  // R-056: on success the handler owns the fd; on rejection PostFd closes it,
-  // so the gateway never closes it twice.
-  (void)handle.worker.PostFd(fd, [this, worker_index = handle.index](int fd) {
+  // R-056: on success the handler adopts the move-only FdOwner; on rejection
+  // PostFd closes it, so the gateway never closes it twice.
+  (void)handle.worker.PostFd(fd, [this, worker_index = handle.index](net::FdOwner fd) {
     auto &slot = worker_datas_[worker_index];
     if (slot) {
-      slot->Accept(fd);
-    } else {
-      (void)::close(fd);
+      slot->Accept(std::move(fd));
     }
+    // If the slot is gone (worker tearing down), the FdOwner closes the
+    // descriptor on destruction.
   });
 }
 

@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "aegisgate/net/EventLoop.h"
+#include "aegisgate/net/Fd.h"
 #include "aegisgate/runtime/WorkerRuntime.h"
 
 #include "../support/WakeFd.h"
@@ -370,7 +371,7 @@ TEST(WorkerRuntimeTest, PostFdRejectsWhenFullAndClosesFd) {
     }));
   }
   // Queue full: PostFd rejects and the API closes the handed descriptor.
-  EXPECT_FALSE(worker.PostFd(peer[1], [](int) {}));
+  EXPECT_FALSE(worker.PostFd(peer[1], [](net::FdOwner) {}));
   EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
   char byte = '\0';
   EXPECT_EQ(::read(peer[0], &byte, 1), 0) << "peer must see EOF (fd closed by the API)";
@@ -397,7 +398,7 @@ TEST(WorkerRuntimeTest, PostFdRejectsWhenStoppedAndClosesFd) {
   WorkerRuntime worker;
   worker.Start();
   worker.Stop();
-  EXPECT_FALSE(worker.PostFd(peer[1], [](int) {}));
+  EXPECT_FALSE(worker.PostFd(peer[1], [](net::FdOwner) {}));
   EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
   char byte = '\0';
   EXPECT_EQ(::read(peer[0], &byte, 1), 0) << "peer must see EOF (fd closed by the API)";
@@ -413,9 +414,9 @@ TEST(WorkerRuntimeTest, PostFdRunsHandlerWithOwnedFd) {
   auto future = handled.get_future();
   WorkerRuntime worker;
   worker.Start();
-  ASSERT_TRUE(worker.PostFd(peer[1], [&](int fd) {
-    received.store(fd);
-    (void)::close(fd);  // the handler owns and closes the descriptor
+  ASSERT_TRUE(worker.PostFd(peer[1], [&](net::FdOwner fd) {
+    received.store(fd.get());
+    (void)::close(fd.release());  // the handler owns and closes the descriptor
     handled.set_value();
   }));
   future.get();
@@ -434,7 +435,7 @@ TEST(WorkerRuntimeTest, PostFdHandlerThrowClosesFd) {
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, peer.data()), 0);
   WorkerRuntime worker;
   worker.Start();
-  ASSERT_TRUE(worker.PostFd(peer[1], [](int) { throw std::runtime_error("handler boom"); }));
+  ASSERT_TRUE(worker.PostFd(peer[1], [](net::FdOwner) { throw std::runtime_error("handler boom"); }));
   EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
   char byte = '\0';
   EXPECT_EQ(::read(peer[0], &byte, 1), 0) << "peer must see EOF (wrapper closed the fd)";
@@ -454,7 +455,7 @@ TEST(WorkerRuntimeTest, WakeWriteFailurePopsTaskAndClosesFd) {
   worker.Start();
   std::atomic_int runs{0};
   EXPECT_FALSE(worker.Post([&] { ++runs; }));
-  EXPECT_FALSE(worker.PostFd(peer[1], [](int) {}));
+  EXPECT_FALSE(worker.PostFd(peer[1], [](net::FdOwner) {}));
   EXPECT_TRUE(WaitFor(peer[0], POLLIN | POLLHUP, TestDeadline()));
   char byte = '\0';
   EXPECT_EQ(::read(peer[0], &byte, 1), 0);
@@ -512,6 +513,59 @@ TEST(WorkerRuntimeTest, StopFromOwnerThreadDoesNotSelfJoin) {
   // A subsequent external Stop joins the thread that quit on its own.
   worker.Stop();
   EXPECT_FALSE(worker.IsOwnerThread());
+}
+
+
+// R-063/R-067: the reserved shutdown slot is accepted even when the control
+// queue is full and its task runs on the worker thread; a second shutdown task
+// is refused.
+TEST(WorkerRuntimeTest, PostShutdownRunsDestroyTaskWhenQueueFull) {
+  std::array<int, 2> gate{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate.data()), 0);
+  std::string error;
+  std::atomic_int destroyed{0};
+  WorkerRuntime worker(/*task_capacity=*/2);
+  worker.Start();
+  for (int index = 0; index != 2; ++index) {
+    ASSERT_TRUE(worker.Post([&] {
+      char release = '\0';
+      (void)::read(gate[0], &release, 1);
+    }));
+  }
+  // The reserved shutdown slot is accepted even with the queue full.
+  ASSERT_TRUE(worker.PostShutdown([&](net::EventLoop &) { ++destroyed; }));
+  EXPECT_FALSE(worker.PostShutdown([](net::EventLoop &) {}));
+  ASSERT_EQ(::write(gate[1], "rr", 2), 2);
+  worker.Stop();
+  EXPECT_TRUE(error.empty()) << error;
+  EXPECT_EQ(destroyed.load(), 1);
+  EXPECT_EQ(::close(gate[0]), 0);
+  EXPECT_EQ(::close(gate[1]), 0);
+}
+
+// R-056: a handler that adopts the descriptor (release) and then throws must
+// not have the wrapper close it — the FdOwner it held is empty, so the adopted
+// descriptor survives for its adopter to close exactly once.
+TEST(WorkerRuntimeTest, AdoptedFdSurvivesHandlerThrow) {
+  std::array<int, 2> peer{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, peer.data()), 0);
+  std::atomic_int adopted{-1};
+  std::promise<void> ran;
+  auto future = ran.get_future();
+  WorkerRuntime worker;
+  worker.Start();
+  ASSERT_TRUE(worker.PostFd(peer[1], [&](net::FdOwner fd) {
+    adopted.store(fd.release());  // the handler takes ownership
+    ran.set_value();
+    throw std::runtime_error("after adopting");
+  }));
+  future.get();
+  // The wrapper unwound and must NOT have closed the adopted descriptor.
+  pollfd descriptor{peer[0], POLLIN | POLLHUP, 0};
+  EXPECT_EQ(::poll(&descriptor, 1, 200), 0) << "adopted fd must not be closed by the wrapper";
+  if (adopted.load() >= 0) (void)::close(adopted.load());  // the adopter closes once
+  worker.Stop();
+  EXPECT_EQ(::close(peer[0]), 0);
 }
 
 } // namespace aegisgate::runtime

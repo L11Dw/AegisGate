@@ -70,32 +70,21 @@ void Coordinator::Stop() noexcept {
   // reference and resets it when it runs, destroying LoopData on the
   // coordinator thread.  `data` stays in scope until Stop returns (the join
   // guarantees the accepted destroy task ran during the drain), so the
-  // reference can never dangle.
+  // reference can never dangle.  R-063/R-067: the reserved shutdown slot is
+  // always accepted while the coordinator runs, so the destroy task is
+  // guaranteed to execute on its owner thread — a rejection means the thread
+  // is already gone, which is an explicit shutdown failure (abort), never a
+  // silent leak.
   std::unique_ptr<LoopData> data;
   if (loop_data_) {
     data = std::move(loop_data_);
-    // R-063: bounded retry, never an infinite spin.  A live, draining
-    // coordinator loop always accepts the destroy task; a rejection means the
-    // coordinator thread is gone, and retrying forever would burn a core.
-    // Give up after the bound and abandon the loop-attached objects (they can
-    // only be destroyed on the coordinator thread, which no longer runs).
-    bool accepted = false;
-    for (int attempt = 0; attempt < kShutdownPostAttempts; ++attempt) {
-      if (runtime_->PostWithLoop([&data](net::EventLoop &) mutable { data.reset(); })) {
-        accepted = true;
-        break;
-      }
-      std::this_thread::yield();
-    }
-    if (!accepted && data) {
-      (void)std::fprintf(stderr,
-                         "fatal: coordinator destroy task not accepted; loop data leaked\n");
-      (void)data.release();
+    if (!runtime_->PostShutdown([&data](net::EventLoop &) mutable { data.reset(); })) {
+      (void)std::fprintf(stderr, "fatal: coordinator destroy task not accepted\n");
+      std::terminate();
     }
   }
   runtime_->Stop();
-  // data is empty here: the destroy task ran on the coordinator thread (or was
-  // intentionally abandoned after the bounded retry gave up).
+  // data is empty here: the destroy task ran on the coordinator thread.
 }
 
 std::shared_ptr<const HealthCircuitSnapshot> Coordinator::CurrentSnapshot() const noexcept {
@@ -120,27 +109,18 @@ void Coordinator::BeginOutcomeStopping() noexcept {
   }
 }
 
-void Coordinator::DrainOutcomesAndWait() noexcept {
+void Coordinator::DrainOutcomesAndWait() {
   std::promise<void> drained;
   auto future = drained.get_future();
-  // R-063: bounded retry.  The coordinator loop is running during gateway
-  // shutdown (this runs before Stop()), so the drain task is normally accepted
-  // on the first try; a rejection means the loop is stuck, and spinning would
-  // burn a core forever.
-  bool accepted = false;
-  for (int attempt = 0; attempt < kShutdownPostAttempts; ++attempt) {
-    if (PostTask([this, &drained] {
-          DrainAllOutcomeChannels();
-          drained.set_value();
-        })) {
-      accepted = true;
-      break;
-    }
-    std::this_thread::yield();
-  }
-  if (!accepted) {
-    (void)std::fprintf(stderr, "fatal: coordinator outcome drain task not accepted\n");
-    return;
+  // The coordinator loop is running during gateway shutdown (this runs before
+  // Stop()), so the drain task is accepted on the first try; a rejection means
+  // the loop is stuck, which must fail the shutdown loudly rather than skip
+  // draining published outcomes silently.
+  if (!PostTask([this, &drained] {
+        DrainAllOutcomeChannels();
+        drained.set_value();
+      })) {
+    throw std::logic_error("coordinator outcome drain task was not accepted");
   }
   future.wait();
 }
@@ -165,14 +145,17 @@ std::optional<AttemptPermit> Coordinator::ClaimProbe(
 void Coordinator::SubmitResultAndWait(const AttemptResult &result) {
   std::promise<void> processed;
   auto future = processed.get_future();
-  while (!PostTask([this, result, &processed] {
-    try {
-      RecordResultTask(result);
-      processed.set_value();
-    } catch (...) {
-      processed.set_exception(std::current_exception());
-    }
-  })) {
+  // Test seam: a rejection means the coordinator is stopping or its queue is
+  // broken; fail loudly instead of busy-looping on the caller's core.
+  if (!PostTask([this, result, &processed] {
+        try {
+          RecordResultTask(result);
+          processed.set_value();
+        } catch (...) {
+          processed.set_exception(std::current_exception());
+        }
+      })) {
+    throw std::logic_error("coordinator result submission was not accepted");
   }
   future.get();
 }
@@ -180,10 +163,11 @@ void Coordinator::SubmitResultAndWait(const AttemptResult &result) {
 void Coordinator::RecordHealthAndWait(std::size_t route, std::size_t endpoint, bool healthy) {
   std::promise<void> processed;
   auto future = processed.get_future();
-  while (!PostTask([this, route, endpoint, healthy, &processed] {
-    RecordHealthTask(route, endpoint, healthy);
-    processed.set_value();
-  })) {
+  if (!PostTask([this, route, endpoint, healthy, &processed] {
+        RecordHealthTask(route, endpoint, healthy);
+        processed.set_value();
+      })) {
+    throw std::logic_error("coordinator health submission was not accepted");
   }
   future.get();
 }

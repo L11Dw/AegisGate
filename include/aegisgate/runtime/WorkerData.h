@@ -10,6 +10,7 @@
 #include "aegisgate/http/HttpRequestParser.h"
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
+#include "aegisgate/net/Fd.h"
 #include "aegisgate/net/StreamFlowControl.h"
 #include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/observability/Metrics.h"
@@ -36,9 +37,9 @@ public:
   WorkerData(const WorkerData &) = delete;
   WorkerData &operator=(const WorkerData &) = delete;
 
-  // Runs on the worker thread: takes ownership of the accepted fd (already
-  // nonblocking) and registers a client connection.
-  void Accept(int fd);
+  // Runs on the worker thread: takes ownership of the accepted descriptor
+  // (already nonblocking) and registers a client connection.
+  void Accept(net::FdOwner fd);
   // Runs on the worker thread during shutdown: terminates every exchange
   // (pool CancelAll) and drops the clients so transactions release via RAII.
   void Shutdown() noexcept;

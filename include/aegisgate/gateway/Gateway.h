@@ -50,10 +50,16 @@ public:
   Gateway(const Gateway &) = delete;
   Gateway &operator=(const Gateway &) = delete;
 
+  // Explicit lifecycle state (R-067 low-risk): Start() rejects a second start
+  // and the destructor records the stopped state; a partial Start relies on
+  // the destructor to roll back whatever was already created.
+  enum class Lifecycle : std::uint8_t { kNotStarted, kStarting, kRunning, kStopped };
+
   void Start();
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
+  [[nodiscard]] Lifecycle lifecycle() const noexcept { return lifecycle_; }
   // Test access to the immutable config snapshot's matcher.
   [[nodiscard]] routing::RouteTable &Routes() noexcept { return routes_; }
   // M3-D test views over the live coordinator snapshot, addressed by route and
@@ -73,6 +79,7 @@ private:
   [[nodiscard]] std::string RenderMetrics() const;
 
   net::EventLoop &loop_;
+  Lifecycle lifecycle_ = Lifecycle::kNotStarted;
   // Lifecycle token observed (weakly) by in-flight transactions.  Reset on
   // the first line of the destructor so any late callback sees the gateway
   // as down before its members are torn down (R-040).

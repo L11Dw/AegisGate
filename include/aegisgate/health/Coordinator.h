@@ -72,9 +72,10 @@ public:
   // drainable.  Called before workers tear down their clients.
   void BeginOutcomeStopping() noexcept;
   // Drains every route's outcome ring on the coordinator loop and blocks until
-  // done; called after all workers have joined, before Stop().  Never throws
-  // (a bounded give-up logs and returns when the coordinator loop is stuck).
-  void DrainOutcomesAndWait() noexcept;
+  // done; called after all workers have joined, before Stop().  Throws
+  // std::logic_error when the coordinator loop cannot accept the drain task
+  // (it is stuck) so the failure is explicit, never silently skipped.
+  void DrainOutcomesAndWait();
   // Sum of outcome_reservation_rejected_total across routes (R-061).
   [[nodiscard]] std::uint64_t OutcomeRejectedTotal() const noexcept;
 
@@ -105,8 +106,6 @@ private:
   void DrainAllOutcomeChannels();
   void Publish() noexcept;
   [[nodiscard]] bool PostTask(std::function<void()> task) noexcept;
-
-  static constexpr int kShutdownPostAttempts = 256;
 
   std::shared_ptr<const config::Config> config_;
   std::unique_ptr<CoordinatorState> state_;

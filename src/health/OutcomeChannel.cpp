@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <exception>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -92,16 +93,18 @@ std::uint64_t OutcomeChannel::rejected() const noexcept {
 int OutcomeChannel::WakeFd() const noexcept { return state_->wake_fd; }
 
 void OutcomeChannel::State::Enqueue(AttemptResult result) noexcept {
-  // The reservation accounting guarantees head - tail never reaches capacity:
-  // a published-but-undrained outcome still occupies the credit its attempt
-  // reserved.  A violation is an internal invariant break; do not silently
-  // swallow the outcome — revert the claim and record a fatal.
+  // The reservation accounting guarantees head - tail never reaches capacity
+  // (R-053): a published-but-undrained outcome still occupies the credit its
+  // attempt reserved, so the ring cannot be full when a reserved result
+  // publishes.  A violation is an internal invariant break that must never be
+  // silently swallowed — a fetch_sub rollback is not linearizable under
+  // concurrent producers and would both lose the result and exhaust the
+  // credit; abort instead of continuing with corrupted accounting.
   const std::uint32_t claimed = head.fetch_add(1, std::memory_order_relaxed);
   const std::uint32_t tail_now = tail.load(std::memory_order_acquire);
   if (claimed - tail_now >= capacity) {
-    head.fetch_sub(1, std::memory_order_relaxed);
     std::fprintf(stderr, "fatal: OutcomeChannel ring overflow (capacity %u)\n", capacity);
-    return;
+    std::terminate();
   }
   const std::uint32_t slot = claimed % capacity;
   slots[slot].value = result;
