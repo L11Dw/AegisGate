@@ -34,6 +34,13 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
   worker_shared_->flow_control = flow_control_;
   worker_shared_->lifetime_token = lifetime_token_;
   worker_shared_->metrics_renderer = [this] { return RenderMetrics(); };
+  worker_shared_->log_callback = [this](std::string level, std::string event,
+                                        std::uint16_t status, std::string reason,
+                                        std::uint64_t latency_us, std::uint32_t retries,
+                                        std::uint64_t request_bytes, std::uint64_t response_bytes) {
+    Log(std::move(level), std::move(event), {}, {}, status, std::move(reason),
+        latency_us, retries, request_bytes, response_bytes);
+  };
   worker_metrics_.resize(generation->snapshot()->config.workers);
   client_counts_.resize(generation->snapshot()->config.workers);
   for (std::size_t index = 0; index < generation->snapshot()->config.workers; ++index) {

@@ -160,10 +160,13 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
       [selector = std::move(selector), least_active]() mutable {
         return selector.Select(least_active);
       };
-  (void)proxy::ProxyTransaction::Start(
+  auto txn = proxy::ProxyTransaction::Start(
       loop_, client, route.endpoints.front(), request, pool_, std::move(reservation),
       timers_.get(), std::move(policy), metrics_, route.name, std::move(provider),
       std::weak_ptr<void>(shared_->lifetime_token), std::move(generation_lease));
+  if (shared_->log_callback && generation) {
+    txn->SetLogCallback(shared_->log_callback, generation->version());
+  }
 }
 
 bool WorkerData::TryAdmit(const RuntimeGenerationRef &generation, std::size_t route_index,

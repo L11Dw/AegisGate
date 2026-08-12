@@ -89,6 +89,17 @@ public:
   // exhausted); the initial call terminates with a unique 503 and a retry call
   // terminates the transaction.
   using AttemptProvider = std::function<AttemptDecision()>;
+  using LogCallback = std::function<void(std::string level, std::string event,
+                                         std::uint16_t status, std::string reason,
+                                         std::uint64_t latency_us, std::uint32_t retries,
+                                         std::uint64_t request_bytes, std::uint64_t response_bytes)>;
+
+  // Sets the log callback and request generation version.  Must be called
+  // before the transaction reaches a terminal state.
+  void SetLogCallback(LogCallback cb, std::uint64_t generation_version) {
+    log_callback_ = std::move(cb);
+    request_generation_version_ = generation_version;
+  }
 
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
@@ -99,7 +110,9 @@ public:
         AttemptProvider attempt_provider = {},
         std::optional<std::weak_ptr<void>> gateway_lifetime = std::nullopt,
         std::optional<runtime::RuntimeGeneration::RequestLease> request_generation_lease =
-            std::nullopt);
+            std::nullopt,
+        LogCallback log_callback = {},
+        std::uint64_t request_generation_version = 0);
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -149,6 +162,8 @@ private:
   void HandleUpstream(net::UpstreamResult result, http::HttpResponse response);
   void CompleteMetric(int status, bool rate_limited = false,
                      std::string_view reason = {}) noexcept;
+  void LogTerminal(std::string level, std::string event, std::uint16_t status = 0,
+                   std::string reason = {}, std::uint64_t latency_us = 0) noexcept;
   [[nodiscard]] std::string UpstreamLabel() const;
 
   net::EventLoop &loop_;
@@ -204,6 +219,11 @@ private:
   bool starting_upstream_ = false;
   bool finished_ = false;
   http::HttpResponseHead response_head_;
+  LogCallback log_callback_;
+  std::uint64_t request_generation_version_ = 0;
+  std::uint64_t request_bytes_ = 0;
+  std::uint64_t response_bytes_ = 0;
+  bool logged_ = false;  // one-shot: each transaction logs exactly once.
 };
 
 } // namespace aegisgate::proxy
