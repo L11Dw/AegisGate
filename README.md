@@ -1,73 +1,89 @@
 # AegisGate
 
-> A high-performance HTTP API gateway built with C++20 on Linux.
+> **An event-driven HTTP gateway for predictable operations.**
 
-## Status
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-**In design and implementation planning.** AegisGate is being built incrementally; every implemented capability will be accompanied by tests and reproducible evidence. This repository does not claim production readiness or a target QPS before measurements exist.
+![AegisGate request flow](docs/assets/aegisgate-flow-light.png)
 
-## Problem
+AegisGate is an HTTP/1.1 reverse proxy for Linux services. It routes requests to upstream services while making ownership, overload protection, failure handling, and configuration changes explicit and observable.
 
-Services commonly need a single entry point that can route requests to multiple backend instances while protecting both the gateway and its upstreams under overload or partial failure. AegisGate focuses on four practical concerns:
+It provides a runnable demo and reproducible verification. It does **not** claim production readiness or a universal throughput figure.
 
-- route HTTP requests by `Host` and path prefix;
-- distribute traffic across healthy backend instances;
-- bound work with rate limits, in-flight limits, timeouts, and safe retries;
-- make latency, failures, and protection decisions observable.
+## Highlights
 
-## Scope
+- Event-driven Linux I/O with `epoll`, `eventfd`, `timerfd`, and non-blocking sockets.
+- Host/path routing, weighted and least-active selection, worker-local connection pools.
+- Global admission, timeouts, bounded retries, health checks, and circuit breaking.
+- Multi-worker I/O, response backpressure, atomic configuration reload, Prometheus metrics, and JSON Lines logs.
 
-The first deliverable is a single-event-loop HTTP/1.1 reverse proxy with upstream Keep-Alive reuse, weighted round-robin, route-level admission control, timeout handling, limited idempotent retries, metrics, fault-injectable mock backends, and reproducible tests and benchmarks.
-
-Subsequent deliverables add multi-worker I/O, active health checks, circuit breaking, backpressure, configuration reload, structured logging, and performance analysis. Adaptive overload control is an optional experiment only; it will be retained only if controlled measurements demonstrate a benefit.
-
-Deliberate non-goals include HTTP/2, HTTP/3, gRPC, WebSocket, TLS termination, service discovery, distributed control planes, and HTTP chunked transfer encoding.
-
-## Architecture
-
-```text
-Client
-  │ HTTP/1.1
-  ▼
-AegisGate
-  ├── route matching and admission control
-  ├── load balancing and upstream connection reuse
-  ├── timeout / retry / fault isolation
-  └── metrics and structured logs
-  ▼
-Mock or application backends
-```
-
-See [the design document](AegisGate-%E8%AE%BE%E8%AE%A1%E6%96%87%E6%A1%A3.md) for protocol boundaries, state ownership, failure handling, and verification criteria.
-
-## Run the demo
-
-The local Compose demo builds the existing CMake targets, starts the gateway and two deterministic mock backends, and publishes the gateway at `127.0.0.1:8080`.
+## Quick start
 
 ```bash
 docker compose -f deploy/docker-compose.yml up --build
 curl -i -H 'Host: normal.demo.local' http://127.0.0.1:8080/
-curl -i -H 'Host: fault.demo.local' http://127.0.0.1:8080/
 curl -s http://127.0.0.1:8080/metrics
+docker compose -f deploy/docker-compose.yml down -v --remove-orphans
 ```
 
-The demo uses fixed private Docker-network addresses because this MVP deliberately accepts only literal IPv4 upstream endpoints; it does not perform DNS resolution. See [benchmark/README.md](benchmark/README.md) for a reproducible measurement procedure and result-record template.
+For a scripted demo that verifies forwarding, logs, and SIGHUP reload:
 
-## Planned verification
+```bash
+./scripts/verify-compose-demo.sh
+```
 
-- unit and integration tests, including TCP segmentation, malformed HTTP, connection reuse, timeouts, and fault injection;
-- ASan/UBSan coverage for core integration scenarios;
-- reproducible load tests reporting QPS, P50/P99 latency, error rate, CPU, memory, and optimization deltas;
-- a Docker Compose demo that reproduces backend degradation and traffic protection.
+To build locally:
 
-## Technology
+```bash
+cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build/release
+./build/release/aegisgate_server configs/demo.yaml 8080 --log-path ./aegisgate.jsonl
+```
 
-- C++20 on Linux
-- epoll, eventfd, timerfd, non-blocking sockets
-- CMake and Ninja
-- GoogleTest, yaml-cpp, Prometheus text exposition
-- perf, Sanitizers, wrk/wrk2, FlameGraph
+## Documentation
+
+| Topic | English | 简体中文 |
+|---|---|---|
+| Architecture and ownership | [Read](docs/en/architecture.md) | [阅读](docs/zh-CN/architecture.md) |
+| Operations and reload | [Read](docs/en/operations.md) | [阅读](docs/zh-CN/operations.md) |
+| Metrics and logs | [Read](docs/en/observability.md) | [阅读](docs/zh-CN/observability.md) |
+| Protocol boundaries | [Read](docs/en/limitations.md) | [阅读](docs/zh-CN/limitations.md) |
+| Benchmark evidence | [Read](docs/en/benchmark-report.md) | [阅读](docs/zh-CN/benchmark-report.md) |
+| Release validation | [Read](docs/en/release-validation.md) | [阅读](docs/zh-CN/release-validation.md) |
+
+## Architecture
+
+```text
+Clients → Acceptor → I/O workers → upstream services
+                       │
+                       ├─ ClientConnection / ProxyTransaction
+                       ├─ worker-local selection, timers, connection pools
+                       └─ streaming backpressure
+
+Control plane: immutable configuration generations, global admission,
+health/circuit coordination, reload, metrics, and structured logging.
+```
+
+An event-loop-owned object is accessed only by its owning thread. Cross-thread work uses bounded queues and wake descriptors; a socket descriptor is transferred only through `FdOwner`.
+
+## Verification
+
+The repository maintains Debug ASan/UBSan, plain, and ThreadSanitizer gates. The benchmark harness exercises normal forwarding, admission limiting, circuit recovery, a 512 KiB slow-reader backpressure flow, and atomic reload under traffic.
+
+```bash
+./benchmark/run.sh normal 1 5 10 3
+```
+
+Read the [benchmark guide](benchmark/README.md) before interpreting a result.
+
+## Scope and limitations
+
+This release supports HTTP/1.1 and literal IPv4 upstream endpoints. TLS termination, DNS/service discovery, HTTP chunked transfer encoding, HTTP/2, HTTP/3, gRPC, WebSocket, dynamic worker resizing, and cross-worker connection migration are deliberately out of scope. See [protocol boundaries](docs/en/limitations.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Keep changes focused, preserve the event-loop ownership model, add deterministic tests for behavior changes, and run relevant sanitizer gates before review.
 
 ## License
 
-The license will be selected before the first public code release.
+Distributed under the [MIT License](LICENSE).

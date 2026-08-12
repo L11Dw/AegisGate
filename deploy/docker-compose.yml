@@ -34,7 +34,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     entrypoint: ["/build/aegisgate_server"]
-    command: ["/src/configs/demo.yaml", "8080"]
+    command: ["/etc/aegisgate/demo.yaml", "8080", "--log-path", "/var/log/aegisgate/aegisgate.jsonl"]
     depends_on:
       normal-backend:
         condition: service_healthy
@@ -47,6 +47,11 @@ services:
       retries: 10
     ports:
       - "8080:8080"
+    volumes:
+      # The verifier supplies an isolated writable copy through this bind mount;
+      # ordinary `docker compose up` uses the checked-in demo configuration.
+      - "${AEGISGATE_CONFIG_DIR:-../configs}:/etc/aegisgate:ro"
+      - "${AEGISGATE_LOG_DIR:-../.demo-logs}:/var/log/aegisgate"
     networks:
       aegisgate-demo:
         ipv4_address: 172.29.0.20

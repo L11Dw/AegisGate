@@ -1,0 +1,34 @@
+# Version-control and local agent state
+.git/
+.worktrees/
+.superpowers/
+.codex/
+.agents/
+
+# Build and profiling output
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+*.o
+*.a
+*.so
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Runtime output and local measurements
+benchmark/results/
+.demo-logs/
+logs/
+*.log
+*.jsonl
+
+# Editor and operating-system files
+.vscode/
+.obsidian/
+*.swp
+.DS_Store

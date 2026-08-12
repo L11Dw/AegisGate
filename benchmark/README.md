@@ -1,5 +1,7 @@
 # AegisGate Benchmark
 
+[English](README.md) | [简体中文](../README.zh-CN.md) | [Method and evidence](../docs/en/benchmark-report.md)
+
 ## Quick Start
 
 ```bash
@@ -60,6 +62,8 @@ Results are written to `benchmark/results/` as JSON:
 - Results include mean/p50/p95/p99, log drop counters and scenario-specific assertions.
 - Do not modify production code based on single-run results
 - P-1～P-5 optimizations require ≥3% throughput gain, ≤5% p99 regression
+- Keep `benchmark/results/` local. Every JSON sample records its own machine,
+  kernel, and Git SHA; it is evidence for that environment, not a portable QPS claim.
 
 ## Requirements
 
