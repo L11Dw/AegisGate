@@ -80,6 +80,24 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
     reload_channel_ = std::make_unique<net::Channel>(loop_, reload_controller_->wake_fd());
     reload_channel_->SetReadCallback([this] { HandleReloadResults(); });
     reload_channel_->EnableReading();
+    // ReloadWatcher: SIGHUP + inotify + debounce.
+    reload_watcher_ = std::make_unique<runtime::ReloadWatcher>(
+        config_path_, [this] { (void)RequestReload(); });
+    if (reload_watcher_->sighup_fd() >= 0) {
+      sighup_channel_ = std::make_unique<net::Channel>(loop_, reload_watcher_->sighup_fd());
+      sighup_channel_->SetReadCallback([this] { reload_watcher_->HandleSighup(); });
+      sighup_channel_->EnableReading();
+    }
+    if (reload_watcher_->inotify_fd() >= 0) {
+      inotify_channel_ = std::make_unique<net::Channel>(loop_, reload_watcher_->inotify_fd());
+      inotify_channel_->SetReadCallback([this] { reload_watcher_->HandleInotify(); });
+      inotify_channel_->EnableReading();
+    }
+    if (reload_watcher_->timer_fd() >= 0) {
+      watcher_timer_channel_ = std::make_unique<net::Channel>(loop_, reload_watcher_->timer_fd());
+      watcher_timer_channel_->SetReadCallback([this] { reload_watcher_->HandleTimer(); });
+      watcher_timer_channel_->EnableReading();
+    }
   }
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
 }
@@ -92,6 +110,10 @@ Gateway::~Gateway() {
   lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
+  if (reload_watcher_) reload_watcher_->Stop();
+  sighup_channel_.reset();
+  inotify_channel_.reset();
+  watcher_timer_channel_.reset();
   if (reload_controller_) reload_controller_->Stop();
   reload_channel_.reset();
   // Stop the generation mailbox channel before draining events.

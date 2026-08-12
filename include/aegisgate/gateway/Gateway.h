@@ -17,6 +17,7 @@
 #include "aegisgate/runtime/ConfigSnapshot.h"
 #include "aegisgate/runtime/GenerationMailbox.h"
 #include "aegisgate/runtime/ReloadController.h"
+#include "aegisgate/runtime/ReloadWatcher.h"
 #include "aegisgate/runtime/RuntimeGeneration.h"
 #include "aegisgate/runtime/WorkerData.h"
 #include "aegisgate/runtime/WorkerSet.h"
@@ -138,6 +139,10 @@ private:
   std::unique_ptr<net::Acceptor> acceptor_;
   std::unique_ptr<runtime::ReloadController> reload_controller_;
   std::unique_ptr<net::Channel> reload_channel_;
+  std::unique_ptr<runtime::ReloadWatcher> reload_watcher_;
+  std::unique_ptr<net::Channel> sighup_channel_;
+  std::unique_ptr<net::Channel> inotify_channel_;
+  std::unique_ptr<net::Channel> watcher_timer_channel_;
   std::shared_ptr<runtime::GenerationMailbox> generation_mailbox_;
   std::unique_ptr<net::Channel> generation_mailbox_channel_;
   std::unordered_map<std::uint64_t, RetiringGeneration> retiring_generations_;
