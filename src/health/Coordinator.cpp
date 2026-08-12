@@ -62,7 +62,7 @@ void Coordinator::Start() {
 }
 
 void Coordinator::StartPrepared() {
-  Lifecycle expected = Lifecycle::kNew;
+  Lifecycle expected = Lifecycle::kActive;
   if (!lifecycle_.compare_exchange_strong(expected, Lifecycle::kPrepared,
                                            std::memory_order_acq_rel)) {
     throw std::logic_error("coordinator already started");

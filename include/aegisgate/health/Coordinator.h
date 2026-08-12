@@ -126,7 +126,10 @@ private:
   std::atomic<std::shared_ptr<const HealthCircuitSnapshot>> snapshot_{nullptr};
   std::unique_ptr<LoopData> loop_data_;
   enum class Lifecycle : std::uint8_t { kNew, kPrepared, kActive, kStopping, kStopped };
-  std::atomic<Lifecycle> lifecycle_{Lifecycle::kNew};
+  // Preserve the M3-D construction-time test/API behavior: a coordinator
+  // without a runtime loop may still reserve value-owned outcome credits.
+  // StartPrepared() changes this to kPrepared before a candidate is exposed.
+  std::atomic<Lifecycle> lifecycle_{Lifecycle::kActive};
   bool prepared_only_ = false;
 };
 
