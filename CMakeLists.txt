@@ -35,6 +35,7 @@ add_library(aegisgate STATIC
     src/runtime/RuntimeGeneration.cpp
     src/runtime/GenerationMailbox.cpp
     src/runtime/ReloadController.cpp
+    src/runtime/ReloadWatcher.cpp
     src/health/HealthChecker.cpp
     src/health/CoordinatorState.cpp
     src/health/Coordinator.cpp
