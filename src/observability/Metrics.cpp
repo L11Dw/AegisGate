@@ -36,6 +36,8 @@ struct Metrics::State {
   std::map<std::pair<std::string, std::string>, bool> upstream_health;
   std::size_t active_connections{};
   std::size_t inflight{};
+  std::uint64_t upstream_read_pauses{};
+  std::uint64_t upstream_read_resumes{};
   mutable std::mutex mutex;
 };
 
@@ -80,6 +82,16 @@ void Metrics::SetActiveConnections(std::size_t count) noexcept {
   state_->active_connections = count;
 }
 
+void Metrics::RecordUpstreamReadPause() noexcept {
+  std::lock_guard<std::mutex> guard(state_->mutex);
+  ++state_->upstream_read_pauses;
+}
+
+void Metrics::RecordUpstreamReadResume() noexcept {
+  std::lock_guard<std::mutex> guard(state_->mutex);
+  ++state_->upstream_read_resumes;
+}
+
 void Metrics::SetCircuitState(std::string_view route, std::string_view upstream,
                               std::string_view state) {
   std::lock_guard<std::mutex> guard(state_->mutex);
@@ -100,6 +112,8 @@ Metrics::Data Metrics::Snapshot() const {
   data.duration = state_->duration;
   data.active_connections = state_->active_connections;
   data.inflight = state_->inflight;
+  data.upstream_read_pauses = state_->upstream_read_pauses;
+  data.upstream_read_resumes = state_->upstream_read_resumes;
   return data;
 }
 
@@ -120,6 +134,8 @@ void Metrics::MergeInto(Data &target, const Data &source) noexcept {
   }
   target.active_connections += source.active_connections;
   target.inflight += source.inflight;
+  target.upstream_read_pauses += source.upstream_read_pauses;
+  target.upstream_read_resumes += source.upstream_read_resumes;
 }
 
 std::string Metrics::RenderPrometheus() const {
@@ -130,6 +146,8 @@ std::string Metrics::RenderPrometheus() const {
   data.duration = state_->duration;
   data.active_connections = state_->active_connections;
   data.inflight = state_->inflight;
+  data.upstream_read_pauses = state_->upstream_read_pauses;
+  data.upstream_read_resumes = state_->upstream_read_resumes;
   std::vector<ProtectionSample> protection;
   for (const auto &[key, state] : state_->circuit_states) {
     ProtectionSample sample;
@@ -195,7 +213,11 @@ std::string Metrics::RenderPrometheus(const Data &aggregate,
   output << "# TYPE aegisgate_active_connections gauge\n"
          << "aegisgate_active_connections " << aggregate.active_connections << '\n'
          << "# TYPE aegisgate_inflight_requests gauge\n"
-         << "aegisgate_inflight_requests " << aggregate.inflight << '\n';
+         << "aegisgate_inflight_requests " << aggregate.inflight << '\n'
+         << "# TYPE aegisgate_upstream_read_pauses_total counter\n"
+         << "aegisgate_upstream_read_pauses_total " << aggregate.upstream_read_pauses << '\n'
+         << "# TYPE aegisgate_upstream_read_resumes_total counter\n"
+         << "aegisgate_upstream_read_resumes_total " << aggregate.upstream_read_resumes << '\n';
   return output.str();
 }
 

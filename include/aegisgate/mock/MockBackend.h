@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -23,6 +24,10 @@ struct MockBackendOptions {
   std::chrono::milliseconds delay{};
   bool reset = false;
   std::size_t max_inflight = 64;
+  // Successful responses carry this many deterministic 'x' bytes.  The
+  // option exists to exercise Content-Length streaming and backpressure in
+  // integration/benchmark clients without adding chunked support.
+  std::size_t body_bytes = 0;
 };
 
 class MockBackend {
@@ -46,6 +51,7 @@ private:
 
   net::EventLoop &loop_;
   MockBackendOptions options_;
+  std::string response_body_;
   std::shared_ptr<State> state_;
   std::unique_ptr<net::TimerQueue> timers_;
   std::unique_ptr<net::Acceptor> acceptor_;

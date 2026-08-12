@@ -216,6 +216,7 @@ private:
   // connection: the conservative retry boundary (the kernel may not have
   // written any byte yet, but the output can no longer be replaced).
   bool downstream_response_committed_ = false;
+  bool upstream_read_paused_ = false;
   bool starting_upstream_ = false;
   bool finished_ = false;
   http::HttpResponseHead response_head_;

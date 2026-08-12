@@ -451,12 +451,18 @@ void ProxyTransaction::HandleClientAbort() {
 }
 
 void ProxyTransaction::PauseUpstreamReading() noexcept {
+  if (upstream_read_paused_) return;
+  upstream_read_paused_ = true;
+  if (metrics_) metrics_->RecordUpstreamReadPause();
   if (pool_ && active_connection_) active_connection_->PauseReading();
   if (upstream_) upstream_->PauseReading();
 }
 
 void ProxyTransaction::ResumeUpstreamReading() noexcept {
   if (finished_ || GatewayDown()) return;
+  if (!upstream_read_paused_) return;
+  upstream_read_paused_ = false;
+  if (metrics_) metrics_->RecordUpstreamReadResume();
   if (pool_ && active_connection_) active_connection_->ResumeReading();
   if (upstream_) upstream_->ResumeReading();
 }

@@ -78,4 +78,23 @@ TEST(MetricsTest, EscapesStateLabels) {
   EXPECT_NE(text.find("upstream=\"up\\nstream\""), std::string::npos);
 }
 
+TEST(MetricsTest, AggregatesStreamingBackpressurePauseAndResumeCounters) {
+  Metrics first;
+  Metrics second;
+  first.RecordUpstreamReadPause();
+  first.RecordUpstreamReadPause();
+  first.RecordUpstreamReadResume();
+  second.RecordUpstreamReadPause();
+  second.RecordUpstreamReadResume();
+  second.RecordUpstreamReadResume();
+
+  Metrics::Data aggregate;
+  Metrics::MergeInto(aggregate, first.Snapshot());
+  Metrics::MergeInto(aggregate, second.Snapshot());
+  const std::string text = Metrics::RenderPrometheus(aggregate, {});
+
+  EXPECT_NE(text.find("aegisgate_upstream_read_pauses_total 3\n"), std::string::npos);
+  EXPECT_NE(text.find("aegisgate_upstream_read_resumes_total 3\n"), std::string::npos);
+}
+
 } // namespace aegisgate::observability

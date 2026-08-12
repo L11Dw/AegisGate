@@ -16,7 +16,8 @@ namespace aegisgate::mock {
 
 MockBackend::MockBackend(net::EventLoop &loop, MockBackendOptions options, std::string_view address,
                          std::uint16_t port)
-    : loop_(loop), options_(options), state_(std::make_shared<State>()),
+    : loop_(loop), options_(options), response_body_(options.body_bytes, 'x'),
+      state_(std::make_shared<State>()),
       timers_(std::make_unique<net::TimerQueue>(loop)),
       acceptor_(std::make_unique<net::Acceptor>(loop, address, port)) {
   if (options_.status < 200 || options_.status > 599) throw std::invalid_argument("mock status must be 200..599");
@@ -91,7 +92,9 @@ void MockBackend::Deliver(std::uint64_t id) {
 void MockBackend::Send(net::ClientConnection &client, bool capacity) {
   const int status = capacity ? 503 : options_.status;
   const char *reason = capacity ? "Mock Capacity" : (status >= 500 ? "Mock Failure" : "Mock Response");
-  try { client.SendResponse(http::HttpResponse{status, reason, {}, ""}); }
+  const std::string_view body = !capacity && status >= 200 && status < 300
+                                    ? std::string_view(response_body_) : std::string_view{};
+  try { client.SendResponse(http::HttpResponse{status, reason, {}, std::string(body)}); }
   catch (const std::logic_error &) { client.Close(); }
   catch (const std::system_error &) { client.Close(); }
 }
