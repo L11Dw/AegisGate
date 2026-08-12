@@ -192,6 +192,22 @@ void WorkerData::Shutdown() noexcept {
   client_count_->store(0, std::memory_order_release);
 }
 
+void WorkerData::ReturnGenerationLeaseBalance(
+    const std::vector<std::shared_ptr<resilience::GlobalAdmission>> &admissions) noexcept {
+  // Return every unspent lease token to the old generation's admissions.
+  // Called by the retirement pipeline on the worker thread.  Each route's
+  // balance is returned and zeroed.  Idempotent: a second call returns nothing
+  // because balances are already zero.
+  for (std::size_t route = 0; route < lease_balances_.size() &&
+                              route < admissions.size();
+       ++route) {
+    if (lease_balances_[route] > 0) {
+      admissions[route]->Return(lease_balances_[route]);
+      lease_balances_[route] = 0;
+    }
+  }
+}
+
 void WorkerData::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,
                                     std::uint64_t identifier) {
   const auto state = weak_state.lock();

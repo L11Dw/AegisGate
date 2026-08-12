@@ -68,6 +68,10 @@ public:
              const HealthCircuitSnapshot &snapshot) noexcept;
 
   // --- shutdown orchestration (R-062) ---
+  // Stops all health checkers on the coordinator loop and clears them.
+  // Must be called from the coordinator thread (e.g., via a posted task).
+  // Idempotent.
+  void StopCheckers() noexcept;
   // Rejects every future reservation; already-published outcomes stay
   // drainable.  Called before workers tear down their clients.
   void BeginOutcomeStopping() noexcept;

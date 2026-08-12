@@ -12,6 +12,8 @@
 #include "aegisgate/runtime/ConfigSnapshot.h"
 
 namespace aegisgate::runtime {
+class RuntimeGeneration;
+using RuntimeGenerationRef = std::shared_ptr<RuntimeGeneration>;
 
 // The immutable, thread-safe bundle every worker shares.  config_snapshot is
 // the request-binding configuration (accessed with std::atomic_load/
@@ -26,6 +28,9 @@ struct WorkerShared {
   std::atomic<ConfigSnapshotRef> config_snapshot;
   std::shared_ptr<health::Coordinator> coordinator;
   std::vector<std::shared_ptr<resilience::GlobalAdmission>> admissions;
+  // M4-A: the one published generation.  New requests load this pointer
+  // once; retries retain the old pointer through ProxyTransaction.
+  std::atomic<RuntimeGenerationRef> current_generation;
   std::uint32_t worker_count = 1;
   net::StreamFlowControl flow_control;
   std::shared_ptr<void> lifetime_token;

@@ -32,6 +32,8 @@ add_library(aegisgate STATIC
     src/runtime/WorkerData.cpp
     src/runtime/SelectionState.cpp
     src/runtime/AttemptSelector.cpp
+    src/runtime/RuntimeGeneration.cpp
+    src/runtime/GenerationMailbox.cpp
     src/health/HealthChecker.cpp
     src/health/CoordinatorState.cpp
     src/health/Coordinator.cpp

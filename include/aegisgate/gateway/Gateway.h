@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "aegisgate/config/Config.h"
@@ -13,12 +15,15 @@
 #include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/routing/RouteTable.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
+#include "aegisgate/runtime/GenerationMailbox.h"
+#include "aegisgate/runtime/RuntimeGeneration.h"
 #include "aegisgate/runtime/WorkerData.h"
 #include "aegisgate/runtime/WorkerSet.h"
 #include "aegisgate/runtime/WorkerShared.h"
 
 namespace aegisgate::net {
 class Acceptor;
+class Channel;
 class EventLoop;
 } // namespace aegisgate::net
 
@@ -60,6 +65,13 @@ public:
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
   [[nodiscard]] Lifecycle lifecycle() const noexcept { return lifecycle_; }
+  // M4-A: control-loop owner only.  Returns the current generation version.
+  [[nodiscard]] std::uint64_t CurrentGenerationVersion() const noexcept;
+  // M4-A: control-loop owner only.  Returns the number of generations in
+  // the retirement pipeline.  Used for test observation.
+  [[nodiscard]] std::size_t RetiringGenerationCount() const noexcept {
+    return retiring_generations_.size();
+  }
   // Test access to the immutable config snapshot's matcher.
   [[nodiscard]] routing::RouteTable &Routes() noexcept { return routes_; }
   // M3-D test views over the live coordinator snapshot, addressed by route and
@@ -75,7 +87,15 @@ public:
   void SubmitResultAndWait(std::size_t route_index, std::size_t endpoint_index, bool success);
 
 private:
+  struct RetiringGeneration {
+    runtime::RuntimeGenerationRef generation;
+    std::size_t returned_worker_balances = 0;
+    bool reaper_started = false;
+  };
+
   void Accept(int fd);
+  void RetireGeneration(runtime::RuntimeGenerationRef generation);
+  void HandleGenerationEvents();
   [[nodiscard]] std::string RenderMetrics() const;
 
   net::EventLoop &loop_;
@@ -85,6 +105,8 @@ private:
   // as down before its members are torn down (R-040).
   std::shared_ptr<void> lifetime_token_;
   runtime::ConfigSnapshotRef config_snapshot_;
+  // M4-A: the one published generation used by every newly accepted request.
+  std::atomic<runtime::RuntimeGenerationRef> current_generation_;
   routing::RouteTable routes_;
   std::shared_ptr<runtime::WorkerShared> worker_shared_;
   std::vector<std::shared_ptr<resilience::GlobalAdmission>> admissions_;
@@ -94,6 +116,10 @@ private:
   std::unique_ptr<runtime::WorkerSet> workers_;
   std::shared_ptr<health::Coordinator> coordinator_;
   std::unique_ptr<net::Acceptor> acceptor_;
+  std::shared_ptr<runtime::GenerationMailbox> generation_mailbox_;
+  std::unique_ptr<net::Channel> generation_mailbox_channel_;
+  std::unordered_map<std::uint64_t, RetiringGeneration> retiring_generations_;
+  std::vector<std::thread> retirement_reapers_;
   net::StreamFlowControl flow_control_;
 };
 

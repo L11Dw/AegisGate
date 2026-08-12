@@ -43,6 +43,13 @@ public:
   // Runs on the worker thread during shutdown: terminates every exchange
   // (pool CancelAll) and drops the clients so transactions release via RAII.
   void Shutdown() noexcept;
+  // M4-A: returns unused lease tokens to the old generation's admissions.
+  // Called by the retirement pipeline on the worker thread.  Each route's
+  // balance is returned to the corresponding admission and zeroed.  Idempotent
+  // (a second call returns nothing).  Must be called before the old generation
+  // is destroyed.
+  void ReturnGenerationLeaseBalance(
+      const std::vector<std::shared_ptr<resilience::GlobalAdmission>> &admissions) noexcept;
   [[nodiscard]] std::shared_ptr<observability::Metrics> Metrics() const noexcept {
     return metrics_;
   }

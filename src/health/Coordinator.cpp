@@ -103,6 +103,30 @@ Coordinator::ReserveOutcome(std::size_t route_index) noexcept {
   return outcome_channels_[route_index]->TryReserve();
 }
 
+void Coordinator::StopCheckers() noexcept {
+  if (!loop_data_) return;
+  // Stop checkers must run on the coordinator thread (checker timers and
+  // connections are loop-attached objects).  If PostTask fails the
+  // coordinator runtime is already stopped — loop_data_ will be destroyed
+  // by the pending PostShutdown/Stop sequence, so we must not touch it
+  // from this thread.  This is safe because a stopped coordinator will
+  // never fire new probe callbacks.
+  std::promise<void> done;
+  auto future = done.get_future();
+  if (!PostTask([this, &done] {
+        for (auto &checker : loop_data_->checkers) {
+          if (checker) checker->Stop();
+        }
+        loop_data_->checkers.clear();
+        done.set_value();
+      })) {
+    // Coordinator runtime is not running.  The checkers will be destroyed
+    // when loop_data_ is released by Stop().  Do NOT access them here.
+    return;
+  }
+  future.get();
+}
+
 void Coordinator::BeginOutcomeStopping() noexcept {
   for (const auto &channel : outcome_channels_) {
     if (channel) channel->BeginStopping();

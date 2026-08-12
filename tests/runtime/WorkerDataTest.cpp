@@ -237,5 +237,70 @@ TEST(WorkerDataTest, LeaseReturnedAfterCoordinatorStops) {
   runtime.Stop();
 }
 
+// M4-A: ReturnGenerationLeaseBalance returns unused tokens to the old
+// generation's admissions.  The worker draws a batch, spends one on a
+// request, then returns the remainder via the retirement pipeline.
+TEST(WorkerDataTest, ReturnGenerationLeaseBalanceReturnsAllTokens) {
+  Fixture fixture = MakeFixture();
+  WorkerRuntime runtime;
+  runtime.Start();
+  std::shared_ptr<WorkerData> data;
+  {
+    std::promise<void> ready;
+    auto future = ready.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &loop) {
+      data = std::make_shared<WorkerData>(loop, fixture.shared, /*worker_index=*/0,
+                                          fixture.metrics, fixture.client_count);
+      ready.set_value();
+    }));
+    future.get();
+  }
+
+  std::array<int, 2> fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds.data()), 0);
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data->Accept(net::FdOwner(fds[1])); }));
+
+  std::string error;
+  constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: lease.test\r\n\r\n";
+  ASSERT_TRUE(WriteAll(fds[0], request, TestDeadline(), error)) << error;
+  constexpr std::string_view expected =
+      "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+  EXPECT_EQ(ReadExact(fds[0], expected.size(), TestDeadline(), error), expected);
+  (void)::close(fds[0]);
+
+  constexpr std::int64_t kScale = 1'000'000'000;
+  constexpr std::int64_t kBatch = 100;
+  // One batch drawn (100), one spent: 99 held.
+  EXPECT_EQ(fixture.admission->credit(), (1000 - kBatch) * kScale);
+
+  // Return via the retirement pipeline (explicit admissions parameter).
+  {
+    std::promise<void> done;
+    auto future = done.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) {
+      data->ReturnGenerationLeaseBalance(fixture.shared->admissions);
+      done.set_value();
+    }));
+    future.get();
+  }
+  // Only the spent token remains deducted.
+  EXPECT_EQ(fixture.admission->credit(), (1000 - 1) * kScale);
+
+  // Idempotent: second call returns nothing.
+  {
+    std::promise<void> done;
+    auto future = done.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) {
+      data->ReturnGenerationLeaseBalance(fixture.shared->admissions);
+      done.set_value();
+    }));
+    future.get();
+  }
+  EXPECT_EQ(fixture.admission->credit(), (1000 - 1) * kScale);
+
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data.reset(); }));
+  runtime.Stop();
+}
+
 } // namespace
 } // namespace aegisgate::runtime
