@@ -48,6 +48,10 @@ public:
   // It is idempotent and intentionally does not touch live transactions: their
   // GlobalAdmission reservations remain owned by ProxyTransaction RAII.
   void ReturnGenerationLeaseBalance(std::uint64_t generation_version) noexcept;
+  // Builds a candidate SelectionState on the worker thread for a reload.
+  // Does NOT replace the current selection_.  Returns nullptr on failure.
+  [[nodiscard]] std::shared_ptr<SelectionState> PrepareSelectionState(
+      const config::Config &config, std::uint64_t version);
   [[nodiscard]] std::shared_ptr<observability::Metrics> Metrics() const noexcept {
     return metrics_;
   }

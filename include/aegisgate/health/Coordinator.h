@@ -74,6 +74,10 @@ public:
   ClaimProbe(std::size_t route, std::size_t endpoint,
              const HealthCircuitSnapshot &snapshot) noexcept;
 
+  // Stops all health checkers on the coordinator loop.  Must be called
+  // from the coordinator thread (e.g., via a posted task).  Idempotent.
+  void StopCheckers() noexcept;
+
   // --- shutdown orchestration (R-062) ---
   // Rejects every future reservation; already-published outcomes stay
   // drainable.  Called before workers tear down their clients.

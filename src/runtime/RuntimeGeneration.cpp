@@ -36,8 +36,8 @@ RuntimeGeneration::RequestLease &RuntimeGeneration::RequestLease::operator=(Requ
 RuntimeGeneration::RequestLease::~RequestLease() { Release(); }
 
 void RuntimeGeneration::RequestLease::Release() noexcept {
-  const auto generation = std::move(generation_);
-  if (generation) generation->ReleaseRequestLease();
+  auto gen = std::move(generation_);
+  if (gen) gen->ReleaseRequestLease();
 }
 
 std::optional<RuntimeGeneration::RequestLease> RuntimeGeneration::TryAcquireRequestLease() {
@@ -49,8 +49,19 @@ std::optional<RuntimeGeneration::RequestLease> RuntimeGeneration::TryAcquireRequ
   return RequestLease(shared_from_this());
 }
 
+// ---------------------------------------------------------------------------
+// 6-state retirement machine.
+// Callbacks fire outside the lock to prevent lock inversion.
+// ---------------------------------------------------------------------------
+
+void RuntimeGeneration::SetStateChangeCallback(StateChangeCallback cb) {
+  std::lock_guard<std::mutex> guard(retirement_mutex_);
+  on_state_change_ = std::move(cb);
+}
+
 bool RuntimeGeneration::BeginRetirement(std::function<void()> on_last_lease) {
   std::function<void()> notify;
+  StateChangeCallback cb;
   {
     std::lock_guard<std::mutex> guard(retirement_mutex_);
     if (retirement_state_.load(std::memory_order_acquire) != RetirementState::kActive) {
@@ -58,45 +69,121 @@ bool RuntimeGeneration::BeginRetirement(std::function<void()> on_last_lease) {
     }
     retirement_state_.store(RetirementState::kRetiring, std::memory_order_release);
     on_last_lease_ = std::move(on_last_lease);
+    cb = on_state_change_;
     if (active_request_leases_.load(std::memory_order_acquire) == 0 && !retirement_notified_) {
       retirement_notified_ = true;
       notify = on_last_lease_;
     }
   }
+  if (cb) cb(RetirementState::kRetiring);
   if (notify) notify();
   return true;
 }
 
-bool RuntimeGeneration::BeginReaping() noexcept {
-  std::lock_guard<std::mutex> guard(retirement_mutex_);
-  if (retirement_state_.load(std::memory_order_acquire) != RetirementState::kRetiring) {
-    return false;
+bool RuntimeGeneration::NotifyCheckersStopped() {
+  std::vector<Transition> transitions;
+  {
+    std::lock_guard<std::mutex> guard(retirement_mutex_);
+    const auto state = retirement_state_.load(std::memory_order_acquire);
+    if (state != RetirementState::kRetiring && state != RetirementState::kCheckersStopped) {
+      return false;
+    }
+    checkers_stopped_ = true;
+    AdvanceIfReady(transitions);
   }
-  retirement_state_.store(RetirementState::kReaping, std::memory_order_release);
+  for (const auto &[cb, s] : transitions) {
+    if (cb) cb(s);
+  }
+  return true;
+}
+
+bool RuntimeGeneration::BeginOutcomeStopping() {
+  StateChangeCallback cb;
+  {
+    std::lock_guard<std::mutex> guard(retirement_mutex_);
+    if (retirement_state_.load(std::memory_order_acquire) != RetirementState::kWaitingForLeases) {
+      return false;
+    }
+    if (active_request_leases_.load(std::memory_order_acquire) != 0) {
+      return false;
+    }
+    retirement_state_.store(RetirementState::kOutcomeDraining, std::memory_order_release);
+    cb = on_state_change_;
+  }
+  if (cb) cb(RetirementState::kOutcomeDraining);
+  return true;
+}
+
+bool RuntimeGeneration::BeginReaping() noexcept {
+  StateChangeCallback cb;
+  {
+    std::lock_guard<std::mutex> guard(retirement_mutex_);
+    const auto state = retirement_state_.load(std::memory_order_acquire);
+    if (state != RetirementState::kWaitingForLeases ||
+        active_request_leases_.load(std::memory_order_acquire) != 0) {
+      return false;
+    }
+    retirement_state_.store(RetirementState::kOutcomeDraining, std::memory_order_release);
+    cb = on_state_change_;
+  }
+  if (cb) cb(RetirementState::kOutcomeDraining);
   return true;
 }
 
 void RuntimeGeneration::MarkRetired() noexcept {
-  std::lock_guard<std::mutex> guard(retirement_mutex_);
-  if (retirement_state_.load(std::memory_order_acquire) == RetirementState::kReaping) {
-    retirement_state_.store(RetirementState::kDone, std::memory_order_release);
+  StateChangeCallback cb;
+  {
+    std::lock_guard<std::mutex> guard(retirement_mutex_);
+    if (retirement_state_.load(std::memory_order_acquire) == RetirementState::kOutcomeDraining) {
+      retirement_state_.store(RetirementState::kDone, std::memory_order_release);
+      cb = on_state_change_;
+    }
   }
+  if (cb) cb(RetirementState::kDone);
+}
+
+void RuntimeGeneration::MarkCoordinatorStopped() noexcept {
+  coordinator_stopped_.store(true, std::memory_order_release);
 }
 
 void RuntimeGeneration::ReleaseRequestLease() noexcept {
+  std::vector<Transition> transitions;
   std::function<void()> notify;
   {
     std::lock_guard<std::mutex> guard(retirement_mutex_);
     const std::uint64_t previous = active_request_leases_.fetch_sub(1, std::memory_order_acq_rel);
     if (previous == 0) std::terminate();
-    if (previous == 1 &&
-        retirement_state_.load(std::memory_order_acquire) == RetirementState::kRetiring &&
-        !retirement_notified_) {
-      retirement_notified_ = true;
-      notify = on_last_lease_;
+    if (previous == 1) {
+      AdvanceIfReady(transitions);
+      if (retirement_state_.load(std::memory_order_acquire) == RetirementState::kRetiring &&
+          !retirement_notified_) {
+        retirement_notified_ = true;
+        notify = on_last_lease_;
+      }
     }
   }
+  for (const auto &[cb, s] : transitions) {
+    if (cb) cb(s);
+  }
   if (notify) notify();
+}
+
+// Must be called under retirement_mutex_.  Advances through:
+//   kRetiring -> kCheckersStopped -> kWaitingForLeases
+void RuntimeGeneration::AdvanceIfReady(std::vector<Transition> &transitions) noexcept {
+  auto state = retirement_state_.load(std::memory_order_acquire);
+
+  if (state == RetirementState::kRetiring && checkers_stopped_) {
+    retirement_state_.store(RetirementState::kCheckersStopped, std::memory_order_release);
+    transitions.push_back({on_state_change_, RetirementState::kCheckersStopped});
+    state = RetirementState::kCheckersStopped;
+  }
+
+  if (state == RetirementState::kCheckersStopped &&
+      active_request_leases_.load(std::memory_order_acquire) == 0) {
+    retirement_state_.store(RetirementState::kWaitingForLeases, std::memory_order_release);
+    transitions.push_back({on_state_change_, RetirementState::kWaitingForLeases});
+  }
 }
 
 } // namespace aegisgate::runtime

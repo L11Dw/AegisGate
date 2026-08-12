@@ -39,15 +39,80 @@ TEST(RuntimeGenerationTest, RetiringGenerationRejectsNewRequestLeases) {
   EXPECT_FALSE(generation->TryAcquireRequestLease().has_value());
 }
 
-TEST(RuntimeGenerationTest, RetirementTransitionsToReapingOnlyOnce) {
+TEST(RuntimeGenerationTest, RetirementTransitionsToOutcomeDrainingOnlyOnce) {
   auto generation = std::make_shared<RuntimeGeneration>(/*version=*/81);
   ASSERT_TRUE(generation->BeginRetirement([] {}));
   EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kRetiring);
+  // NotifyCheckersStopped advances to kCheckersStopped -> kWaitingForLeases
+  // (no leases held).
+  EXPECT_TRUE(generation->NotifyCheckersStopped());
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kWaitingForLeases);
+  // BeginReaping transitions to kOutcomeDraining.
   EXPECT_TRUE(generation->BeginReaping());
-  EXPECT_FALSE(generation->BeginReaping());
-  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kReaping);
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kOutcomeDraining);
+  EXPECT_FALSE(generation->BeginReaping()); // already in kOutcomeDraining
   generation->MarkRetired();
   EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kDone);
+}
+
+TEST(RuntimeGenerationTest, SixStateRetirementOrdering) {
+  auto generation = std::make_shared<RuntimeGeneration>(/*version=*/100);
+  auto lease = generation->TryAcquireRequestLease();
+  ASSERT_TRUE(lease.has_value());
+
+  std::vector<RuntimeGeneration::RetirementState> observed;
+  generation->SetStateChangeCallback([&observed](RuntimeGeneration::RetirementState s) {
+    observed.push_back(s);
+  });
+
+  EXPECT_TRUE(generation->BeginRetirement([] {}));
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kRetiring);
+
+  // Stop checkers — lease still held → kCheckersStopped.
+  EXPECT_TRUE(generation->NotifyCheckersStopped());
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kCheckersStopped);
+
+  // Release lease → auto-advance to kWaitingForLeases.
+  lease = RuntimeGeneration::RequestLease{};
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kWaitingForLeases);
+
+  // BeginReaping → kOutcomeDraining.
+  EXPECT_TRUE(generation->BeginReaping());
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kOutcomeDraining);
+
+  // MarkRetired → kDone.
+  generation->MarkRetired();
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kDone);
+
+  // Verify observed ordering.
+  ASSERT_EQ(observed.size(), 5u);
+  EXPECT_EQ(observed[0], RuntimeGeneration::RetirementState::kRetiring);
+  EXPECT_EQ(observed[1], RuntimeGeneration::RetirementState::kCheckersStopped);
+  EXPECT_EQ(observed[2], RuntimeGeneration::RetirementState::kWaitingForLeases);
+  EXPECT_EQ(observed[3], RuntimeGeneration::RetirementState::kOutcomeDraining);
+  EXPECT_EQ(observed[4], RuntimeGeneration::RetirementState::kDone);
+}
+
+TEST(RuntimeGenerationTest, ZeroLeasesStillStopsCheckersFirst) {
+  auto generation = std::make_shared<RuntimeGeneration>(/*version=*/101);
+  EXPECT_EQ(generation->active_request_leases(), 0u);
+
+  EXPECT_TRUE(generation->BeginRetirement([] {}));
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kRetiring);
+
+  // Cannot advance past kRetiring without stopping checkers.
+  EXPECT_FALSE(generation->BeginReaping());
+
+  // Stop checkers → kCheckersStopped → kWaitingForLeases (leases zero).
+  EXPECT_TRUE(generation->NotifyCheckersStopped());
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kWaitingForLeases);
+}
+
+TEST(RuntimeGenerationTest, CoordinatorStoppedFlagIsAtomic) {
+  auto generation = std::make_shared<RuntimeGeneration>(/*version=*/102);
+  EXPECT_FALSE(generation->coordinator_stopped());
+  generation->MarkCoordinatorStopped();
+  EXPECT_TRUE(generation->coordinator_stopped());
 }
 
 TEST(RuntimeGenerationTest, LastLeasePostsAValueEventForControlLoopRetirement) {
