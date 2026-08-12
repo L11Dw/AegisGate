@@ -16,6 +16,7 @@
 #include "aegisgate/routing/RouteTable.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
 #include "aegisgate/runtime/GenerationMailbox.h"
+#include "aegisgate/runtime/ReloadController.h"
 #include "aegisgate/runtime/RuntimeGeneration.h"
 #include "aegisgate/runtime/WorkerData.h"
 #include "aegisgate/runtime/WorkerSet.h"
@@ -49,7 +50,8 @@ class Gateway {
 public:
   Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
           std::uint16_t listen_port,
-          net::StreamFlowControl flow_control = net::StreamFlowControl{});
+          net::StreamFlowControl flow_control = net::StreamFlowControl{},
+          std::string config_path = {});
   ~Gateway();
 
   Gateway(const Gateway &) = delete;
@@ -68,6 +70,11 @@ public:
   // or the gateway is not running.  On failure the current generation
   // and all runtime state are unchanged.
   [[nodiscard]] bool RequestReload(config::Config candidate);
+  // M4-A: triggers a background config file reload.  Thread-safe.
+  // Returns false if no config path was provided or the gateway is
+  // stopping.  The result is delivered to the control loop via the
+  // ReloadController's eventfd.
+  [[nodiscard]] bool RequestReload();
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
@@ -78,6 +85,11 @@ public:
   // the retirement pipeline.  Used for test observation.
   [[nodiscard]] std::size_t RetiringGenerationCount() const noexcept {
     return retiring_generations_.size();
+  }
+  // M4-A: returns the monotonic sequence of the last reload result consumed
+  // by the control loop.  Tests use this as a completion barrier.
+  [[nodiscard]] std::uint64_t LastReloadResultSequence() const noexcept {
+    return last_reload_result_sequence_;
   }
   // Test access to the immutable config snapshot's matcher.
   [[nodiscard]] routing::RouteTable &Routes() noexcept { return routes_; }
@@ -103,6 +115,7 @@ private:
   void Accept(int fd);
   void RetireGeneration(runtime::RuntimeGenerationRef generation);
   void HandleGenerationEvents();
+  void HandleReloadResults();
   [[nodiscard]] std::string RenderMetrics() const;
 
   net::EventLoop &loop_;
@@ -123,11 +136,15 @@ private:
   std::unique_ptr<runtime::WorkerSet> workers_;
   std::shared_ptr<health::Coordinator> coordinator_;
   std::unique_ptr<net::Acceptor> acceptor_;
+  std::unique_ptr<runtime::ReloadController> reload_controller_;
+  std::unique_ptr<net::Channel> reload_channel_;
   std::shared_ptr<runtime::GenerationMailbox> generation_mailbox_;
   std::unique_ptr<net::Channel> generation_mailbox_channel_;
   std::unordered_map<std::uint64_t, RetiringGeneration> retiring_generations_;
   std::vector<std::thread> retirement_reapers_;
   net::StreamFlowControl flow_control_;
+  std::string config_path_;
+  std::uint64_t last_reload_result_sequence_ = 0;
 };
 
 } // namespace aegisgate::gateway

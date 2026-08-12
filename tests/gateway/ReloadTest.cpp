@@ -3,6 +3,7 @@
 // threads, published atomically on success, and rolled back on failure.
 
 #include <chrono>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <string>
@@ -128,6 +129,142 @@ TEST(ReloadTest, OldGenerationRetiresAfterReload) {
 
   // The retired generation should eventually complete (the test's ctest
   // timeout is the assertion — if retirement hangs, the test times out).
+}
+
+// ---------------------------------------------------------------------------
+// A6: Gateway wiring tests
+// ---------------------------------------------------------------------------
+
+// Write a YAML config to a temp file.
+std::string WriteConfig(const std::string &yaml, const std::string &name) {
+  const std::string path = "/tmp/aegisgate_reload_" + name + ".yaml";
+  std::ofstream ofs(path);
+  ofs << yaml;
+  ofs.close();
+  return path;
+}
+
+TEST(ReloadTest, ReloadUsesExplicitConfigPath) {
+  constexpr std::string_view yaml = R"(workers: 1
+routes:
+  - name: api
+    host: test.local
+    path_prefix: /
+    endpoints:
+      - host: 127.0.0.1
+        port: 9001
+        weight: 1
+    rate_limit: 100
+    burst: 50
+    max_inflight: 10
+)";
+  const std::string path = WriteConfig(std::string(yaml), "explicit_path");
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    (void)::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+
+  config::Config config = SimpleConfig();
+  Gateway gateway(loop, config, "127.0.0.1", 0, net::StreamFlowControl{}, path);
+  gateway.Start();
+
+  const auto v0 = gateway.CurrentGenerationVersion();
+
+  // Trigger a file-based reload.
+  EXPECT_TRUE(gateway.RequestReload());
+
+  // Wait for the reload result to be consumed by the control loop.
+  net::TimerQueue timers(loop);
+  (void)timers.ScheduleAfter(std::chrono::milliseconds(500), [&] {
+    if (gateway.CurrentGenerationVersion() > v0 || gateway.LastReloadResultSequence() > 0) {
+      if (::write(wake_fds[1], "q", 1) != 1) {}
+    } else {
+      (void)timers.ScheduleAfter(std::chrono::milliseconds(100), [&] {
+        if (::write(wake_fds[1], "q", 1) != 1) {}
+      });
+    }
+  });
+
+  loop.Loop();
+
+  // The reload should have been consumed.
+  EXPECT_GT(gateway.LastReloadResultSequence(), 0u);
+
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
+}
+
+TEST(ReloadTest, InvalidYamlLeavesCurrentGenerationUntouched) {
+  const std::string path = WriteConfig("not valid yaml: [broken", "invalid_yaml");
+
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    (void)::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+
+  config::Config config = SimpleConfig();
+  Gateway gateway(loop, config, "127.0.0.1", 0, net::StreamFlowControl{}, path);
+  gateway.Start();
+
+  const auto v0 = gateway.CurrentGenerationVersion();
+
+  // Trigger a reload with invalid YAML.
+  EXPECT_TRUE(gateway.RequestReload());
+
+  // Wait for the result.
+  net::TimerQueue timers(loop);
+  (void)timers.ScheduleAfter(std::chrono::milliseconds(500), [&] {
+    if (::write(wake_fds[1], "q", 1) != 1) {}
+  });
+  loop.Loop();
+
+  // The parse failed — generation should be unchanged.
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), v0);
+  EXPECT_GT(gateway.LastReloadResultSequence(), 0u);
+
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
+}
+
+TEST(ReloadTest, NoConfigPathDisablesFileReload) {
+  std::array<int, 2> wake_fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, wake_fds.data()), 0);
+  net::EventLoop loop;
+  net::Channel wake_channel(loop, wake_fds[0]);
+  wake_channel.SetReadCallback([&] {
+    char byte = '\0';
+    (void)::read(wake_fds[0], &byte, 1);
+    loop.Quit();
+  });
+  wake_channel.EnableReading();
+
+  config::Config config = SimpleConfig();
+  // No config_path — file reload should be disabled.
+  Gateway gateway(loop, config, "127.0.0.1", 0);
+  gateway.Start();
+
+  EXPECT_FALSE(gateway.RequestReload());
+
+  (void)::write(wake_fds[1], "q", 1);
+  loop.Loop();
+  wake_channel.Remove();
+  (void)::close(wake_fds[0]);
+  (void)::close(wake_fds[1]);
 }
 
 } // namespace
