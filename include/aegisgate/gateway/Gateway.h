@@ -11,6 +11,7 @@
 
 #include "aegisgate/config/Config.h"
 #include "aegisgate/net/StreamFlowControl.h"
+#include "aegisgate/observability/AsyncLogger.h"
 #include "aegisgate/observability/Metrics.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/routing/RouteTable.h"
@@ -50,7 +51,8 @@ public:
   Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
           std::uint16_t listen_port,
           net::StreamFlowControl flow_control = net::StreamFlowControl{},
-          std::string config_path = {});
+          std::string config_path = {},
+          std::string log_path = {});
   ~Gateway();
 
   Gateway(const Gateway &) = delete;
@@ -121,6 +123,11 @@ private:
   };
 
   void Accept(int fd);
+  void Log(std::string level, std::string event, std::string route = {},
+           std::string upstream = {}, std::uint16_t status = 0,
+           std::string reason = {}, std::uint64_t latency_us = 0,
+           std::uint32_t retries = 0, std::uint64_t request_bytes = 0,
+           std::uint64_t response_bytes = 0);
   // Control-loop-only retirement pipeline.  A WorkerData notification never
   // calls these directly; the cross-thread boundary is GenerationMailbox.
   void RetireGeneration(runtime::RuntimeGenerationRef generation);
@@ -158,6 +165,7 @@ private:
   std::vector<std::thread> retirement_reapers_;
   bool workers_stopped_ = false;
   net::StreamFlowControl flow_control_;
+  std::unique_ptr<observability::AsyncLogger> logger_;
   // Monotonic sequence of the last reload result consumed by the control loop.
   // Tests use this as a completion barrier: wait until this value increases.
   std::uint64_t last_reload_result_sequence_ = 0;

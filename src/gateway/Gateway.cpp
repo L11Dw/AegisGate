@@ -18,7 +18,7 @@ namespace aegisgate::gateway {
 
 Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view listen_address,
                  std::uint16_t listen_port, net::StreamFlowControl flow_control,
-                 std::string config_path)
+                 std::string config_path, std::string log_path)
     : loop_(loop), lifetime_token_(std::make_shared<int>(0)),
       current_generation_(std::make_shared<runtime::RuntimeGeneration>(1, std::move(config))),
       routes_(CurrentGeneration()->snapshot()->config),
@@ -50,6 +50,10 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
     reload_channel_->SetReadCallback([this] { HandleReloadResults(); });
     reload_channel_->EnableReading();
   }
+  // AsyncLogger: optional structured JSON Lines logging.
+  if (!log_path.empty()) {
+    logger_ = std::make_unique<observability::AsyncLogger>(std::move(log_path));
+  }
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
 }
 
@@ -63,6 +67,7 @@ Gateway::~Gateway() {
   // loop and stop the coordinator — a worker still publishing to a stopped
   // coordinator would lose breaker accounting.
   if (!loop_.IsOwnerThread()) std::terminate();
+  Log("info", "gateway_stop");
   lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
@@ -111,6 +116,29 @@ Gateway::~Gateway() {
   // worker_datas_ entries are all empty: the destroy tasks ran on their workers.
 }
 
+void Gateway::Log(std::string level, std::string event, std::string route,
+                  std::string upstream, std::uint16_t status, std::string reason,
+                  std::uint64_t latency_us, std::uint32_t retries,
+                  std::uint64_t request_bytes, std::uint64_t response_bytes) {
+  if (!logger_) return;
+  observability::LogRecord record;
+  record.timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  record.level = std::move(level);
+  record.event = std::move(event);
+  const auto gen = CurrentGeneration();
+  if (gen) record.generation = gen->version();
+  record.route = std::move(route);
+  record.upstream = std::move(upstream);
+  record.status = status;
+  record.reason = std::move(reason);
+  record.latency_us = latency_us;
+  record.retries = retries;
+  record.request_bytes = request_bytes;
+  record.response_bytes = response_bytes;
+  (void)logger_->Submit(std::move(record));
+}
+
 bool Gateway::RequestReload(config::Config candidate) {
   if (!loop_.IsOwnerThread() || lifecycle_ != Lifecycle::kRunning) return false;
   const auto previous = CurrentGeneration();
@@ -143,6 +171,7 @@ bool Gateway::RequestReload(config::Config candidate) {
   current_generation_.store(replacement, std::memory_order_release);
   worker_shared_->current_generation.store(replacement, std::memory_order_release);
   RetireGeneration(previous);
+  Log("info", "reload_succeeded");
   return true;
 }
 
@@ -297,6 +326,7 @@ void Gateway::Start() {
   }
   acceptor_->Listen();
   lifecycle_ = Lifecycle::kRunning;
+  Log("info", "gateway_start");
 }
 
 std::uint16_t Gateway::port() const { return acceptor_->port(); }
