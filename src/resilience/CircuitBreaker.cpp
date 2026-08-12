@@ -220,18 +220,30 @@ void CircuitBreaker::ImportSnapshot(const CircuitBreakerSnapshot &snap, Clock::t
 
   switch (state_) {
   case State::kClosed:
-    // Rebuild buckets from relative ages.
+    // Rebuild buckets from relative ages (P2 #5).
     {
       const auto bucket_duration =
           std::chrono::duration_cast<Clock::duration>(config_.window) /
           static_cast<int>(kBucketCount);
       initialized_ = true;
-      active_start_ = now;
+      // Compute the window start as the earliest valid bucket boundary.
+      const auto window_start = now - config_.window;
+      // Find the active bucket index and start time.
+      const auto elapsed = now - epoch_;
+      active_index_ = static_cast<std::size_t>(elapsed / bucket_duration) % kBucketCount;
+      active_start_ = epoch_ + (elapsed / bucket_duration) * bucket_duration;
       for (const auto &bsnap : snap.buckets) {
+        // Discard buckets outside the window.
+        if (bsnap.age_from_export >= config_.window) continue;
         const auto bucket_start = now - bsnap.age_from_export;
-        const auto offset = (bucket_start - epoch_) / bucket_duration;
+        // Compute non-negative offset from window start.
+        if (bucket_start < window_start) continue;
+        const auto offset = (bucket_start - window_start) / bucket_duration;
         const auto index = static_cast<std::size_t>(offset) % kBucketCount;
-        buckets_[index] = {bucket_start, bsnap.success, bsnap.failure};
+        // Merge (P2 #5): += success/failure, don't overwrite.
+        buckets_[index].start = bucket_start;
+        buckets_[index].success += bsnap.success;
+        buckets_[index].failure += bsnap.failure;
       }
     }
     break;

@@ -23,7 +23,8 @@ constexpr std::chrono::milliseconds kRefillTick = std::chrono::milliseconds(250)
 
 Coordinator::Coordinator(std::shared_ptr<const config::Config> config, Clock::time_point now)
     : config_(std::move(config)), state_(std::make_unique<CoordinatorState>(config_, now)),
-      runtime_(std::make_unique<runtime::WorkerRuntime>()) {
+      runtime_(std::make_unique<runtime::WorkerRuntime>()),
+      lifecycle_(Lifecycle::kActive) {
   if (!config_) throw std::invalid_argument("coordinator requires a config snapshot");
   // One OutcomeChannel per breaker route: every accounted attempt reserves a
   // slot before it connects, so its terminal result always has room (capacity
@@ -54,6 +55,7 @@ void Coordinator::Start() {
   if (!runtime_->PostWithLoop([this, &initialized](net::EventLoop &loop) {
     try {
       OnLoopInit(loop);
+      lifecycle_.store(Lifecycle::kActive, std::memory_order_release);
       initialized.set_value();
     } catch (...) {
       initialized.set_exception(std::current_exception());
@@ -65,8 +67,7 @@ void Coordinator::Start() {
 }
 
 void Coordinator::StartPrepared() {
-  prepared_ = true;
-  activated_ = false;
+  lifecycle_.store(Lifecycle::kPrepared, std::memory_order_release);
   runtime_->Start();
   std::promise<void> initialized;
   auto future = initialized.get_future();
@@ -112,7 +113,7 @@ void Coordinator::OnPreparedLoopInit(net::EventLoop &loop) {
 
 bool Coordinator::ImportProtectionSnapshotAndWait(
     const ProtectionSnapshot &snapshot, std::chrono::milliseconds timeout) {
-  if (!prepared_ || activated_) return false;
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kPrepared) return false;
   struct Completion {
     std::mutex mu;
     std::condition_variable cv;
@@ -121,24 +122,34 @@ bool Coordinator::ImportProtectionSnapshotAndWait(
     bool ok = false;
   };
   auto completion = std::make_shared<Completion>();
-  if (!PostTask([this, &snapshot, completion] {
+  // Value-capture snapshot to avoid UAF after timeout (P1 #1).
+  ProtectionSnapshot snap_copy = snapshot;
+  if (!PostTask([this, snap = std::move(snap_copy), completion] {
         std::lock_guard<std::mutex> guard(completion->mu);
         if (completion->cancelled) return;
         try {
-          // Import health states by identity matching.
-          for (const auto &ep : snapshot.endpoints) {
+          const auto now = Clock::now();
+          // Import by identity matching.
+          for (const auto &ep : snap.endpoints) {
             for (std::size_t r = 0; r < config_->routes.size(); ++r) {
               const auto &route = config_->routes[r];
               RouteIdentity rid{route.name, route.host, route.path_prefix};
               if (!SameRouteIdentity(rid, ep.route)) continue;
+              // Check policy equivalence.
+              if (!SameHealthPolicy(route.health_check,
+                                    config_->routes[r].health_check)) continue;
+              if (!SameBreakerPolicy(route.circuit_breaker,
+                                     config_->routes[r].circuit_breaker)) continue;
               for (std::size_t e = 0; e < route.endpoints.size(); ++e) {
                 const auto &endpoint = route.endpoints[e];
                 EndpointIdentity eid{endpoint.host, endpoint.address, endpoint.port};
                 if (!SameEndpointIdentity(eid, ep.endpoint)) continue;
-                // Import health state.
-                const bool healthy = ep.health.state == HealthState::kHealthy ||
-                                     ep.health.state == HealthState::kImplicitHealthy;
-                state_->RecordHealth(r, e, healthy);
+                // Import health state (P1 #4: preserve 4-state enum).
+                state_->ImportHealthState(r, e, ep.health.state);
+                // Import breaker state (P1 #2: real breaker migration).
+                if (ep.breaker.has_value()) {
+                  state_->ImportBreakerSnapshot(r, e, *ep.breaker, now);
+                }
               }
             }
           }
@@ -163,14 +174,14 @@ bool Coordinator::ImportProtectionSnapshotAndWait(
 }
 
 bool Coordinator::Activate() {
-  if (!prepared_ || activated_) return false;
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kPrepared) return false;
   try {
     std::promise<void> activated;
     auto future = activated.get_future();
     if (!runtime_->PostWithLoop([this, &activated](net::EventLoop &loop) {
       try {
         OnActivateLoopInit(loop);
-        activated_ = true;
+        lifecycle_.store(Lifecycle::kActive, std::memory_order_release);
         activated.set_value();
       } catch (...) {
         activated.set_exception(std::current_exception());
@@ -211,6 +222,7 @@ void Coordinator::OnActivateLoopInit(net::EventLoop &loop) {
 
 std::optional<ProtectionSnapshot> Coordinator::ExportProtectionSnapshotAndWait(
     std::chrono::milliseconds timeout) {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return std::nullopt;
   struct Completion {
     std::mutex mu;
     std::condition_variable cv;
@@ -223,29 +235,7 @@ std::optional<ProtectionSnapshot> Coordinator::ExportProtectionSnapshotAndWait(
         std::lock_guard<std::mutex> guard(completion->mu);
         if (completion->cancelled) return;
         try {
-          ProtectionSnapshot snap;
-          for (std::size_t r = 0; r < config_->routes.size(); ++r) {
-            const auto &route = config_->routes[r];
-            RouteIdentity rid{route.name, route.host, route.path_prefix};
-            for (std::size_t e = 0; e < route.endpoints.size(); ++e) {
-              const auto &endpoint = route.endpoints[e];
-              EndpointIdentity eid{endpoint.host, endpoint.address, endpoint.port};
-              EndpointProtectionSnapshot ep;
-              ep.route = rid;
-              ep.endpoint = eid;
-              ep.health.state = state_->Healthy(r, e) ? HealthState::kHealthy
-                                                      : HealthState::kUnhealthy;
-              if (route.circuit_breaker.has_value()) {
-                resilience::CircuitBreakerSnapshot bsnap;
-                bsnap.state = static_cast<resilience::CircuitBreakerState>(
-                    static_cast<std::uint8_t>(state_->BreakerState(r, e)));
-                bsnap.half_open_quota = route.circuit_breaker->half_open_probes;
-                ep.breaker = bsnap;
-              }
-              snap.endpoints.push_back(std::move(ep));
-            }
-          }
-          completion->result = std::move(snap);
+          completion->result = state_->ExportProtectionSnapshot();
         } catch (...) {}
         completion->done = true;
         completion->cv.notify_all();
@@ -263,16 +253,7 @@ std::optional<ProtectionSnapshot> Coordinator::ExportProtectionSnapshotAndWait(
 }
 
 void Coordinator::Stop() noexcept {
-  // The destroy task must run on the coordinator thread (TimerQueue and
-  // checkers hold loop registrations).  It captures the Stop-frame owner by
-  // reference and resets it when it runs, destroying LoopData on the
-  // coordinator thread.  `data` stays in scope until Stop returns (the join
-  // guarantees the accepted destroy task ran during the drain), so the
-  // reference can never dangle.  R-063/R-067: the reserved shutdown slot is
-  // always accepted while the coordinator runs, so the destroy task is
-  // guaranteed to execute on its owner thread — a rejection means the thread
-  // is already gone, which is an explicit shutdown failure (abort), never a
-  // silent leak.
+  lifecycle_.store(Lifecycle::kStopping, std::memory_order_release);
   std::unique_ptr<LoopData> data;
   if (loop_data_) {
     data = std::move(loop_data_);
@@ -282,7 +263,7 @@ void Coordinator::Stop() noexcept {
     }
   }
   runtime_->Stop();
-  // data is empty here: the destroy task ran on the coordinator thread.
+  lifecycle_.store(Lifecycle::kStopped, std::memory_order_release);
 }
 
 std::shared_ptr<const HealthCircuitSnapshot> Coordinator::CurrentSnapshot() const noexcept {
@@ -290,13 +271,13 @@ std::shared_ptr<const HealthCircuitSnapshot> Coordinator::CurrentSnapshot() cons
 }
 
 bool Coordinator::PostResult(const AttemptResult &result) noexcept {
-  if (prepared_ && !activated_) return false;  // Prepared state: reject
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return false;
   return PostTask([this, result] { RecordResultTask(result); });
 }
 
 std::optional<OutcomeChannel::Reservation>
 Coordinator::ReserveOutcome(std::size_t route_index) noexcept {
-  if (prepared_ && !activated_) return std::nullopt;  // Prepared state: reject
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return std::nullopt;
   if (route_index >= outcome_channels_.size() || !outcome_channels_[route_index]) {
     return std::nullopt;
   }
@@ -334,11 +315,13 @@ std::uint64_t Coordinator::OutcomeRejectedTotal() const noexcept {
 }
 
 bool Coordinator::ProbeAvailable(std::size_t route, std::size_t endpoint) const noexcept {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return false;
   return state_->ProbeAvailable(route, endpoint);
 }
 
 std::optional<AttemptPermit> Coordinator::ClaimProbe(
     std::size_t route, std::size_t endpoint, const HealthCircuitSnapshot &snapshot) noexcept {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return std::nullopt;
   return state_->ClaimProbe(route, endpoint, snapshot);
 }
 

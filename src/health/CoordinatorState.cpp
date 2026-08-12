@@ -14,6 +14,14 @@ CoordinatorState::CoordinatorState(std::shared_ptr<const config::Config> config,
     // EndpointState holds an atomic claim counter, so it is not movable:
     // default-construct in place and assign the per-endpoint pieces.
     std::vector<EndpointState> states(route.endpoints.size());
+    // Initialize HealthState: for initial startup, endpoints with health_check
+    // default to kHealthy (allow traffic until first check).  For reload
+    // migration, ImportHealthState sets kUnknown for new/changed endpoints.
+    for (EndpointState &state : states) {
+      state.health = EndpointHealth(route.health_check.has_value()
+                                        ? HealthState::kHealthy
+                                        : HealthState::kImplicitHealthy);
+    }
     if (route.circuit_breaker.has_value()) {
       const auto &breaker = *route.circuit_breaker;
       const resilience::CircuitBreakerConfig breaker_config{
@@ -31,6 +39,65 @@ CoordinatorState::CoordinatorState(std::shared_ptr<const config::Config> config,
 void CoordinatorState::RecordHealth(std::size_t route, std::size_t endpoint, bool healthy) {
   if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) return;
   endpoints_[route][endpoint].health.RecordCheckResult(healthy);
+}
+
+void CoordinatorState::ImportHealthState(std::size_t route, std::size_t endpoint,
+                                         HealthState state) {
+  if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) return;
+  endpoints_[route][endpoint].health.ImportState(state);
+}
+
+void CoordinatorState::ImportBreakerSnapshot(std::size_t route, std::size_t endpoint,
+                                              const resilience::CircuitBreakerSnapshot &snap,
+                                              Clock::time_point now) {
+  if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) return;
+  auto &breaker = endpoints_[route][endpoint].breaker;
+  if (!breaker) return;  // no breaker configured for this endpoint
+  breaker->ImportSnapshot(snap, now);
+  // If import resulted in HalfOpen, set up probe slots.
+  if (breaker->StateNow() == resilience::CircuitBreaker::State::kHalfOpen) {
+    const auto &settings = config_->routes[route].circuit_breaker;
+    if (settings) {
+      auto slots = std::make_shared<ProbeSlotState>();
+      slots->remaining.store(settings->half_open_probes, std::memory_order_release);
+      slots->issued.store(0, std::memory_order_relaxed);
+      // Issue probes to get probe_base.
+      std::uint64_t base = 0;
+      for (std::uint32_t i = 0; i < settings->half_open_probes; ++i) {
+        const auto permit = breaker->Select(now);
+        if (i == 0) base = permit.probe_id;
+      }
+      slots->probe_base = base;
+      slots->generation = breaker->Generation();
+      slots->quota = settings->half_open_probes;
+      endpoints_[route][endpoint].probe_slots.store(std::move(slots),
+                                                     std::memory_order_release);
+    }
+  }
+}
+
+ProtectionSnapshot CoordinatorState::ExportProtectionSnapshot() {
+  ProtectionSnapshot snap;
+  const auto now = Clock::now();
+  for (std::size_t r = 0; r < endpoints_.size(); ++r) {
+    const auto &route = config_->routes[r];
+    RouteIdentity rid{route.name, route.host, route.path_prefix};
+    for (std::size_t e = 0; e < endpoints_[r].size(); ++e) {
+      const auto &endpoint = route.endpoints[e];
+      EndpointIdentity eid{endpoint.host, endpoint.address, endpoint.port};
+      EndpointProtectionSnapshot ep;
+      ep.route = rid;
+      ep.endpoint = eid;
+      // Export real HealthState (P1 #4).
+      ep.health.state = endpoints_[r][e].health.State();
+      // Export real breaker snapshot (P1 #2).
+      if (endpoints_[r][e].breaker) {
+        ep.breaker = endpoints_[r][e].breaker->ExportSnapshot(now);
+      }
+      snap.endpoints.push_back(std::move(ep));
+    }
+  }
+  return snap;
 }
 
 void CoordinatorState::RecordResult(const AttemptResult &result, Clock::time_point now) {

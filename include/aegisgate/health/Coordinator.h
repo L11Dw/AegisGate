@@ -143,11 +143,17 @@ private:
   std::vector<std::unique_ptr<OutcomeChannel>> outcome_channels_;
   std::atomic<std::shared_ptr<const HealthCircuitSnapshot>> snapshot_{nullptr};
   std::unique_ptr<LoopData> loop_data_;
-  // True after StartPrepared(); health checkers and refill not yet running.
-  // PostResult/ReserveOutcome/ClaimProbe are rejected in this state.
-  bool prepared_ = false;
-  // True after Activate(); the coordinator is fully operational.
-  bool activated_ = false;
+  // Atomic lifecycle state.  Worker-side APIs (PostResult, ReserveOutcome,
+  // ClaimProbe, ProbeAvailable) read this with acquire; control-side APIs
+  // (StartPrepared, Activate, Stop) write with release.
+  enum class Lifecycle : std::uint8_t {
+    kNew,
+    kPrepared,
+    kActive,
+    kStopping,
+    kStopped,
+  };
+  std::atomic<Lifecycle> lifecycle_{Lifecycle::kNew};
 };
 
 } // namespace aegisgate::health
