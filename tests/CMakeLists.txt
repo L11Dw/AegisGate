@@ -31,7 +31,6 @@ add_executable(aegisgate_tests
     health/HealthCheckerTest.cpp
     health/CoordinatorTest.cpp
     health/OutcomeChannelTest.cpp
-    health/ProtectionSnapshotTest.cpp
     observability/MetricsTest.cpp
     mock/MockBackendTest.cpp
     integration/EndToEndTest.cpp

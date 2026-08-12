@@ -12,7 +12,6 @@
 #include "aegisgate/health/CoordinatorState.h"
 #include "aegisgate/health/HealthChecker.h"
 #include "aegisgate/health/OutcomeChannel.h"
-#include "aegisgate/health/ProtectionSnapshot.h"
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/runtime/WorkerRuntime.h"
 
@@ -45,29 +44,6 @@ public:
   // Spawns the coordinator thread and blocks until the loop-attached objects
   // (timer queue, health checkers, refill tick) are initialized.
   void Start();
-
-  // --- Two-phase lifecycle for migration (A3) ---
-
-  // Phase 1: starts the coordinator loop and creates OutcomeChannel wake
-  // channels, but does NOT start health checkers or admission refill.
-  // PostResult/ReserveOutcome/ClaimProbe are rejected until Activate().
-  void StartPrepared();
-
-  // Phase 2: imports protection state from a snapshot (on coordinator loop).
-  // Uses shared CompletionState for timeout safety.  Returns false on timeout,
-  // queue rejection, or coordinator stopped.
-  [[nodiscard]] bool ImportProtectionSnapshotAndWait(
-      const ProtectionSnapshot &snapshot, std::chrono::milliseconds timeout);
-
-  // Phase 3: starts health checkers and admission refill.  Must be called
-  // after Import succeeds.  Returns false on failure (caller must Stop()).
-  [[nodiscard]] bool Activate();
-
-  // Export protection state from this coordinator (on its owner loop).
-  // Returns nullopt on timeout, queue rejection, or coordinator stopped.
-  [[nodiscard]] std::optional<ProtectionSnapshot> ExportProtectionSnapshotAndWait(
-      std::chrono::milliseconds timeout);
-
   // Destroys loop-attached objects on the coordinator thread, then stops the
   // runtime and joins.  Idempotent.
   void Stop() noexcept;
@@ -131,9 +107,6 @@ private:
   void Publish() noexcept;
   [[nodiscard]] bool PostTask(std::function<void()> task) noexcept;
 
-  void OnPreparedLoopInit(net::EventLoop &loop);
-  void OnActivateLoopInit(net::EventLoop &loop);
-
   std::shared_ptr<const config::Config> config_;
   std::unique_ptr<CoordinatorState> state_;
   std::unique_ptr<runtime::WorkerRuntime> runtime_;
@@ -143,17 +116,6 @@ private:
   std::vector<std::unique_ptr<OutcomeChannel>> outcome_channels_;
   std::atomic<std::shared_ptr<const HealthCircuitSnapshot>> snapshot_{nullptr};
   std::unique_ptr<LoopData> loop_data_;
-  // Atomic lifecycle state.  Worker-side APIs (PostResult, ReserveOutcome,
-  // ClaimProbe, ProbeAvailable) read this with acquire; control-side APIs
-  // (StartPrepared, Activate, Stop) write with release.
-  enum class Lifecycle : std::uint8_t {
-    kNew,
-    kPrepared,
-    kActive,
-    kStopping,
-    kStopped,
-  };
-  std::atomic<Lifecycle> lifecycle_{Lifecycle::kNew};
 };
 
 } // namespace aegisgate::health

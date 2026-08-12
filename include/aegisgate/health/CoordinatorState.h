@@ -9,7 +9,6 @@
 
 #include "aegisgate/config/Config.h"
 #include "aegisgate/health/EndpointHealth.h"
-#include "aegisgate/health/ProtectionSnapshot.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 
 namespace aegisgate::health {
@@ -81,27 +80,10 @@ public:
 
   // --- coordinator-loop (single writer) ---
   void RecordHealth(std::size_t route, std::size_t endpoint, bool healthy);
-  // Import a 4-state HealthState (P1 #4).
-  void ImportHealthState(std::size_t route, std::size_t endpoint, HealthState state);
   void RecordResult(const AttemptResult &result, Clock::time_point now);
   // Transitions an elapsed Open window to HalfOpen and pre-issues the full
   // probe quota so worker probe ids can be validated exactly once.
   void ArmHalfOpen(std::size_t route, std::size_t endpoint, Clock::time_point now);
-  // Import a breaker snapshot (P1 #2).  Identity/policy must already match.
-  // For Open/HalfOpen, the caller must subsequently call
-  // CreateFreshHalfOpenCycle if the import results in HalfOpen state.
-  void ImportBreakerSnapshot(std::size_t route, std::size_t endpoint,
-                             const resilience::CircuitBreakerSnapshot &snap,
-                             Clock::time_point now);
-  // Create a fresh HalfOpen cycle for the given endpoint.  This is the
-  // single place that transitions a breaker to HalfOpen, pre-issues the
-  // full probe quota, and creates the corresponding ProbeSlotState.
-  // The slot's probe_base and probe ids are in 1:1 correspondence with
-  // the breaker's pending_probes_.
-  void CreateFreshHalfOpenCycle(std::size_t route, std::size_t endpoint,
-                                Clock::time_point now);
-  // Export the full protection snapshot (P1 #2).
-  [[nodiscard]] ProtectionSnapshot ExportProtectionSnapshot();
 
   // --- any thread (atomics only) ---
   [[nodiscard]] std::shared_ptr<const HealthCircuitSnapshot> BuildSnapshot();
