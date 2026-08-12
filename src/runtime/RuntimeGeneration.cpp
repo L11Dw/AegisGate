@@ -4,6 +4,25 @@
 
 namespace aegisgate::runtime {
 
+RuntimeGeneration::RuntimeGeneration(std::uint64_t version, config::Config config)
+    : version_(version), snapshot_(std::make_shared<ConfigSnapshot>(
+                            ConfigSnapshot{version, std::move(config)})),
+      coordinator_(std::make_shared<health::Coordinator>(
+          std::make_shared<const config::Config>(snapshot_->config),
+          health::Coordinator::Clock::now())) {
+  const auto now = resilience::GlobalAdmission::Clock::now();
+  admissions_.reserve(snapshot_->config.routes.size());
+  for (const config::Route &route : snapshot_->config.routes) {
+    admissions_.push_back(std::make_shared<resilience::GlobalAdmission>(route, now));
+  }
+  coordinator_->SetAdmissions(admissions_);
+  selection_states_.reserve(snapshot_->config.workers);
+  for (std::uint32_t worker = 0; worker < snapshot_->config.workers; ++worker) {
+    selection_states_.push_back(
+        std::make_shared<SelectionState>(snapshot_->config, snapshot_->version));
+  }
+}
+
 RuntimeGeneration::RequestLease::RequestLease(RequestLease &&other) noexcept
     : generation_(std::move(other.generation_)) {}
 

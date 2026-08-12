@@ -6,6 +6,12 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
+
+#include "aegisgate/health/Coordinator.h"
+#include "aegisgate/resilience/GlobalAdmission.h"
+#include "aegisgate/runtime/ConfigSnapshot.h"
+#include "aegisgate/runtime/SelectionState.h"
 
 namespace aegisgate::runtime {
 
@@ -37,8 +43,27 @@ public:
   };
 
   explicit RuntimeGeneration(std::uint64_t version) : version_(version) {}
+  // Builds the complete immutable/control-plane bundle for one generation.
+  // The Coordinator is deliberately constructed but not started here: the
+  // Gateway control loop owns the prepare/publish/rollback transaction and
+  // starts it only after every worker-local selection state is ready.
+  RuntimeGeneration(std::uint64_t version, config::Config config);
 
   [[nodiscard]] std::uint64_t version() const noexcept { return version_; }
+  [[nodiscard]] const ConfigSnapshotRef &snapshot() const noexcept { return snapshot_; }
+  [[nodiscard]] const std::shared_ptr<health::Coordinator> &coordinator() const noexcept {
+    return coordinator_;
+  }
+  [[nodiscard]] const std::vector<std::shared_ptr<resilience::GlobalAdmission>> &
+  admissions() const noexcept {
+    return admissions_;
+  }
+  // One SelectionState exists for each fixed I/O worker.  It is only ever
+  // touched by that worker after publication; the shared pointer exists so
+  // an in-flight request can retain its old state across reload.
+  [[nodiscard]] const std::vector<std::shared_ptr<SelectionState>> &selection_states() const noexcept {
+    return selection_states_;
+  }
   [[nodiscard]] std::optional<RequestLease> TryAcquireRequestLease();
   // Called only by the Gateway control loop.  The callback must merely notify
   // that same loop through its control mailbox; it must not tear down owner
@@ -55,6 +80,10 @@ private:
   void ReleaseRequestLease() noexcept;
 
   std::uint64_t version_;
+  ConfigSnapshotRef snapshot_;
+  std::shared_ptr<health::Coordinator> coordinator_;
+  std::vector<std::shared_ptr<resilience::GlobalAdmission>> admissions_;
+  std::vector<std::shared_ptr<SelectionState>> selection_states_;
   std::atomic<std::uint64_t> active_request_leases_{0};
   std::atomic<RetirementState> retirement_state_{RetirementState::kActive};
   std::mutex retirement_mutex_;
