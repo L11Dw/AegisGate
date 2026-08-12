@@ -46,20 +46,35 @@ public:
   AsyncLogger &operator=(const AsyncLogger &) = delete;
 
   // Thread-safe.  Returns true if the record was enqueued.  Returns false
-  // if the queue is full (debug/info dropped) or the logger is stopped.
+  // if the queue is full (debug/info dropped), the logger is stopped, or
+  // the writer has failed.
   [[nodiscard]] bool Submit(LogRecord record);
 
   // Stops the logger.  Drains the queue with a deadline, then joins the
   // writer thread.  Idempotent.
   void Stop() noexcept;
 
-  // Monotonic count of dropped records (debug/info only).
+  // Monotonic count of dropped records (queue full).
   [[nodiscard]] std::uint64_t dropped_total() const noexcept {
     return dropped_total_.load(std::memory_order_relaxed);
+  }
+  // Monotonic count of records lost due to writer I/O failure.
+  [[nodiscard]] std::uint64_t io_dropped_total() const noexcept {
+    return io_dropped_total_.load(std::memory_order_relaxed);
+  }
+  // Monotonic count of critical (warn/error) records that overflowed
+  // the reserved slots.
+  [[nodiscard]] std::uint64_t critical_overflow() const noexcept {
+    return critical_overflow_.load(std::memory_order_relaxed);
+  }
+  // True if the writer has entered degraded mode (file open/write failure).
+  [[nodiscard]] bool writer_failed() const noexcept {
+    return writer_failed_.load(std::memory_order_relaxed);
   }
 
 private:
   void WriterLoop() noexcept;
+  void WakeWriter() noexcept;
 
   const std::string path_;
   const std::size_t capacity_;
@@ -68,6 +83,9 @@ private:
   int wake_fd_ = -1;
   std::thread writer_;
   std::atomic<std::uint64_t> dropped_total_{0};
+  std::atomic<std::uint64_t> io_dropped_total_{0};
+  std::atomic<std::uint64_t> critical_overflow_{0};
+  std::atomic<bool> writer_failed_{false};
   bool stopped_ = false;
   // Reserved slots for warn/error when queue is full.
   static constexpr std::size_t kCriticalSlots = 16;

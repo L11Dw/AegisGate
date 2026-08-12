@@ -153,5 +153,106 @@ TEST(AsyncLoggerTest, ShutdownDrainsAndReportsDropCount) {
   EXPECT_EQ(logger.dropped_total(), 0u);
 }
 
+TEST(AsyncLoggerTest, SubmitAfterStopReturnsFalse) {
+  AsyncLogger logger("/dev/null", 16);
+  logger.Stop();
+  LogRecord record;
+  record.timestamp_us = 1;
+  record.level = "info";
+  record.event = "test";
+  EXPECT_FALSE(logger.Submit(std::move(record)));
+}
+
+TEST(AsyncLoggerTest, ConcurrentSubmitAndStopIsSafe) {
+  // Submit from multiple threads while Stop is called from another.
+  AsyncLogger logger("/dev/null", 256);
+  std::atomic<bool> stop_flag{false};
+  std::vector<std::thread> submitters;
+  for (int t = 0; t < 4; ++t) {
+    submitters.emplace_back([&logger, &stop_flag] {
+      for (int i = 0; !stop_flag.load(std::memory_order_relaxed); ++i) {
+        LogRecord record;
+        record.timestamp_us = i;
+        record.level = "info";
+        record.event = "concurrent";
+        (void)logger.Submit(std::move(record));
+      }
+    });
+  }
+  // Let submissions run briefly.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  logger.Stop();
+  stop_flag.store(true, std::memory_order_relaxed);
+  for (auto &t : submitters) t.join();
+  // No crash, no hang.
+}
+
+TEST(AsyncLoggerTest, CriticalSlotsAcceptWarnAndErrorWhenQueueFull) {
+  AsyncLogger logger("/dev/null", 4);
+  // Fill queue with debug records.
+  for (int i = 0; i < 4; ++i) {
+    LogRecord record;
+    record.timestamp_us = i;
+    record.level = "debug";
+    record.event = "fill";
+    EXPECT_TRUE(logger.Submit(std::move(record)));
+  }
+  // warn/error should still be accepted via critical slots.
+  LogRecord warn_record;
+  warn_record.timestamp_us = 100;
+  warn_record.level = "warn";
+  warn_record.event = "critical";
+  EXPECT_TRUE(logger.Submit(std::move(warn_record)));
+
+  LogRecord error_record;
+  error_record.timestamp_us = 101;
+  error_record.level = "error";
+  error_record.event = "critical";
+  EXPECT_TRUE(logger.Submit(std::move(error_record)));
+}
+
+TEST(AsyncLoggerTest, CriticalOverflowIsCounted) {
+  AsyncLogger logger("/dev/null", 4);
+  // Fill queue.
+  for (int i = 0; i < 4; ++i) {
+    LogRecord record;
+    record.timestamp_us = i;
+    record.level = "debug";
+    record.event = "fill";
+    (void)logger.Submit(std::move(record));
+  }
+  // Overflow critical slots (16).
+  for (int i = 0; i < 20; ++i) {
+    LogRecord record;
+    record.timestamp_us = 100 + i;
+    record.level = "error";
+    record.event = "overflow";
+    (void)logger.Submit(std::move(record));
+  }
+  EXPECT_GT(logger.critical_overflow(), 0u);
+}
+
+TEST(AsyncLoggerTest, WriterFailureDoesNotBlockStop) {
+  // Open a path that will fail — writer enters degraded mode.
+  AsyncLogger logger("/nonexistent/dir/log.jsonl", 16);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(logger.writer_failed());
+  // Stop should return quickly, not hang.
+  logger.Stop();
+}
+
+TEST(AsyncLoggerTest, SubmitAfterWriterFailureCountsIoDrop) {
+  AsyncLogger logger("/nonexistent/dir/log.jsonl", 16);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  EXPECT_TRUE(logger.writer_failed());
+  // Subsequent submits should count as I/O drops.
+  LogRecord record;
+  record.timestamp_us = 1;
+  record.level = "info";
+  record.event = "after_fail";
+  EXPECT_FALSE(logger.Submit(std::move(record)));
+  EXPECT_GT(logger.io_dropped_total(), 0u);
+}
+
 } // namespace
 } // namespace aegisgate::observability

@@ -15,7 +15,6 @@ namespace aegisgate::observability {
 
 namespace {
 
-// Escape a string for JSON.  Handles \n, \r, \t, \\, \".
 std::string JsonEscape(std::string_view sv) {
   std::string result;
   result.reserve(sv.size() + 8);
@@ -80,30 +79,40 @@ AsyncLogger::AsyncLogger(std::string path, std::size_t capacity)
 AsyncLogger::~AsyncLogger() { Stop(); }
 
 bool AsyncLogger::Submit(LogRecord record) {
+  int fd = -1;
   {
     std::lock_guard<std::mutex> guard(mu_);
     if (stopped_) return false;
-    // Check if this is a critical (warn/error) level.
+    if (writer_failed_.load(std::memory_order_relaxed)) {
+      // Writer is in degraded mode — count as I/O drop.
+      io_dropped_total_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
     const bool is_critical = (record.level == "warn" || record.level == "error");
     if (queue_.size() >= capacity_) {
       if (is_critical && critical_used_ < kCriticalSlots) {
-        // Use a reserved critical slot.
         ++critical_used_;
       } else {
-        // Drop and count.
+        if (is_critical) {
+          critical_overflow_.fetch_add(1, std::memory_order_relaxed);
+        }
         dropped_total_.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
     }
     queue_.push_back(std::move(record));
+    fd = wake_fd_; // capture under lock
   }
-  // Wake the writer thread.
-  const std::uint64_t one = 1;
-  for (;;) {
-    const ssize_t n = ::write(wake_fd_, &one, sizeof(one));
-    if (n == sizeof(one)) break;
-    if (n < 0 && errno == EINTR) continue;
-    break; // EAGAIN
+  // Wake the writer — fd is valid because stopped_ was false under lock,
+  // and Stop() sets stopped_ before closing the fd.
+  if (fd >= 0) {
+    const std::uint64_t one = 1;
+    for (;;) {
+      const ssize_t n = ::write(fd, &one, sizeof(one));
+      if (n == sizeof(one)) break;
+      if (n < 0 && errno == EINTR) continue;
+      break; // EAGAIN or EBADF (Stop raced — acceptable)
+    }
   }
   return true;
 }
@@ -114,18 +123,28 @@ void AsyncLogger::Stop() noexcept {
     if (stopped_) return;
     stopped_ = true;
   }
-  // Wake the writer to process remaining records.
+  // Wake the writer to process remaining records.  The fd is still valid
+  // because we set stopped_ under lock before this point, and the writer
+  // checks stopped_ after draining.
+  WakeWriter();
+  if (writer_.joinable()) writer_.join();
+  // Now safe to close the fd — writer has exited.
+  {
+    std::lock_guard<std::mutex> guard(mu_);
+    if (wake_fd_ >= 0) {
+      (void)::close(wake_fd_);
+      wake_fd_ = -1;
+    }
+  }
+}
+
+void AsyncLogger::WakeWriter() noexcept {
   const std::uint64_t one = 1;
   for (;;) {
     const ssize_t n = ::write(wake_fd_, &one, sizeof(one));
     if (n == sizeof(one)) break;
     if (n < 0 && errno == EINTR) continue;
-    break;
-  }
-  if (writer_.joinable()) writer_.join();
-  if (wake_fd_ >= 0) {
-    (void)::close(wake_fd_);
-    wake_fd_ = -1;
+    break; // EAGAIN or EBADF
   }
 }
 
@@ -133,7 +152,7 @@ void AsyncLogger::WriterLoop() noexcept {
   std::ofstream ofs;
   ofs.open(path_, std::ios::app);
   if (!ofs.is_open()) {
-    // Degraded mode: just count drops and return.
+    writer_failed_.store(true, std::memory_order_relaxed);
     return;
   }
 
@@ -144,7 +163,7 @@ void AsyncLogger::WriterLoop() noexcept {
       const ssize_t n = ::read(wake_fd_, &counter, sizeof(counter));
       if (n == sizeof(counter)) break;
       if (n < 0 && errno == EINTR) continue;
-      break; // EAGAIN
+      break; // EAGAIN or EBADF (Stop closed fd)
     }
 
     // Drain the queue.
@@ -157,14 +176,18 @@ void AsyncLogger::WriterLoop() noexcept {
     }
 
     // Write each record.
+    std::size_t io_failures = 0;
     for (const auto &record : batch) {
       const std::string json = SerializeLogRecord(record);
       ofs << json << '\n';
       if (!ofs.good()) {
-        // Write failed — degrade to counting.
-        dropped_total_.fetch_add(batch.size(), std::memory_order_relaxed);
-        return;
+        ++io_failures;
       }
+    }
+    if (io_failures > 0) {
+      io_dropped_total_.fetch_add(io_failures, std::memory_order_relaxed);
+      writer_failed_.store(true, std::memory_order_relaxed);
+      return;
     }
     ofs.flush();
   }
