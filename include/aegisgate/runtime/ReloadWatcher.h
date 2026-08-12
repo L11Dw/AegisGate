@@ -34,6 +34,7 @@ private:
   void HandleInotify();
   void HandleSighup();
   void Debounce();
+  void TryRewatch();
   void Stop() noexcept;
 
   net::EventLoop &loop_;

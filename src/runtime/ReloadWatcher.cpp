@@ -19,6 +19,8 @@
 namespace aegisgate::runtime {
 namespace {
 
+constexpr std::chrono::milliseconds kWatchRetryDelay{500};
+
 std::pair<std::string, std::string> SplitPath(const std::string &path) {
   const std::size_t slash = path.find_last_of('/');
   if (slash == std::string::npos) return {".", path};
@@ -86,14 +88,39 @@ void ReloadWatcher::HandleInotify() {
       const auto *event = reinterpret_cast<const inotify_event *>(bytes.data() + offset);
       const std::size_t event_size = sizeof(inotify_event) + event->len;
       if (event_size == 0 || offset + event_size > static_cast<std::size_t>(count)) return;
-      if (event->wd == watch_descriptor_ && event->len != 0 &&
-          filename_ == std::string_view(event->name) &&
-          (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB)) != 0) {
-        Debounce();
+      if (event->wd == watch_descriptor_) {
+        // Watch invalidation: the kernel removes the watch when the watched
+        // directory is deleted or the filesystem is unmounted.  Re-arm if the
+        // directory is still accessible; otherwise schedule a retry.
+        if ((event->mask & IN_IGNORED) != 0) {
+          watch_descriptor_ = -1;
+          TryRewatch();
+          continue;
+        }
+        if (event->len != 0 && filename_ == std::string_view(event->name) &&
+            (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB)) != 0) {
+          Debounce();
+        }
       }
       offset += event_size;
     }
   }
+}
+
+void ReloadWatcher::TryRewatch() {
+  const int new_wd = ::inotify_add_watch(
+      inotify_fd_, directory_.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB);
+  if (new_wd >= 0) {
+    watch_descriptor_ = new_wd;
+    return;
+  }
+  // Directory is gone.  Schedule a retry so we re-arm when it reappears.
+  // The timer callback will try again; if the directory still doesn't exist,
+  // it reschedules itself.
+  (void)timers_->ScheduleAfter(kWatchRetryDelay, [this] {
+    if (watch_descriptor_ >= 0) return;  // already re-armed
+    TryRewatch();
+  });
 }
 
 void ReloadWatcher::HandleSighup() {
