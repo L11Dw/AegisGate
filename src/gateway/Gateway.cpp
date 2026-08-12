@@ -288,15 +288,15 @@ void Gateway::HandleGenerationEvents() {
           auto wd = worker_datas_[i];
           auto admissions = entry.generation->admissions();
           auto mb = generation_mailbox_;
-          if (!worker.PostWithLoop(
+          // Use PostShutdown (reserved slot, always accepted while running).
+          // If it fails the worker is stopping/stopped: WorkerData::Shutdown
+          // has been or will be called before the thread joins, returning
+          // lease balances.  Count as completed to avoid hanging.
+          if (!worker.PostShutdown(
                   [wd, admissions, mb](net::EventLoop &) {
                     wd->ReturnGenerationLeaseBalance(admissions);
                     (void)mb->Wake();
                   })) {
-            // Worker stopped or queue full.  Its Shutdown() has already
-            // returned lease balances (WorkerData::Shutdown is called
-            // before the worker joins).  Count as completed to avoid
-            // hanging the retirement pipeline.
             ++entry.returned_worker_balances;
           }
         }

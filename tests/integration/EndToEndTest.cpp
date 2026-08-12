@@ -229,7 +229,7 @@ private:
         return;
       }
       std::array<char, 512> request{};
-      (void)::read(fd, request.data(), request.size());
+      [[maybe_unused]] auto _ = ::read(fd, request.data(), request.size());
       if (::write(fd, response.data(), response.size()) != static_cast<ssize_t>(response.size())) {
         Fail("write failed");
       }
@@ -665,7 +665,7 @@ TEST(EndToEndTest, StreamsLargeResponseUnderSlowClient) {
     }
     (void)::close(fd);
     // The body is fully buffered upstream; the client has read nothing yet.
-    (void)::write(signal[1], "d", 1);
+    [[maybe_unused]] auto _ = ::write(signal[1], "d", 1);
   });
 
   config::Route route{"slow", "slow.e2e.test", "/", {Endpoint(listener.BoundPort())}, 100, 100, 8};
@@ -680,7 +680,7 @@ TEST(EndToEndTest, StreamsLargeResponseUnderSlowClient) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view request = "GET /slow HTTP/1.1\r\nHost: slow.e2e.test\r\n\r\n";
     if (!WriteAll(client.Fd(), request, TestDeadline(), error)) {
-      (void)::write(wake, "q", 1);
+      [[maybe_unused]] auto _ = ::write(wake, "q", 1);
       return;
     }
     // Do not read anything while the whole response is buffered: the gateway
@@ -838,7 +838,7 @@ TEST(EndToEndTest, ClientDisconnectStopsUpstreamRead) {
       if (!closed && backend_error.empty()) backend_error = "expected EOF on cancelled upstream";
     }
     (void)::close(fd);
-    (void)::write(signal[1], "c", 1);
+    [[maybe_unused]] auto _ = ::write(signal[1], "c", 1);
   });
 
   config::Route route{"disconnect", "disconnect.e2e.test", "/",
@@ -849,7 +849,7 @@ TEST(EndToEndTest, ClientDisconnectStopsUpstreamRead) {
     net::Socket client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view inbound = "GET /disconnect HTTP/1.1\r\nHost: disconnect.e2e.test\r\n\r\n";
     if (!WriteAll(client.Fd(), inbound, TestDeadline(), error)) {
-      (void)::write(wake, "q", 1);
+      [[maybe_unused]] auto _ = ::write(wake, "q", 1);
       return;
     }
     // Wait for the response head to reach the kernel (the stream is
@@ -915,7 +915,7 @@ TEST(EndToEndTest, UpstreamReuseIsIndependentOfDownstreamDrain) {
     net::Socket first_client = net::Socket::ConnectLoopback(port);
     constexpr std::string_view inbound = "GET /reuse HTTP/1.1\r\nHost: reuse.e2e.test\r\n\r\n";
     if (!WriteAll(first_client.Fd(), inbound, TestDeadline(), error)) {
-      (void)::write(wake, "q", 1);
+      [[maybe_unused]] auto _ = ::write(wake, "q", 1);
       return;
     }
     // The first response arriving in the kernel means the gateway has read

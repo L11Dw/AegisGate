@@ -302,5 +302,122 @@ TEST(WorkerDataTest, ReturnGenerationLeaseBalanceReturnsAllTokens) {
   runtime.Stop();
 }
 
+// Balance return: when PostShutdown fails (worker is stopping, its reserved
+// slot already consumed), Shutdown() still returns balances before the
+// thread joins.  The retirement pipeline counts PostShutdown failure as
+// "will be returned by Shutdown" to avoid hanging.
+TEST(WorkerDataTest, BalanceReturnPostFailureDoesNotHangRetirement) {
+  Fixture fixture = MakeFixture();
+  WorkerRuntime runtime;
+  runtime.Start();
+  std::shared_ptr<WorkerData> data;
+  {
+    std::promise<void> ready;
+    auto future = ready.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &loop) {
+      data = std::make_shared<WorkerData>(loop, fixture.shared, 0,
+                                          fixture.metrics, fixture.client_count);
+      ready.set_value();
+    }));
+    future.get();
+  }
+
+  // Drain some lease tokens so the worker holds a balance.
+  std::array<int, 2> fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds.data()), 0);
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data->Accept(net::FdOwner(fds[1])); }));
+  std::string error;
+  constexpr std::string_view req = "GET / HTTP/1.1\r\nHost: lease.test\r\n\r\n";
+  ASSERT_TRUE(WriteAll(fds[0], req, TestDeadline(), error));
+  constexpr std::string_view resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+  EXPECT_EQ(ReadExact(fds[0], resp.size(), TestDeadline(), error), resp);
+  (void)::close(fds[0]);
+
+  constexpr std::int64_t kScale = 1'000'000'000;
+  constexpr std::int64_t kBatch = 100;
+  // One batch drawn, one spent: 99 held by the worker.
+  EXPECT_EQ(fixture.admission->credit(), (1000 - kBatch) * kScale);
+
+  // Post a shutdown task (reserves the slot).  A second PostShutdown
+  // returns false — this is the condition the retirement pipeline handles.
+  ASSERT_TRUE(runtime.PostShutdown([](net::EventLoop &) {}));
+  EXPECT_FALSE(runtime.PostShutdown([](net::EventLoop &) {}));
+
+  // Shutdown still returns the 99 unspent tokens even though PostShutdown
+  // would fail for the balance return task.
+  {
+    std::promise<void> done;
+    auto future = done.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) {
+      data->Shutdown();
+      done.set_value();
+    }));
+    future.get();
+  }
+  EXPECT_EQ(fixture.admission->credit(), (1000 - 1) * kScale);
+
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data.reset(); }));
+  runtime.Stop();
+}
+
+// Worker shutdown returns lease balances; explicit ReturnGenerationLeaseBalance
+// followed by Shutdown must not double-return.
+TEST(WorkerDataTest, WorkerShutdownBarrierMakesBalanceReturnSafe) {
+  Fixture fixture = MakeFixture();
+  WorkerRuntime runtime;
+  runtime.Start();
+  std::shared_ptr<WorkerData> data;
+  {
+    std::promise<void> ready;
+    auto future = ready.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &loop) {
+      data = std::make_shared<WorkerData>(loop, fixture.shared, 0,
+                                          fixture.metrics, fixture.client_count);
+      ready.set_value();
+    }));
+    future.get();
+  }
+
+  std::array<int, 2> fds{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds.data()), 0);
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data->Accept(net::FdOwner(fds[1])); }));
+  std::string error;
+  constexpr std::string_view req = "GET / HTTP/1.1\r\nHost: lease.test\r\n\r\n";
+  ASSERT_TRUE(WriteAll(fds[0], req, TestDeadline(), error));
+  constexpr std::string_view resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+  EXPECT_EQ(ReadExact(fds[0], resp.size(), TestDeadline(), error), resp);
+  (void)::close(fds[0]);
+
+  constexpr std::int64_t kScale = 1'000'000'000;
+  EXPECT_EQ(fixture.admission->credit(), (1000 - 100) * kScale);
+
+  // Return via the retirement pipeline path.
+  {
+    std::promise<void> done;
+    auto future = done.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) {
+      data->ReturnGenerationLeaseBalance(fixture.shared->admissions);
+      done.set_value();
+    }));
+    future.get();
+  }
+  EXPECT_EQ(fixture.admission->credit(), (1000 - 1) * kScale);
+
+  // Shutdown is idempotent — balances already returned.
+  {
+    std::promise<void> done;
+    auto future = done.get_future();
+    ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) {
+      data->Shutdown();
+      done.set_value();
+    }));
+    future.get();
+  }
+  EXPECT_EQ(fixture.admission->credit(), (1000 - 1) * kScale);
+
+  ASSERT_TRUE(runtime.PostWithLoop([&](net::EventLoop &) { data.reset(); }));
+  runtime.Stop();
+}
+
 } // namespace
 } // namespace aegisgate::runtime

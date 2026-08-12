@@ -1937,7 +1937,7 @@ TEST(ProxyTransactionTest, ClientCloseCancelsUpstream) {
       }
     }
     (void)::close(fd);
-    (void)::write(wake_sockets[1], "q", 1);
+    [[maybe_unused]] auto _ = ::write(wake_sockets[1], "q", 1);
   });
 
   std::array<int, 2> client_sockets{};
@@ -2099,7 +2099,7 @@ TEST(ProxyTransactionTest, ClientDestroyedBeforeCommittedFailureIsSafe) {
       if (backend_error.empty()) backend_error = "gate read failed";
     }
     (void)::close(fd);
-    (void)::write(gate[1], "d", 1);
+    [[maybe_unused]] auto _ = ::write(gate[1], "d", 1);
   });
 
   std::array<int, 2> client_sockets{};

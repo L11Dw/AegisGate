@@ -24,11 +24,15 @@ bool GenerationMailbox::Wake() {
   const std::uint64_t one = 1;
   for (;;) {
     const ssize_t n = ::write(wake_fd_, &one, sizeof(one));
-    if (n == sizeof(one)) break;
+    if (n == sizeof(one)) return true;
     if (n < 0 && errno == EINTR) continue;
-    break; // EAGAIN: counter already saturated
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // Counter already saturated — a wake is pending.  Treat as success.
+      return true;
+    }
+    // Hard error (EBADF, EFAULT, etc.).  The fd is likely invalid.
+    return false;
   }
-  return true;
 }
 
 bool GenerationMailbox::Drain() {
