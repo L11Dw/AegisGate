@@ -117,4 +117,3 @@ TEST(WorkerSetTest, PartialStartRollsBackStartedWorkers) {
 }
 
 } // namespace aegisgate::runtime
-

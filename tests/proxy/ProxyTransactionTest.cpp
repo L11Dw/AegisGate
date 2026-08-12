@@ -573,9 +573,9 @@ public:
         request_snapshot_(std::make_shared<const runtime::ConfigSnapshot>(
             runtime::ConfigSnapshot{1, config})) {}
 
-  std::optional<ProxyTransaction::AttemptSelection> Select() {
+  ProxyTransaction::AttemptDecision Select() {
     const auto snapshot = coordinator_->CurrentSnapshot();
-    if (!snapshot) return std::nullopt;
+    if (!snapshot) return {std::nullopt, false};
     const auto &endpoints = config_.routes[0].endpoints;
     const auto eligible = [&](std::size_t endpoint_index) {
       const auto &decision = snapshot->endpoints[0][endpoint_index];
@@ -590,7 +590,7 @@ public:
     };
     for (;;) {
       const auto index = selection_.NextLeastActiveIndex(0, tried_, eligible);
-      if (!index) return std::nullopt;
+      if (!index) return {std::nullopt, false};
       tried_.insert(*index);
       std::optional<ProxyTransaction::BreakerLink> link;
       if (snapshot->endpoints[0][*index].generation != 0) {
@@ -599,9 +599,11 @@ public:
             {false, snapshot->endpoints[0][*index].generation, 0},
             health::OutcomeChannel::Reservation{}};
       }
-      return ProxyTransaction::AttemptSelection{
-          endpoints[*index], std::move(link), selection_.AcquireActive(0, *index),
-          request_snapshot_};
+      return ProxyTransaction::AttemptDecision{
+          ProxyTransaction::AttemptSelection{endpoints[*index], std::move(link),
+                                             selection_.AcquireActive(0, *index),
+                                             request_snapshot_},
+          false};
     }
   }
 
@@ -1485,9 +1487,9 @@ TEST(ProxyTransactionTest, StartWithExpiredGatewayTokenIsInert) {
     transaction = ProxyTransaction::Start(
         loop, connection, endpoint, parsed, pool, std::optional<resilience::GlobalAdmission::Reservation>(std::move(reservation)), &timers, std::move(policy),
         nullptr, "least",
-        [&]() -> std::optional<ProxyTransaction::AttemptSelection> {
+        [&]() -> ProxyTransaction::AttemptDecision {
           provider_called = true;
-          return std::nullopt;
+          return {std::nullopt, false};
         },
         expired_token);
   });

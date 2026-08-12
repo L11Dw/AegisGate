@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -92,6 +93,10 @@ private:
   void DrainQueue(net::EventLoop &loop);
   void DrainShutdownTask(net::EventLoop &loop);
   [[nodiscard]] bool PostTask(Task task);
+  // The eventfd wake write, EINTR/EAGAIN-safe, using the injected seam when
+  // present.  Must be called with queue_mutex_ held.  Returns false on a hard
+  // failure (descriptor closed) so the caller can roll back the enqueue.
+  [[nodiscard]] bool WakeLocked(const std::uint64_t *counter) noexcept;
 
   std::size_t task_capacity_;
   // Constructor-injected test seam for the wake write (see the constructor).
@@ -100,9 +105,17 @@ private:
   // -1 means closed.  Exchanged atomically so close is exactly once.
   std::atomic<int> wake_fd_;
   std::mutex queue_mutex_;
+  std::condition_variable ready_cv_;
   std::deque<Task> tasks_;
   // The reserved shutdown/destroy task; guarded by queue_mutex_.
   std::function<void(net::EventLoop &)> shutdown_task_;
+  // True once the worker loop is registered and running (guarded by
+  // queue_mutex_); Post/PostShutdown require it so a worker whose loop has
+  // exited never accepts a task that would never run.
+  bool running_ = false;
+  // One-shot, set true by Run() once the loop is ready; Start() waits on it
+  // so a Post immediately after Start is never rejected by the startup window.
+  bool loop_ready_ = false;
   std::atomic_bool started_{false};
   std::atomic_bool stopping_{false};
   std::atomic<std::thread::id> owner_thread_{};

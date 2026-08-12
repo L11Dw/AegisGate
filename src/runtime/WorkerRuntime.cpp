@@ -1,6 +1,7 @@
 #include "aegisgate/runtime/WorkerRuntime.h"
 
 #include <cerrno>
+#include <condition_variable>
 #include <stdexcept>
 #include <system_error>
 
@@ -36,6 +37,13 @@ void WorkerRuntime::Start() {
     throw std::logic_error("worker already stopped");
   }
   thread_ = std::thread([this] { Run(); });
+  // Wait until Run() has registered the loop and set running_, so a Post
+  // immediately after Start is never rejected by the startup window.
+  std::unique_lock<std::mutex> lock(queue_mutex_);
+  ready_cv_.wait(lock, [this] { return loop_ready_; });
+  if (stopping_.load(std::memory_order_relaxed)) {
+    throw std::logic_error("worker loop failed to start");
+  }
 }
 
 void WorkerRuntime::Stop() noexcept {
@@ -47,21 +55,19 @@ void WorkerRuntime::Stop() noexcept {
   {
     // The final wake write is serialized with Run()'s exchange+close under the
     // queue mutex (TSAN): a concurrent write and close of the same descriptor
-    // would otherwise race the fd number.
+    // would otherwise race the fd number.  The stop signal always uses the real
+    // write (never the injected seam): it must wake a parked worker regardless
+    // of test injection.
     std::lock_guard<std::mutex> guard(queue_mutex_);
     stopping_.store(true, std::memory_order_relaxed);
-    // Final wake: a worker parked in epoll_wait must observe the stop without
-    // waiting for another producer.  EINTR is retried; EAGAIN/EWOULDBLOCK means
-    // a wake is already pending; any other error is harmless because the queue
-    // state was frozen under the mutex.
+    const std::uint64_t counter = 1;
     const int fd = wake_fd_.load(std::memory_order_relaxed);
     if (fd >= 0) {
-      const std::uint64_t counter = 1;
       for (;;) {
         const ssize_t count = ::write(fd, &counter, sizeof(counter));
         if (count == static_cast<ssize_t>(sizeof(counter))) break;
         if (count < 0 && errno == EINTR) continue;
-        break;
+        break;  // EAGAIN: a wake is already pending; other errors: no reader
       }
     }
   }
@@ -95,46 +101,51 @@ bool WorkerRuntime::PostTask(Task task) {
   if (!started_.load(std::memory_order_acquire)) return false;
   const std::uint64_t wake = 1;
   std::lock_guard<std::mutex> guard(queue_mutex_);
-  if (stopping_.load(std::memory_order_relaxed)) return false;
+  // Accept only while the worker loop is running: a task posted after the loop
+  // has exited would never be drained.
+  if (stopping_.load(std::memory_order_relaxed) || !running_) return false;
   if (tasks_.size() >= task_capacity_) return false;
   tasks_.push_back(std::move(task));
   // The wake write happens while the queue is locked so a failure can pop the
   // task back: a false return must mean "not accepted, caller still owns it".
-  // EINTR is retried; EAGAIN/EWOULDBLOCK on a nonblocking eventfd means a
-  // wake is already pending, which cannot lose this task.
-  const int fd = wake_fd_.load(std::memory_order_relaxed);
-  if (fd < 0) {
+  if (!WakeLocked(&wake)) {
     tasks_.pop_back();
     return false;
   }
-  for (;;) {
-    const ssize_t count = wake_writer_ ? wake_writer_(fd, &wake, sizeof(wake))
-                                       : ::write(fd, &wake, sizeof(wake));
-    if (count == static_cast<ssize_t>(sizeof(wake))) return true;
-    if (count < 0 && errno == EINTR) continue;
-    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
-    tasks_.pop_back();
-    return false;
-  }
+  return true;
 }
 
 bool WorkerRuntime::PostShutdown(std::function<void(net::EventLoop &)> task) {
   if (!task) return false;
+  const std::uint64_t wake = 1;
   std::lock_guard<std::mutex> guard(queue_mutex_);
-  if (stopping_.load(std::memory_order_relaxed) || shutdown_task_) return false;
+  // Accept only while the worker loop is running: a shutdown task posted to an
+  // exited loop would be a "fake success" — the destroy task would never run.
+  if (!started_.load(std::memory_order_relaxed) || !running_ ||
+      stopping_.load(std::memory_order_relaxed) || shutdown_task_) {
+    return false;
+  }
   shutdown_task_ = std::move(task);
-  // Wake the worker so the shutdown task runs even when it is parked.
-  const int fd = wake_fd_.load(std::memory_order_relaxed);
-  if (fd >= 0) {
-    const std::uint64_t counter = 1;
-    for (;;) {
-      const ssize_t count = ::write(fd, &counter, sizeof(counter));
-      if (count == static_cast<ssize_t>(sizeof(counter))) break;
-      if (count < 0 && errno == EINTR) continue;
-      break;
-    }
+  if (!WakeLocked(&wake)) {
+    // Hard wake failure (descriptor closed): roll the reservation back so the
+    // caller's false is an honest "not accepted", never a fake success.
+    shutdown_task_ = std::function<void(net::EventLoop &)>();
+    return false;
   }
   return true;
+}
+
+bool WorkerRuntime::WakeLocked(const std::uint64_t *counter) noexcept {
+  const int fd = wake_fd_.load(std::memory_order_relaxed);
+  if (fd < 0) return false;
+  for (;;) {
+    const ssize_t count = wake_writer_ ? wake_writer_(fd, counter, sizeof(*counter))
+                                       : ::write(fd, counter, sizeof(*counter));
+    if (count == static_cast<ssize_t>(sizeof(*counter))) return true;
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+    return false;
+  }
 }
 
 bool WorkerRuntime::PostFd(int fd, std::function<void(net::FdOwner)> handler) {
@@ -161,24 +172,44 @@ void WorkerRuntime::Run() {
   owner_thread_.store(std::this_thread::get_id(), std::memory_order_release);
   const int fd = wake_fd_.load(std::memory_order_relaxed);
   if (fd < 0) return;  // unreachable: Start() rejects a stopped worker
-  // The EventLoop is constructed on this thread so its owner-thread
-  // assertions hold for every registration and callback.
-  net::EventLoop loop;
-  net::Channel wake(loop, fd);
-  wake.SetReadCallback([this, &loop] { HandleWake(loop); });
-  wake.EnableReading();
-  loop.Loop();
-  // Unregister before closing so the Channel destructor never touches the
-  // EventLoop with a closed descriptor (R-003).  The exchange is serialized
-  // with Stop()'s final wake write under the queue mutex (TSAN): once the
-  // descriptor is -1 here, no concurrent Stop can still write it.
-  wake.Remove();
-  int closed = -1;
-  {
-    std::lock_guard<std::mutex> guard(queue_mutex_);
-    closed = wake_fd_.exchange(-1, std::memory_order_relaxed);
+  try {
+    // The EventLoop is constructed on this thread so its owner-thread
+    // assertions hold for every registration and callback.
+    net::EventLoop loop;
+    net::Channel wake(loop, fd);
+    wake.SetReadCallback([this, &loop] { HandleWake(loop); });
+    wake.EnableReading();
+    {
+      std::lock_guard<std::mutex> guard(queue_mutex_);
+      running_ = true;
+      loop_ready_ = true;
+    }
+    ready_cv_.notify_all();
+    loop.Loop();
+    // Unregister before closing so the Channel destructor never touches the
+    // EventLoop with a closed descriptor (R-003).  The exchange is serialized
+    // with Stop()'s final wake write under the queue mutex (TSAN): once the
+    // descriptor is -1 here, no concurrent Stop can still write it.  running_
+    // is cleared first so a concurrent Post/PostShutdown stops being accepted.
+    wake.Remove();
+    int closed = -1;
+    {
+      std::lock_guard<std::mutex> guard(queue_mutex_);
+      running_ = false;
+      closed = wake_fd_.exchange(-1, std::memory_order_relaxed);
+    }
+    if (closed >= 0) (void)::close(closed);
+  } catch (...) {
+    // A loop setup failure must wake Start() and mark the worker unusable
+    // instead of leaving it permanently in the starting state.
+    {
+      std::lock_guard<std::mutex> guard(queue_mutex_);
+      stopping_.store(true, std::memory_order_relaxed);
+      running_ = false;
+      loop_ready_ = true;
+    }
+    ready_cv_.notify_all();
   }
-  if (closed >= 0) (void)::close(closed);
 }
 
 void WorkerRuntime::HandleWake(net::EventLoop &loop) {

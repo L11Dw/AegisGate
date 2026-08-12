@@ -568,4 +568,52 @@ TEST(WorkerRuntimeTest, AdoptedFdSurvivesHandlerThrow) {
   EXPECT_EQ(::close(peer[0]), 0);
 }
 
+
+// R-063 fix: once the worker loop has exited (here via a task calling Quit),
+// Post and PostShutdown must both reject — a shutdown task must never be a
+// "fake success" on an exited loop.
+TEST(WorkerRuntimeTest, RejectsPostsAfterLoopExited) {
+  WorkerRuntime worker;
+  worker.Start();
+  std::promise<void> quit_called;
+  auto future = quit_called.get_future();
+  ASSERT_TRUE(worker.PostWithLoop([&](net::EventLoop &loop) {
+    loop.Quit();  // force the loop to exit without a stop request
+    quit_called.set_value();
+  }));
+  future.get();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  bool rejected = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!worker.Post([] {}) && !worker.PostShutdown([](net::EventLoop &) {})) {
+      rejected = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(rejected) << "posts must be rejected after the worker loop exited";
+  worker.Stop();  // joins the already-exited thread
+}
+
+// R-063 fix: a hard wake failure during PostShutdown rolls the reserved task
+// back and returns false — an honest rejection, never a fake success.
+TEST(WorkerRuntimeTest, PostShutdownWakeFailureRollsBackReservedTask) {
+  int calls = 0;
+  WorkerRuntime worker(2, [&calls](int, const void *, std::size_t) -> ssize_t {
+    ++calls;
+    if (calls == 1) {
+      errno = EBADF;
+      return -1;
+    }
+    return sizeof(std::uint64_t);
+  });
+  worker.Start();
+  EXPECT_FALSE(worker.PostShutdown([](net::EventLoop &) {}));
+  // The reservation was rolled back, so a fresh PostShutdown can still be
+  // reserved (and now the wake succeeds).
+  std::atomic_int ran{0};
+  ASSERT_TRUE(worker.PostShutdown([&](net::EventLoop &) { ++ran; }));
+  worker.Stop();
+  EXPECT_EQ(ran.load(), 1);
+}
+
 } // namespace aegisgate::runtime

@@ -186,14 +186,19 @@ bool ProxyTransaction::StartUpstream() {
   // The provider chooses an eligible endpoint and issues the attempt permit
   // (freshly per retry).  No candidate means do not connect.
   breaker_link_.reset();
+  coordinator_overloaded_ = false;
   if (attempt_provider_) {
-    auto selection = attempt_provider_();
-    if (!selection.has_value()) {
+    AttemptDecision decision = attempt_provider_();
+    if (!decision.selection.has_value()) {
+      // Record why there was no candidate so the terminal metric reason is
+      // honest (coordinator overload vs no healthy endpoint).
+      coordinator_overloaded_ = decision.coordinator_overloaded;
       // No candidate is not a new attempt: the previous attempt's guard and
       // accounting stay as they are (the old attempt already released its
       // active slot at its terminal point before the retry was queued).
       return false;
     }
+    auto selection = std::move(decision.selection);
     endpoint_ = selection->endpoint;
     breaker_link_ = std::move(selection->link);
     // Bind the request snapshot on the first successful selection; retries use
@@ -468,9 +473,13 @@ void ProxyTransaction::FinishNoEndpoint() {
   ++generation_;
   CancelDeadlines();
   reservation_.reset();
-  // No upstream was ever connected, so the 503 carries no upstream label.
+  // No upstream was ever connected, so the 503 carries no upstream label; the
+  // reason distinguishes a route with no healthy candidate from one whose
+  // outcome capacity is exhausted (R-053), so operators are not misled.
   try {
-    metric_request_.Complete(503, {}, false, "no_healthy_endpoint");
+    metric_request_.Complete(503, {}, false,
+                             coordinator_overloaded_ ? "coordinator_overloaded"
+                                                     : "no_healthy_endpoint");
   } catch (...) {
   }
   if (!client_lifetime_.lock()) return;

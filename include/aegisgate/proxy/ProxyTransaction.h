@@ -75,11 +75,19 @@ public:
     routing::ActiveReservation active;
     runtime::ConfigSnapshotRef snapshot;
   };
+  // The provider's answer: a selection, or the reason there was none.  Both
+  // "no candidate" and "coordinator overloaded" mean do not connect; the two
+  // are distinguished so the terminal metric reason is honest (R-053).
+  struct AttemptDecision {
+    std::optional<AttemptSelection> selection;
+    bool coordinator_overloaded = false;
+  };
   // Chooses the endpoint for the initial attempt and for every retry, so
-  // unhealthy or open candidates are never connected to.  nullopt means no
-  // eligible candidate remains; the initial call terminates with a unique
-  // 503 and a retry call terminates the transaction.
-  using AttemptProvider = std::function<std::optional<AttemptSelection>()>;
+  // unhealthy or open candidates are never connected to.  A nullopt selection
+  // means no eligible candidate remains (or the route's outcome capacity is
+  // exhausted); the initial call terminates with a unique 503 and a retry call
+  // terminates the transaction.
+  using AttemptProvider = std::function<AttemptDecision()>;
 
   [[nodiscard]] static std::shared_ptr<ProxyTransaction>
   Start(net::EventLoop &loop, net::ClientConnection &client, config::Endpoint endpoint,
@@ -149,6 +157,10 @@ private:
   // the whole transaction so no retry re-reads the current global snapshot
   // (R-054).  Null when the provider is absent (caller-owned lifetime).
   runtime::ConfigSnapshotRef request_snapshot_;
+  // True when the provider reported coordinator overload (outcome capacity
+  // exhausted) for the terminal "no selection" decision; distinguishes the 503
+  // reason from a plain no-healthy-endpoint (R-053).
+  bool coordinator_overloaded_ = false;
   http::HttpRequest request_;
   // Pre-acquired by the caller (worker data plane) from the global
   // admission; released exactly once at the terminal path or by RAII.

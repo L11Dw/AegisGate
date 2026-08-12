@@ -10,20 +10,20 @@ AttemptSelector::AttemptSelector(SelectionState &selection, std::shared_ptr<Work
     : selection_(selection), shared_(std::move(shared)), route_index_(route_index),
       snapshot_(std::move(snapshot)) {}
 
-std::optional<proxy::ProxyTransaction::AttemptSelection>
-AttemptSelector::Select(bool least_active) {
+proxy::ProxyTransaction::AttemptDecision AttemptSelector::Select(bool least_active) {
+  overload_ = false;
   const auto health_snapshot = shared_->coordinator->CurrentSnapshot();
-  if (!health_snapshot) return std::nullopt;
+  if (!health_snapshot) return {std::nullopt, false};
   if (least_active) {
     for (;;) {
       const auto index = selection_.NextLeastActiveIndex(
           route_index_, tried_, [this, &health_snapshot](std::size_t endpoint_index) {
             return Eligible(endpoint_index, *health_snapshot);
           });
-      if (!index) return std::nullopt;
+      if (!index) return {std::nullopt, overload_};
       tried_.insert(*index);
       auto selection = MakeSelection(*index, *health_snapshot);
-      if (selection) return selection;
+      if (selection) return {std::move(selection), false};
       // A failed probe claim is not a candidate: re-scan (the index stays in
       // tried so the scan cannot loop on it).
     }
@@ -36,9 +36,9 @@ AttemptSelector::Select(bool least_active) {
     if (!index || !tried_.insert(*index).second) continue;
     if (!Eligible(*index, *health_snapshot)) continue;
     auto selection = MakeSelection(*index, *health_snapshot);
-    if (selection) return selection;
+    if (selection) return {std::move(selection), false};
   }
-  return std::nullopt;
+  return {std::nullopt, overload_};
 }
 
 bool AttemptSelector::Eligible(std::size_t endpoint_index,
@@ -79,9 +79,13 @@ AttemptSelector::MakeSelection(std::size_t endpoint_index,
     // R-053: claim a result slot before the attempt may connect.  A nullopt
     // means the route's outcome capacity is exhausted or the coordinator is
     // stopping: this candidate cannot start a breaker-accounted attempt, so it
-    // is not selectable (the caller terminates with 503 / ends the retry).
+    // is not selectable (the caller terminates with 503 / ends the retry) and
+    // the decision reports coordinator overload.
     auto reservation = shared_->coordinator->ReserveOutcome(route_index_);
-    if (!reservation) return std::nullopt;
+    if (!reservation) {
+      overload_ = true;
+      return std::nullopt;
+    }
     link = proxy::ProxyTransaction::BreakerLink{
         shared_->coordinator, route_index_, endpoint_index, permit, std::move(*reservation)};
   }
