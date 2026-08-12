@@ -19,8 +19,6 @@
 namespace aegisgate::runtime {
 namespace {
 
-constexpr std::chrono::milliseconds kWatchRetryDelay{500};
-
 std::pair<std::string, std::string> SplitPath(const std::string &path) {
   const std::size_t slash = path.find_last_of('/');
   if (slash == std::string::npos) return {".", path};
@@ -51,7 +49,8 @@ ReloadWatcher::ReloadWatcher(net::EventLoop &loop, std::string config_path,
     inotify_fd_ = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (inotify_fd_ < 0) throw std::system_error(errno, std::generic_category(), "inotify_init1");
     watch_descriptor_ = ::inotify_add_watch(
-        inotify_fd_, directory_.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB);
+        inotify_fd_, directory_.c_str(),
+        IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
     if (watch_descriptor_ < 0) {
       throw std::system_error(errno, std::generic_category(), "inotify_add_watch");
     }
@@ -109,15 +108,23 @@ void ReloadWatcher::HandleInotify() {
 
 void ReloadWatcher::TryRewatch() {
   const int new_wd = ::inotify_add_watch(
-      inotify_fd_, directory_.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB);
+      inotify_fd_, directory_.c_str(),
+      IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
   if (new_wd >= 0) {
     watch_descriptor_ = new_wd;
+    // Cancel any pending retry timer since we successfully re-armed.
+    if (rewatch_timer_ != 0) {
+      (void)timers_->Cancel(rewatch_timer_);
+      rewatch_timer_ = 0;
+    }
     return;
   }
-  // Directory is gone.  Schedule a retry so we re-arm when it reappears.
-  // The timer callback will try again; if the directory still doesn't exist,
-  // it reschedules itself.
-  (void)timers_->ScheduleAfter(kWatchRetryDelay, [this] {
+  // Directory is gone.  Schedule a single retry so we re-arm when it
+  // reappears.  Guard against duplicate timers: only schedule if no retry
+  // is already pending.
+  if (rewatch_timer_ != 0) return;
+  rewatch_timer_ = timers_->ScheduleAfter(kWatchRetryDelay, [this] {
+    rewatch_timer_ = 0;
     if (watch_descriptor_ >= 0) return;  // already re-armed
     TryRewatch();
   });
@@ -138,7 +145,7 @@ void ReloadWatcher::HandleSighup() {
 
 void ReloadWatcher::Debounce() {
   if (debounce_timer_ != 0) (void)timers_->Cancel(debounce_timer_);
-  debounce_timer_ = timers_->ScheduleAfter(std::chrono::milliseconds(200), [this] {
+  debounce_timer_ = timers_->ScheduleAfter(kDebounceDelay, [this] {
     debounce_timer_ = 0;
     try {
       trigger_();
@@ -152,6 +159,8 @@ void ReloadWatcher::Debounce() {
 void ReloadWatcher::Stop() noexcept {
   if (debounce_timer_ != 0 && timers_) (void)timers_->Cancel(debounce_timer_);
   debounce_timer_ = 0;
+  if (rewatch_timer_ != 0 && timers_) (void)timers_->Cancel(rewatch_timer_);
+  rewatch_timer_ = 0;
   sighup_channel_.reset();
   inotify_channel_.reset();
   timers_.reset();

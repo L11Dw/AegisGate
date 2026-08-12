@@ -18,9 +18,14 @@ namespace aegisgate::runtime {
 // directory (rather than the file inode) so an editor's atomic rename is seen;
 // SIGHUP arrives through signalfd after the process blocks it before worker
 // threads are created.  Neither callback parses configuration: both merely
-// coalesce into one 200ms debounce callback.
+// coalesce into one debounce callback.
 class ReloadWatcher {
 public:
+  // Debounce delay after inotify/SIGHUP event before triggering reload.
+  static constexpr std::chrono::milliseconds kDebounceDelay{200};
+  // Retry delay when the watched directory is temporarily unavailable.
+  static constexpr std::chrono::milliseconds kWatchRetryDelay{500};
+
   static void BlockSighupForProcess();
 
   ReloadWatcher(net::EventLoop &loop, std::string config_path,
@@ -48,6 +53,7 @@ private:
   int watch_descriptor_ = -1;
   int sighup_fd_ = -1;
   net::TimerQueue::TimerId debounce_timer_ = 0;
+  net::TimerQueue::TimerId rewatch_timer_ = 0;
 };
 
 } // namespace aegisgate::runtime
