@@ -215,6 +215,14 @@ Coordinator::ReserveOutcome(std::size_t route_index) noexcept {
   return outcome_channels_[route_index]->TryReserve();
 }
 
+void Coordinator::StopCheckers() noexcept {
+  if (!loop_data_) return;
+  for (auto &checker : loop_data_->checkers) {
+    if (checker) checker->Stop();
+  }
+  loop_data_->checkers.clear();
+}
+
 void Coordinator::BeginOutcomeStopping() noexcept {
   for (const auto &channel : outcome_channels_) {
     if (channel) channel->BeginStopping();

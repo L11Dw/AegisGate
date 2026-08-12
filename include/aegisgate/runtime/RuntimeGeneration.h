@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "aegisgate/health/Coordinator.h"
@@ -21,7 +22,16 @@ namespace aegisgate::runtime {
 // lifetime, so a retiring generation is never torn down between attempts.
 class RuntimeGeneration : public std::enable_shared_from_this<RuntimeGeneration> {
 public:
-  enum class RetirementState : std::uint8_t { kActive, kRetiring, kReaping, kDone };
+  enum class RetirementState : std::uint8_t {
+    kActive,
+    kRetiring,
+    kCheckersStopped,
+    kWaitingForLeases,
+    kOutcomeDraining,
+    kDone
+  };
+
+  using StateChangeCallback = std::function<void(RetirementState)>;
 
   class RequestLease {
   public:
@@ -69,6 +79,11 @@ public:
   // that same loop through its control mailbox; it must not tear down owner
   // resources on the releasing worker thread.
   [[nodiscard]] bool BeginRetirement(std::function<void()> on_last_lease);
+  // Transition kRetiring -> kCheckersStopped.  Advances to kWaitingForLeases
+  // when leases are also zero.
+  [[nodiscard]] bool NotifyCheckersStopped();
+  // Transition kWaitingForLeases -> kOutcomeDraining.
+  [[nodiscard]] bool BeginOutcomeStopping();
   // Gateway control-loop only.  Starts the one retirement reaper after all
   // worker-local balances for this generation were returned.  A duplicate
   // event is harmlessly rejected rather than starting a second coordinator
@@ -76,6 +91,16 @@ public:
   [[nodiscard]] bool BeginReaping() noexcept;
   // Gateway control-loop only, after the reaper has joined the coordinator.
   void MarkRetired() noexcept;
+  void SetStateChangeCallback(StateChangeCallback cb);
+  // Sets per-worker selection states after a successful prepare.
+  void SetSelectionStates(std::vector<std::shared_ptr<SelectionState>> states) {
+    selection_states_ = std::move(states);
+  }
+  // Set by the reaper thread after coordinator drain+stop.
+  void MarkCoordinatorStopped() noexcept;
+  [[nodiscard]] bool coordinator_stopped() const noexcept {
+    return coordinator_stopped_.load(std::memory_order_acquire);
+  }
   [[nodiscard]] std::uint64_t active_request_leases() const noexcept {
     return active_request_leases_.load(std::memory_order_acquire);
   }
@@ -85,6 +110,8 @@ public:
 
 private:
   void ReleaseRequestLease() noexcept;
+  using Transition = std::pair<StateChangeCallback, RetirementState>;
+  void AdvanceIfReady(std::vector<Transition> &transitions) noexcept;
 
   std::uint64_t version_;
   ConfigSnapshotRef snapshot_;
@@ -93,9 +120,12 @@ private:
   std::vector<std::shared_ptr<SelectionState>> selection_states_;
   std::atomic<std::uint64_t> active_request_leases_{0};
   std::atomic<RetirementState> retirement_state_{RetirementState::kActive};
+  std::atomic<bool> coordinator_stopped_{false};
   std::mutex retirement_mutex_;
+  StateChangeCallback on_state_change_;
   std::function<void()> on_last_lease_;
   bool retirement_notified_ = false;
+  bool checkers_stopped_ = false;
 };
 
 using RuntimeGenerationRef = std::shared_ptr<RuntimeGeneration>;

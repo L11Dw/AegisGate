@@ -232,6 +232,15 @@ void WorkerData::ReturnGenerationLeaseBalance(std::uint64_t generation_version) 
   lease_balances_.erase(found);
 }
 
+std::shared_ptr<SelectionState> WorkerData::PrepareSelectionState(
+    const config::Config &config, std::uint64_t version) {
+  try {
+    return std::make_shared<SelectionState>(config, version);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 void WorkerData::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,
                                     std::uint64_t identifier) {
   const auto state = weak_state.lock();

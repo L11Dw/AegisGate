@@ -201,6 +201,10 @@ void Gateway::HandleGenerationEvents() {
     if (event.kind == runtime::GenerationMailbox::Kind::kWorkerBalancesReturned) {
       ++found->second.returned_worker_balances;
       if (found->second.returned_worker_balances == worker_datas_.size()) {
+        // All balances returned — stop health checkers, notify state machine,
+        // and start the reaper for coordinator shutdown.
+        event.generation->coordinator()->StopCheckers();
+        (void)event.generation->NotifyCheckersStopped();
         StartRetirementReaper(event.generation);
       }
       continue;
@@ -245,6 +249,7 @@ void Gateway::StartRetirementReaper(const runtime::RuntimeGenerationRef &generat
       generation->coordinator()->BeginOutcomeStopping();
       generation->coordinator()->DrainOutcomesAndWait();
       generation->coordinator()->Stop();
+      generation->MarkCoordinatorStopped();
       if (!mailbox->Post({runtime::GenerationMailbox::Kind::kReaperFinished, generation})) {
         std::terminate();
       }
