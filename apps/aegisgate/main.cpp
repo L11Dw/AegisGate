@@ -33,18 +33,24 @@ std::string ReadFile(const char *path) {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    std::cerr << "usage: aegisgate_server <config.yaml> <listen-port>\n";
+  if (argc < 3) {
+    std::cerr << "usage: aegisgate_server <config.yaml> <listen-port> [--log-path <path>]\n";
     return 2;
   }
   try {
+    std::string log_path;
+    for (int i = 3; i < argc; ++i) {
+      if (std::string_view(argv[i]) == "--log-path" && i + 1 < argc) {
+        log_path = argv[++i];
+      }
+    }
     // signalfd receives SIGHUP only when it is blocked before the worker and
     // coordinator threads are created; they inherit this process signal mask.
     aegisgate::runtime::ReloadWatcher::BlockSighupForProcess();
     aegisgate::net::EventLoop loop;
     aegisgate::gateway::Gateway gateway(
         loop, aegisgate::config::LoadFromYaml(ReadFile(argv[1])), "0.0.0.0", ParsePort(argv[2]),
-        {}, argv[1]);
+        {}, argv[1], log_path);
     gateway.Start();
     aegisgate::runtime::ReloadWatcher watcher(loop, argv[1], [&gateway] {
       (void)gateway.RequestReload();

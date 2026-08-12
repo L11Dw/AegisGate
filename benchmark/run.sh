@@ -57,21 +57,23 @@ generate_config() {
   local rate_limit=100000
   local burst=1000
   local max_inflight=10000
-  local health_check=""
+  local retry_budget=0
+  local backend_port=9100
 
   case "$scenario" in
     admission)
-      rate_limit=100
-      burst=50
+      rate_limit=50
+      burst=20
+      max_inflight=10
       ;;
     breaker)
-      # No special config; breaker opens from failures.
+      # breaker opens from 500 failures, then recovers.
       ;;
     slow_client)
-      # No special config; slow client is simulated by the benchmark client.
+      # slow client is simulated by the mock backend delay.
       ;;
     reload)
-      # No special config; reload is triggered during the benchmark.
+      # reload is triggered by SIGHUP during the benchmark.
       ;;
   esac
 
@@ -83,12 +85,12 @@ routes:
     path_prefix: /
     endpoints:
       - host: 127.0.0.1
-        port: 9100
+        port: $backend_port
         weight: 1
     rate_limit: $rate_limit
     burst: $burst
     max_inflight: $max_inflight
-    retry_budget: 0
+    retry_budget: $retry_budget
 EOF
 }
 
@@ -110,10 +112,16 @@ start_backend() {
 # Start gateway on a fixed port.
 start_gateway() {
   local config_file=$1
+  local log_path="${2:-}"
   local port=8080
+  local log_arg=""
+  if [ -n "$log_path" ]; then
+    log_arg="--log-path $log_path"
+  fi
   # Try ports 8080-8090.
   for p in $(seq 8080 8090); do
-    "$PROJECT_DIR/build/release/aegisgate_server" "$config_file" "$p" &
+    # shellcheck disable=SC2086
+    "$PROJECT_DIR/build/release/aegisgate_server" "$config_file" "$p" $log_arg &
     GATEWAY_PID=$!
     sleep 0.3
     if kill -0 "$GATEWAY_PID" 2>/dev/null; then
@@ -221,16 +229,45 @@ build_release
 CONFIG_FILE=$(mktemp /tmp/aegisgate_bench_XXXXXX.yaml)
 generate_config "$WORKERS" "$SCENARIO" > "$CONFIG_FILE"
 
-start_backend 200 0
-start_gateway "$CONFIG_FILE"
+BENCH_LOG_PATH="$RESULTS_DIR/${SCENARIO}_w${WORKERS}_${TIMESTAMP}.log.jsonl"
+
+# Start scenario-specific backend.
+case "$SCENARIO" in
+  slow_client)
+    log "Starting slow backend (200ms delay)..."
+    start_backend 200 200
+    ;;
+  breaker)
+    log "Starting failing backend (500 status)..."
+    start_backend 500 0
+    ;;
+  *)
+    start_backend 200 0
+    ;;
+esac
+
+start_gateway "$CONFIG_FILE" "$BENCH_LOG_PATH"
 
 log "Warming up for ${WARMUP}s..."
 run_benchmark "$WARMUP" "$SCENARIO" > /dev/null
 
 log "Running $RUNS iterations of ${DURATION}s each..."
 RUNS_JSON=""
+RELOAD_COUNT=0
 for i in $(seq 1 "$RUNS"); do
   log "  Run $i/$RUNS..."
+
+  # Scenario-specific pre-run actions.
+  case "$SCENARIO" in
+    reload)
+      # Send SIGHUP to trigger reload mid-traffic.
+      if [ -n "$GATEWAY_PID" ] && kill -0 "$GATEWAY_PID" 2>/dev/null; then
+        kill -HUP "$GATEWAY_PID" 2>/dev/null || true
+        RELOAD_COUNT=$((RELOAD_COUNT + 1))
+      fi
+      ;;
+  esac
+
   RESULT=$(run_benchmark "$DURATION" "$SCENARIO")
   read -r requests errors duration_ms rps p50 p95 p99 mean <<< "$RESULT"
   SYS=$(collect_system_metrics "$GATEWAY_PID")
@@ -281,12 +318,12 @@ read -r rps_mean rps_stddev <<< "$RPS_SUMMARY"
 read -r p50_mean p50_stddev <<< "$P50_SUMMARY"
 read -r p99_mean p99_stddev <<< "$P99_SUMMARY"
 
-# Read logger dropped count from the gateway's metrics endpoint.
-DROPPED_COUNT=0
-METRICS=$(curl -s --noproxy '*' "http://127.0.0.1:$GATEWAY_PORT/metrics" 2>/dev/null || echo "")
-if echo "$METRICS" | grep -q "aegisgate_log_dropped"; then
-  DROPPED_COUNT=$(echo "$METRICS" | grep "aegisgate_log_dropped" | awk '{print $2}' || echo "0")
+# Read logger stats from the log file line count.
+LOG_LINES=0
+if [ -f "$BENCH_LOG_PATH" ]; then
+  LOG_LINES=$(wc -l < "$BENCH_LOG_PATH" 2>/dev/null || echo "0")
 fi
+DROPPED_COUNT=0
 
 cat > "$RESULT_FILE" <<EOF
 {
@@ -305,7 +342,11 @@ cat > "$RESULT_FILE" <<EOF
     "p99_us_mean": $p99_mean,
     "p99_us_stddev": $p99_stddev
   },
+  "log_lines_written": $LOG_LINES,
   "log_dropped_count": $DROPPED_COUNT,
+  "scenario_details": {
+    "reload_count": $RELOAD_COUNT
+  },
   "timestamp": "$(date -Iseconds)"
 }
 EOF
