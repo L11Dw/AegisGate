@@ -2107,6 +2107,8 @@ TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
             static_cast<ssize_t>(valid_yaml.size()));
   ASSERT_EQ(::close(config_fd), 0);
 
+  std::array<int, 2> done{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, done.data()), 0);
   net::EventLoop loop;
   const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
   Gateway gateway(loop, config::Config{{{"api", "invalid-reload.test", "/", {endpoint}, 10, 10, 4}}},
@@ -2126,9 +2128,10 @@ TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
   // and report a failure result; Gateway must not publish a new generation.
   ASSERT_TRUE(gateway.RequestReload());
 
-  // Drive the loop until the controller result arrives or deadline expires.
-  std::array<int, 2> done{};
-  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, done.data()), 0);
+  // The reload controller's background thread will parse and deliver a result
+  // via eventfd.  The control loop will consume it and call HandleReloadResults().
+  // Since the YAML is invalid, no new generation is published.
+  // Use a timer to check after the background thread has had time to finish.
   net::Channel done_channel(loop, done[0]);
   bool timed_out = false;
   done_channel.SetReadCallback([&] {
@@ -2139,21 +2142,17 @@ TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
   });
   done_channel.EnableReading();
   net::TimerQueue check_timer(loop);
-  const auto deadline = TestDeadline();
-  auto check = std::make_shared<std::function<void()>>();
-  *check = [&] {
-    // The controller processes the invalid file; generation stays at v1.
-    // We wait a short time to let the background thread finish parsing.
-    const char result = std::chrono::steady_clock::now() >= deadline ? 't' : '\0';
-    if (result != '\0') {
-      (void)::write(done[1], &result, 1);
-      return;
-    }
-    (void)check_timer.ScheduleAfter(std::chrono::milliseconds(10), *check);
-  };
-  (void)check_timer.ScheduleAfter(std::chrono::milliseconds(10), *check);
+  (void)check_timer.ScheduleAfter(std::chrono::milliseconds(500), [&] {
+    // After 500ms, the background thread should have finished parsing.
+    // The control loop has processed the result (or will on next iteration).
+    (void)::write(done[1], "d", 1);
+  });
+  (void)check_timer.ScheduleAfter(std::chrono::seconds(5), [&] {
+    (void)::write(done[1], "t", 1);
+  });
   loop.Loop();
 
+  EXPECT_FALSE(timed_out);
   // Generation must still be v1: the invalid YAML was never published.
   EXPECT_EQ(gateway.CurrentGenerationVersion(), 1U);
   EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18080);
