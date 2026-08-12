@@ -16,12 +16,7 @@ WorkerData::WorkerData(net::EventLoop &loop, std::shared_ptr<WorkerShared> share
     : loop_(loop), shared_(std::move(shared)), worker_index_(worker_index),
       state_(std::make_shared<State>()), pool_(std::make_shared<proxy::UpstreamPool>(loop)),
       timers_(std::make_unique<net::TimerQueue>(loop)), metrics_(std::move(metrics)),
-      client_count_(std::move(client_count)),
-      // Bind the worker-local selection state to the request snapshot version
-      // it was built from (R-072); a reload rebuilds it for the new version.
-      selection_(shared_->config_snapshot.load(std::memory_order_acquire)->config,
-                 shared_->config_snapshot.load(std::memory_order_acquire)->version),
-      lease_balances_(shared_->config_snapshot.load(std::memory_order_acquire)->config.routes.size(), 0) {
+      client_count_(std::move(client_count)) {
   state_->owner = this;
 }
 
@@ -93,7 +88,17 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
     }
     return;
   }
-  const ConfigSnapshotRef snapshot = shared_->config_snapshot.load(std::memory_order_acquire);
+  const RuntimeGenerationRef generation =
+      shared_->current_generation.load(std::memory_order_acquire);
+  if (!generation || !generation->snapshot() || worker_index_ >= generation->selection_states().size()) {
+    try {
+      metrics_->RecordImmediate("_generation_unavailable", 503);
+      client.SendResponse(http::HttpResponse{503, "Service Unavailable", {}, ""});
+    } catch (...) {
+    }
+    return;
+  }
+  const ConfigSnapshotRef snapshot = generation->snapshot();
   const std::optional<std::size_t> route_index =
       routing::RouteTable::Match(snapshot->config, request.Header("host"), request.target);
   if (!route_index.has_value()) {
@@ -110,11 +115,25 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
   }
   const config::Route &route = snapshot->config.routes[*route_index];
 
+  // A generation lease is acquired once for the entire request, before any
+  // admission/attempt work.  The ProxyTransaction retains it through retries,
+  // streaming writes and all terminal cleanup, so a reload cannot retire this
+  // generation underneath an in-flight request.
+  auto generation_lease = generation->TryAcquireRequestLease();
+  if (!generation_lease) {
+    try {
+      metrics_->RecordImmediate(route.name, 503, {}, false, "generation_retiring");
+      client.SendResponse(http::HttpResponse{503, "Service Unavailable", {}, ""});
+    } catch (...) {
+    }
+    return;
+  }
+
   // Global admission: the in-flight slot first, then one lease token from the
   // worker-local balance (drawing a new lease when it runs low).  A rejection
   // answers 429 immediately and never starts a transaction.
   std::optional<resilience::GlobalAdmission::Reservation> reservation;
-  if (!TryAdmit(*route_index, reservation)) {
+  if (!TryAdmit(generation, *route_index, reservation)) {
     try {
       metrics_->RecordImmediate(route.name, 429, {}, true);
     } catch (...) {
@@ -136,7 +155,7 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
   // retry through the same eligibility rules (R-036), bound to the request's
   // own snapshot (R-054); no candidate ever connects.
   const bool least_active = route.balance == config::BalancePolicy::kLeastActive;
-  AttemptSelector selector(selection_, shared_, *route_index, snapshot);
+  AttemptSelector selector(*generation->selection_states()[worker_index_], generation, *route_index);
   proxy::ProxyTransaction::AttemptProvider provider =
       [selector = std::move(selector), least_active]() mutable {
         return selector.Select(least_active);
@@ -144,21 +163,26 @@ void WorkerData::HandleRequest(net::ClientConnection &client, const http::HttpRe
   (void)proxy::ProxyTransaction::Start(
       loop_, client, route.endpoints.front(), request, pool_, std::move(reservation),
       timers_.get(), std::move(policy), metrics_, route.name, std::move(provider),
-      std::weak_ptr<void>(shared_->lifetime_token));
+      std::weak_ptr<void>(shared_->lifetime_token), std::move(generation_lease));
 }
 
-bool WorkerData::TryAdmit(std::size_t route_index,
+bool WorkerData::TryAdmit(const RuntimeGenerationRef &generation, std::size_t route_index,
                           std::optional<resilience::GlobalAdmission::Reservation> &reservation) {
-  const auto &admission = shared_->admissions[route_index];
+  if (!generation || route_index >= generation->admissions().size()) return false;
+  const auto &admission = generation->admissions()[route_index];
   reservation = admission->TryAcquireInflight();
   if (!reservation) return false;
   // Lease: draw a fresh batch when the local balance runs low (an empty
   // balance must always trigger a draw, hence balance * 2 < batch rather
   // than a half-open comparison that never fires for batch == 1); refresh
   // first returns the remainder so the global credit stays exact.
-  std::uint32_t &balance = lease_balances_[route_index];
+  auto [balances, inserted] = lease_balances_.try_emplace(
+      generation->version(), LeaseBalance{generation->admissions(),
+                                           std::vector<std::uint32_t>(generation->admissions().size(), 0)});
+  (void)inserted;
+  std::uint32_t &balance = balances->second.balances[route_index];
   const std::uint32_t batch = resilience::GlobalAdmission::LeaseBatch(
-      admission->rate(), shared_->worker_count, admission->burst());
+      admission->rate(), generation->snapshot()->config.workers, admission->burst());
   if (balance * 2 < batch) {
     admission->Return(balance);
     balance = 0;
@@ -180,16 +204,32 @@ void WorkerData::Shutdown() noexcept {
   // before any worker-local selection state is destroyed (the destructor body
   // precedes member destruction) and touches admissions only while they are
   // still alive (held via shared_).
-  for (std::size_t route = 0; route < lease_balances_.size() &&
-                              route < shared_->admissions.size();
-       ++route) {
-    shared_->admissions[route]->Return(lease_balances_[route]);
-    lease_balances_[route] = 0;
+  for (auto &[version, balances] : lease_balances_) {
+    (void)version;
+    for (std::size_t route = 0; route < balances.balances.size() &&
+                                route < balances.admissions.size();
+         ++route) {
+      balances.admissions[route]->Return(balances.balances[route]);
+      balances.balances[route] = 0;
+    }
   }
   pool_->CancelAll();
   clients_.clear();
   metrics_->SetActiveConnections(0);
   client_count_->store(0, std::memory_order_release);
+}
+
+void WorkerData::ReturnGenerationLeaseBalance(std::uint64_t generation_version) noexcept {
+  const auto found = lease_balances_.find(generation_version);
+  if (found == lease_balances_.end()) return;
+  LeaseBalance &balances = found->second;
+  for (std::size_t route = 0; route < balances.balances.size() &&
+                              route < balances.admissions.size();
+       ++route) {
+    balances.admissions[route]->Return(balances.balances[route]);
+    balances.balances[route] = 0;
+  }
+  lease_balances_.erase(found);
 }
 
 void WorkerData::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,

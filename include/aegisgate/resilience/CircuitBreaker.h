@@ -3,8 +3,11 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <vector>
+
+#include "aegisgate/resilience/CircuitBreakerSnapshot.h"
 
 namespace aegisgate::resilience {
 
@@ -46,6 +49,15 @@ public:
     std::uint64_t probe_id = 0;
   };
 
+  // The sole source of a coordinator-published HalfOpen cycle.  Its range is
+  // exactly the breaker's pending probe range; callers must not infer ids by
+  // repeatedly calling Select().
+  struct HalfOpenCycle {
+    std::uint64_t generation = 0;
+    std::uint64_t probe_base = 0;
+    std::uint32_t quota = 0;
+  };
+
   explicit CircuitBreaker(CircuitBreakerConfig config, Clock::time_point now);
 
   // Passive request outcomes.  Callers decide what counts: 429/404 and
@@ -77,6 +89,14 @@ public:
     return false;
   }
 
+  [[nodiscard]] CircuitBreakerSnapshot ExportSnapshot(Clock::time_point now) const;
+  // Imports only pure protection state.  An Open snapshot whose window has
+  // elapsed and every HalfOpen snapshot produce a fresh, fully pre-issued
+  // cycle.  The returned descriptor is the only valid source for worker slots.
+  [[nodiscard]] std::optional<HalfOpenCycle>
+  ImportSnapshot(const CircuitBreakerSnapshot &snapshot, Clock::time_point now);
+  [[nodiscard]] HalfOpenCycle BeginFreshHalfOpenCycle(Clock::time_point now) noexcept;
+
 private:
   struct Bucket {
     Clock::time_point start{};
@@ -92,6 +112,7 @@ private:
   void Open(Clock::time_point now) noexcept;
   void Close() noexcept;
   void BeginHalfOpen() noexcept;
+  void AdvanceGeneration() noexcept;
   [[nodiscard]] bool ConsumeProbe(std::uint64_t probe_id) noexcept;
 
   CircuitBreakerConfig config_;

@@ -19,6 +19,15 @@ namespace {
 
 constexpr std::chrono::milliseconds kRefillTick = std::chrono::milliseconds(250);
 
+struct CompletionState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool done = false;
+  bool cancelled = false;
+  bool ok = false;
+  std::optional<ProtectionSnapshot> snapshot;
+};
+
 } // namespace
 
 Coordinator::Coordinator(std::shared_ptr<const config::Config> config, Clock::time_point now)
@@ -48,12 +57,25 @@ void Coordinator::SetAdmissions(
 }
 
 void Coordinator::Start() {
+  StartPrepared();
+  if (!Activate()) throw std::logic_error("coordinator activation failed");
+}
+
+void Coordinator::StartPrepared() {
+  if (runtime_started_) throw std::logic_error("coordinator already started");
+  Lifecycle expected = Lifecycle::kActive;
+  if (!lifecycle_.compare_exchange_strong(expected, Lifecycle::kPrepared,
+                                           std::memory_order_acq_rel)) {
+    throw std::logic_error("coordinator already started");
+  }
+  runtime_started_ = true;
   runtime_->Start();
+  prepared_only_ = true;
   std::promise<void> initialized;
   auto future = initialized.get_future();
   if (!runtime_->PostWithLoop([this, &initialized](net::EventLoop &loop) {
     try {
-      OnLoopInit(loop);
+      OnPreparedLoopInit(loop);
       initialized.set_value();
     } catch (...) {
       initialized.set_exception(std::current_exception());
@@ -64,7 +86,94 @@ void Coordinator::Start() {
   future.get();
 }
 
+bool Coordinator::Activate() {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kPrepared) return false;
+  std::promise<void> activated;
+  auto future = activated.get_future();
+  if (!runtime_->PostWithLoop([this, &activated](net::EventLoop &loop) {
+        try {
+          prepared_only_ = false;
+          OnActivateLoopInit(loop);
+          activated.set_value();
+        } catch (...) {
+          activated.set_exception(std::current_exception());
+        }
+      })) return false;
+  try { future.get(); } catch (...) { return false; }
+  lifecycle_.store(Lifecycle::kActive, std::memory_order_release);
+  return true;
+}
+
+void Coordinator::OnPreparedLoopInit(net::EventLoop &loop) { OnLoopInit(loop); }
+
+void Coordinator::OnActivateLoopInit(net::EventLoop &loop) {
+  if (!loop_data_) throw std::logic_error("coordinator loop is not prepared");
+  auto &data = *loop_data_;
+  for (std::size_t route = 0; route < config_->routes.size(); ++route) {
+    const config::Route &route_config = config_->routes[route];
+    if (!route_config.health_check.has_value()) continue;
+    const auto &settings = *route_config.health_check;
+    for (std::size_t endpoint = 0; endpoint < route_config.endpoints.size(); ++endpoint) {
+      const config::Endpoint &endpoint_config = route_config.endpoints[endpoint];
+      data.checkers.push_back(std::make_unique<health::HealthChecker>(
+          loop, *data.timers, endpoint_config,
+          HealthCheckConfig{std::chrono::milliseconds(settings.interval_ms),
+                            std::chrono::milliseconds(settings.timeout_ms)},
+          [this, route, endpoint](bool healthy) {
+            state_->RecordHealth(route, endpoint, healthy);
+            Publish();
+          }));
+      data.checkers.back()->Start();
+    }
+  }
+  if (!admissions_.empty()) ScheduleRefillTick(*data.timers);
+}
+
+bool Coordinator::ImportProtectionSnapshotAndWait(const ProtectionSnapshot &snapshot,
+                                                   std::chrono::milliseconds timeout) {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kPrepared) return false;
+  auto completion = std::make_shared<CompletionState>();
+  const ProtectionSnapshot copy = snapshot;
+  if (!runtime_->Post([this, completion, copy] {
+        std::lock_guard<std::mutex> guard(completion->mutex);
+        if (completion->cancelled) return;
+        state_->ImportProtectionSnapshot(copy, Clock::now());
+        Publish();
+        completion->ok = true;
+        completion->done = true;
+        completion->cv.notify_all();
+      })) return false;
+  std::unique_lock<std::mutex> lock(completion->mutex);
+  if (!completion->cv.wait_for(lock, timeout, [&] { return completion->done; })) {
+    completion->cancelled = true;
+    return false;
+  }
+  return completion->ok;
+}
+
+std::optional<ProtectionSnapshot>
+Coordinator::ExportProtectionSnapshotAndWait(std::chrono::milliseconds timeout) {
+  const Lifecycle lifecycle = lifecycle_.load(std::memory_order_acquire);
+  if (lifecycle != Lifecycle::kPrepared && lifecycle != Lifecycle::kActive) return std::nullopt;
+  auto completion = std::make_shared<CompletionState>();
+  if (!runtime_->Post([this, completion] {
+        std::lock_guard<std::mutex> guard(completion->mutex);
+        if (completion->cancelled) return;
+        completion->snapshot = state_->ExportProtectionSnapshot(Clock::now());
+        completion->ok = true;
+        completion->done = true;
+        completion->cv.notify_all();
+      })) return std::nullopt;
+  std::unique_lock<std::mutex> lock(completion->mutex);
+  if (!completion->cv.wait_for(lock, timeout, [&] { return completion->done; })) {
+    completion->cancelled = true;
+    return std::nullopt;
+  }
+  return completion->snapshot;
+}
+
 void Coordinator::Stop() noexcept {
+  lifecycle_.store(Lifecycle::kStopping, std::memory_order_release);
   // The destroy task must run on the coordinator thread (TimerQueue and
   // checkers hold loop registrations).  It captures the Stop-frame owner by
   // reference and resets it when it runs, destroying LoopData on the
@@ -84,6 +193,7 @@ void Coordinator::Stop() noexcept {
     }
   }
   runtime_->Stop();
+  lifecycle_.store(Lifecycle::kStopped, std::memory_order_release);
   // data is empty here: the destroy task ran on the coordinator thread.
 }
 
@@ -92,11 +202,13 @@ std::shared_ptr<const HealthCircuitSnapshot> Coordinator::CurrentSnapshot() cons
 }
 
 bool Coordinator::PostResult(const AttemptResult &result) noexcept {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return false;
   return PostTask([this, result] { RecordResultTask(result); });
 }
 
 std::optional<OutcomeChannel::Reservation>
 Coordinator::ReserveOutcome(std::size_t route_index) noexcept {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return std::nullopt;
   if (route_index >= outcome_channels_.size() || !outcome_channels_[route_index]) {
     return std::nullopt;
   }
@@ -134,11 +246,13 @@ std::uint64_t Coordinator::OutcomeRejectedTotal() const noexcept {
 }
 
 bool Coordinator::ProbeAvailable(std::size_t route, std::size_t endpoint) const noexcept {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return false;
   return state_->ProbeAvailable(route, endpoint);
 }
 
 std::optional<AttemptPermit> Coordinator::ClaimProbe(
     std::size_t route, std::size_t endpoint, const HealthCircuitSnapshot &snapshot) noexcept {
+  if (lifecycle_.load(std::memory_order_acquire) != Lifecycle::kActive) return std::nullopt;
   return state_->ClaimProbe(route, endpoint, snapshot);
 }
 
@@ -182,11 +296,13 @@ void Coordinator::OnLoopInit(net::EventLoop &loop) {
   auto data = std::make_unique<LoopData>();
   data->timers = std::make_unique<net::TimerQueue>(loop);
   data->arm_timers.resize(config_->routes.size());
-  // Health checkers run here, on the single-writer loop; their results are
-  // committed in-thread and published.
   for (std::size_t route = 0; route < config_->routes.size(); ++route) {
+    data->arm_timers[route].resize(config_->routes[route].endpoints.size(), 0);
+  }
+  // Health checkers run here, on the single-writer loop; prepared candidates
+  // defer them until Activate().
+  if (!prepared_only_) for (std::size_t route = 0; route < config_->routes.size(); ++route) {
     const config::Route &route_config = config_->routes[route];
-    data->arm_timers[route].resize(route_config.endpoints.size(), 0);
     if (!route_config.health_check.has_value()) continue;
     const auto &settings = *route_config.health_check;
     for (std::size_t endpoint = 0; endpoint < route_config.endpoints.size(); ++endpoint) {
@@ -224,7 +340,7 @@ void Coordinator::OnLoopInit(net::EventLoop &loop) {
     });
     data->outcome_wake_channels.back()->EnableReading();
   }
-  if (!admissions_.empty()) ScheduleRefillTick(*data->timers);
+  if (!prepared_only_ && !admissions_.empty()) ScheduleRefillTick(*data->timers);
   loop_data_ = std::move(data);
 }
 

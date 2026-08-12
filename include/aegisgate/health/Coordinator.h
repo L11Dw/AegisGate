@@ -12,6 +12,7 @@
 #include "aegisgate/health/CoordinatorState.h"
 #include "aegisgate/health/HealthChecker.h"
 #include "aegisgate/health/OutcomeChannel.h"
+#include "aegisgate/health/ProtectionSnapshot.h"
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/runtime/WorkerRuntime.h"
 
@@ -44,6 +45,12 @@ public:
   // Spawns the coordinator thread and blocks until the loop-attached objects
   // (timer queue, health checkers, refill tick) are initialized.
   void Start();
+  void StartPrepared();
+  [[nodiscard]] bool ImportProtectionSnapshotAndWait(
+      const ProtectionSnapshot &snapshot, std::chrono::milliseconds timeout);
+  [[nodiscard]] bool Activate();
+  [[nodiscard]] std::optional<ProtectionSnapshot>
+  ExportProtectionSnapshotAndWait(std::chrono::milliseconds timeout);
   // Destroys loop-attached objects on the coordinator thread, then stops the
   // runtime and joins.  Idempotent.
   void Stop() noexcept;
@@ -97,6 +104,8 @@ private:
   };
 
   void OnLoopInit(net::EventLoop &loop);
+  void OnPreparedLoopInit(net::EventLoop &loop);
+  void OnActivateLoopInit(net::EventLoop &loop);
   void RecordResultTask(const AttemptResult &result);
   void RecordResultDirect(const AttemptResult &result);
   void RecordHealthTask(std::size_t route, std::size_t endpoint, bool healthy);
@@ -116,6 +125,13 @@ private:
   std::vector<std::unique_ptr<OutcomeChannel>> outcome_channels_;
   std::atomic<std::shared_ptr<const HealthCircuitSnapshot>> snapshot_{nullptr};
   std::unique_ptr<LoopData> loop_data_;
+  enum class Lifecycle : std::uint8_t { kNew, kPrepared, kActive, kStopping, kStopped };
+  // Preserve the M3-D construction-time test/API behavior: a coordinator
+  // without a runtime loop may still reserve value-owned outcome credits.
+  // StartPrepared() changes this to kPrepared before a candidate is exposed.
+  std::atomic<Lifecycle> lifecycle_{Lifecycle::kActive};
+  bool prepared_only_ = false;
+  bool runtime_started_ = false;
 };
 
 } // namespace aegisgate::health

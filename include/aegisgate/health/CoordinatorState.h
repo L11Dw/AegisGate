@@ -9,6 +9,7 @@
 
 #include "aegisgate/config/Config.h"
 #include "aegisgate/health/EndpointHealth.h"
+#include "aegisgate/health/ProtectionSnapshot.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 
 namespace aegisgate::health {
@@ -80,6 +81,9 @@ public:
 
   // --- coordinator-loop (single writer) ---
   void RecordHealth(std::size_t route, std::size_t endpoint, bool healthy);
+  void PrepareForMigration();
+  [[nodiscard]] ProtectionSnapshot ExportProtectionSnapshot(Clock::time_point now) const;
+  void ImportProtectionSnapshot(const ProtectionSnapshot &snapshot, Clock::time_point now);
   void RecordResult(const AttemptResult &result, Clock::time_point now);
   // Transitions an elapsed Open window to HalfOpen and pre-issues the full
   // probe quota so worker probe ids can be validated exactly once.
@@ -100,6 +104,7 @@ public:
   [[nodiscard]] std::size_t RouteCount() const noexcept;
   [[nodiscard]] std::size_t EndpointCount(std::size_t route) const noexcept;
   [[nodiscard]] bool Healthy(std::size_t route, std::size_t endpoint) const noexcept;
+  [[nodiscard]] HealthState Health(std::size_t route, std::size_t endpoint) const noexcept;
   [[nodiscard]] resilience::CircuitBreaker::State
   BreakerState(std::size_t route, std::size_t endpoint) const noexcept;
   [[nodiscard]] std::uint64_t Generation(std::size_t route, std::size_t endpoint) const noexcept;

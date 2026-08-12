@@ -43,6 +43,11 @@ public:
   // Runs on the worker thread during shutdown: terminates every exchange
   // (pool CancelAll) and drops the clients so transactions release via RAII.
   void Shutdown() noexcept;
+  // Owner-worker thread only.  Before a retired generation's coordinator is
+  // stopped, return this worker's unused token lease for that generation.
+  // It is idempotent and intentionally does not touch live transactions: their
+  // GlobalAdmission reservations remain owned by ProxyTransaction RAII.
+  void ReturnGenerationLeaseBalance(std::uint64_t generation_version) noexcept;
   [[nodiscard]] std::shared_ptr<observability::Metrics> Metrics() const noexcept {
     return metrics_;
   }
@@ -58,8 +63,12 @@ private:
   void ReapClosedClients(std::vector<std::uint64_t> identifiers);
   static void NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> state,
                                  std::uint64_t identifier);
-  [[nodiscard]] bool TryAdmit(std::size_t route_index,
+  [[nodiscard]] bool TryAdmit(const RuntimeGenerationRef &generation, std::size_t route_index,
                               std::optional<resilience::GlobalAdmission::Reservation> &reservation);
+  struct LeaseBalance {
+    std::vector<std::shared_ptr<resilience::GlobalAdmission>> admissions;
+    std::vector<std::uint32_t> balances;
+  };
 
   net::EventLoop &loop_;
   std::shared_ptr<WorkerShared> shared_;
@@ -71,8 +80,11 @@ private:
   std::shared_ptr<std::atomic<std::uint64_t>> client_count_;
   std::unordered_map<std::uint64_t, std::unique_ptr<net::ClientConnection>> clients_;
   std::uint64_t next_client_identifier_ = 1;
-  SelectionState selection_;
-  std::vector<std::uint32_t> lease_balances_;
+  // A request selects exclusively from the state owned by its generation.
+  // Local admission leases are keyed by generation version so tokens drawn
+  // before a reload are returned to the matching GlobalAdmission, never to a
+  // newly published route with the same index.
+  std::unordered_map<std::uint64_t, LeaseBalance> lease_balances_;
 };
 
 } // namespace aegisgate::runtime

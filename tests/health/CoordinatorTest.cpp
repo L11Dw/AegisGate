@@ -154,6 +154,63 @@ TEST(CoordinatorStateTest, ProbeFailureReopensImmediately) {
   EXPECT_GT(state.Generation(0, 0), armed->endpoints[0][0].generation);
 }
 
+TEST(CoordinatorStateTest, ImportedHalfOpenCycleMatchesPublishedSlotsAndRejectsOldPermit) {
+  const auto now = Clock::now();
+  auto config = ConfigWith({RouteWithBreaker("a", 10, 2, 500, 5, 2)});
+  CoordinatorState source(config, now);
+  const std::uint64_t source_generation = source.BuildSnapshot()->endpoints[0][0].generation;
+  source.RecordResult({0, 0, {false, source_generation, 0}, false}, now + 1ms);
+  source.RecordResult({0, 0, {false, source_generation, 0}, false}, now + 2ms);
+  source.ArmHalfOpen(0, 0, now + 6s);
+  const auto old_snapshot = source.BuildSnapshot();
+  const auto old_probe = source.ClaimProbe(0, 0, *old_snapshot);
+  ASSERT_TRUE(old_probe.has_value());
+
+  CoordinatorState target(config, now + 7s);
+  target.ImportProtectionSnapshot(source.ExportProtectionSnapshot(now + 7s), now + 7s);
+  const auto migrated = target.BuildSnapshot();
+  ASSERT_EQ(migrated->endpoints[0][0].breaker_state,
+            static_cast<std::uint8_t>(State::kHalfOpen));
+  EXPECT_NE(migrated->endpoints[0][0].generation, old_probe->generation);
+  EXPECT_EQ(migrated->endpoints[0][0].probe_quota, 2U);
+
+  // A permit from the retired coordinator has no authority in this one.
+  target.RecordResult({0, 0, *old_probe, false}, now + 8s);
+  EXPECT_EQ(target.BreakerState(0, 0), State::kHalfOpen);
+
+  const auto first = target.ClaimProbe(0, 0, *migrated);
+  const auto second = target.ClaimProbe(0, 0, *migrated);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_NE(first->probe_id, second->probe_id);
+  EXPECT_FALSE(target.ClaimProbe(0, 0, *migrated).has_value());
+  target.RecordResult({0, 0, *first, true}, now + 9s);
+  target.RecordResult({0, 0, *second, true}, now + 10s);
+  EXPECT_EQ(target.BreakerState(0, 0), State::kClosed);
+}
+
+TEST(CoordinatorStateTest, ImportsHealthOnlyWhenIdentityAndPolicyMatch) {
+  const auto now = Clock::now();
+  config::Route source_route = PlainRoute("a");
+  source_route.health_check = config::HealthCheckSettings{1000, 100};
+  auto source_config = ConfigWith({source_route});
+  CoordinatorState source(source_config, now);
+  source.RecordHealth(0, 0, false);
+  const auto exported = source.ExportProtectionSnapshot(now);
+
+  CoordinatorState same(source_config, now + 1ms);
+  same.ImportProtectionSnapshot(exported, now + 1ms);
+  EXPECT_FALSE(same.Healthy(0, 0));
+  EXPECT_EQ(same.Health(0, 0), HealthState::kUnhealthy);
+
+  config::Route changed_route = source_route;
+  changed_route.health_check->timeout_ms = 200;
+  CoordinatorState changed(ConfigWith({changed_route}), now + 1ms);
+  changed.ImportProtectionSnapshot(exported, now + 1ms);
+  EXPECT_FALSE(changed.Healthy(0, 0));  // kUnknown refuses selection.
+  EXPECT_EQ(changed.Health(0, 0), HealthState::kUnknown);
+}
+
 // R-058: a stale snapshot's probe claim is voided once the coordinator has
 // moved to a new HalfOpen cycle; no counters are rolled back.
 TEST(CoordinatorStateTest, StaleSnapshotProbeClaimIsRejected) {
@@ -350,6 +407,20 @@ TEST(CoordinatorRuntimeTest, SubmitResultAndWaitDrivesOpenArmProbeAndClose) {
   ASSERT_TRUE(probe.has_value());
   coordinator.SubmitResultAndWait({0, 0, *probe, true});
   EXPECT_TRUE(WaitForState(coordinator, 0, 0, State::kClosed, TestDeadline()));
+  coordinator.Stop();
+}
+
+TEST(CoordinatorRuntimeTest, PreparedCoordinatorRejectsWorkersUntilActivation) {
+  const auto now = Clock::now();
+  auto config = ConfigWith({RouteWithBreaker("a", 10, 2, 500, 5, 1)});
+  Coordinator coordinator(config, now);
+  coordinator.StartPrepared();
+  EXPECT_FALSE(coordinator.ReserveOutcome(0).has_value());
+  EXPECT_FALSE(coordinator.ProbeAvailable(0, 0));
+  auto exported = coordinator.ExportProtectionSnapshotAndWait(1s);
+  ASSERT_TRUE(exported.has_value());
+  EXPECT_TRUE(coordinator.Activate());
+  EXPECT_TRUE(coordinator.ReserveOutcome(0).has_value());
   coordinator.Stop();
 }
 

@@ -13,6 +13,9 @@ add_executable(aegisgate_tests
     runtime/WorkerRuntimeTest.cpp
     runtime/WorkerSetTest.cpp
     runtime/WorkerDataTest.cpp
+    runtime/RuntimeGenerationTest.cpp
+    runtime/ReloadControllerTest.cpp
+    runtime/ReloadWatcherTest.cpp
     runtime/SelectionStateTest.cpp
     runtime/AttemptSelectorTest.cpp
     gateway/GatewayTest.cpp
@@ -23,7 +26,8 @@ add_executable(aegisgate_tests
     resilience/TokenBucketTest.cpp
     resilience/InflightLimiterTest.cpp
     resilience/GlobalAdmissionTest.cpp
-    resilience/CircuitBreakerTest.cpp
+  resilience/CircuitBreakerTest.cpp
+  resilience/CircuitBreakerMigrationTest.cpp
     health/EndpointHealthTest.cpp
     health/HealthCheckerTest.cpp
     health/CoordinatorTest.cpp

@@ -20,6 +20,7 @@
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/routing/ActiveReservation.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
+#include "aegisgate/runtime/RuntimeGeneration.h"
 
 namespace aegisgate::net {
 class ClientConnection;
@@ -96,7 +97,9 @@ public:
         net::TimerQueue *timers = nullptr, UpstreamPolicy policy = {},
         std::shared_ptr<observability::Metrics> metrics = nullptr, std::string route_name = {},
         AttemptProvider attempt_provider = {},
-        std::optional<std::weak_ptr<void>> gateway_lifetime = std::nullopt);
+        std::optional<std::weak_ptr<void>> gateway_lifetime = std::nullopt,
+        std::optional<runtime::RuntimeGeneration::RequestLease> request_generation_lease =
+            std::nullopt);
 
 private:
   ProxyTransaction(net::EventLoop &loop, net::ClientConnection &client,
@@ -109,7 +112,8 @@ private:
                    net::TimerQueue *timers, UpstreamPolicy policy,
                    std::shared_ptr<observability::Metrics> metrics, std::string route_name,
                    AttemptProvider attempt_provider,
-                   std::optional<std::weak_ptr<void>> gateway_lifetime);
+                   std::optional<std::weak_ptr<void>> gateway_lifetime,
+                   std::optional<runtime::RuntimeGeneration::RequestLease> request_generation_lease);
 
   void Begin();
   // True when the owning gateway has been destroyed.  nullopt (no gateway)
@@ -157,6 +161,10 @@ private:
   // the whole transaction so no retry re-reads the current global snapshot
   // (R-054).  Null when the provider is absent (caller-owned lifetime).
   runtime::ConfigSnapshotRef request_snapshot_;
+  // Pins the complete RuntimeGeneration for the request, including retries and
+  // streaming completion.  It releases only when this transaction is finally
+  // destroyed, never at an attempt boundary.
+  std::optional<runtime::RuntimeGeneration::RequestLease> request_generation_lease_;
   // True when the provider reported coordinator overload (outcome capacity
   // exhausted) for the terminal "no selection" decision; distinguishes the 503
   // reason from a plain no-healthy-endpoint (R-053).

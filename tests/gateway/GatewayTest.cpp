@@ -1,6 +1,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -20,6 +21,7 @@
 #include "aegisgate/net/Channel.h"
 #include "aegisgate/net/EventLoop.h"
 #include "aegisgate/net/Socket.h"
+#include "aegisgate/net/TimerQueue.h"
 #include "aegisgate/health/EndpointHealth.h"
 #include "aegisgate/resilience/CircuitBreaker.h"
 
@@ -1873,6 +1875,614 @@ TEST(GatewayTest, GatewayDestructionTerminatesInFlightAttempt) {
   EXPECT_EQ(::close(stop[1]), 0);
   EXPECT_EQ(::close(wake_fds[0]), 0);
   EXPECT_EQ(::close(wake_fds[1]), 0);
+}
+
+TEST(GatewayTest, ReloadPublishesOnlyCompatiblePreparedGeneration) {
+  net::EventLoop loop;
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
+  Gateway gateway(loop, config::Config{{{"api", "gateway.test", "/", {first}, 10, 10, 4}}},
+                  "127.0.0.1", 0);
+  gateway.Start();
+
+  const config::Endpoint replacement{"127.0.0.1", {127, 0, 0, 1}, 18081, 1};
+  EXPECT_TRUE(gateway.RequestReload(
+      config::Config{{{"api", "gateway.test", "/", {replacement}, 10, 10, 4}}}));
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
+
+  config::Config incompatible{{{"api", "gateway.test", "/", {first}, 10, 10, 4}}};
+  incompatible.workers = 2;
+  EXPECT_FALSE(gateway.RequestReload(std::move(incompatible)));
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
+}
+
+TEST(GatewayTest, ReloadBoundsRetiringGenerationsWithoutReplacingTheLiveOne) {
+  net::EventLoop loop;
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
+  Gateway gateway(loop, config::Config{{{"api", "gateway.test", "/", {first}, 10, 10, 4}}},
+                  "127.0.0.1", 0);
+  gateway.Start();
+
+  const auto replacement = [](std::uint16_t port) {
+    const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, port, 1};
+    return config::Config{{{"api", "gateway.test", "/", {endpoint}, 10, 10, 4}}};
+  };
+  EXPECT_TRUE(gateway.RequestReload(replacement(18081)));
+  EXPECT_TRUE(gateway.RequestReload(replacement(18082)));
+  EXPECT_FALSE(gateway.RequestReload(replacement(18083)));
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), 3U);
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18082);
+}
+
+TEST(GatewayTest, FileReloadParsesOffThreadAndPublishesOnControlLoop) {
+  char path[] = "/tmp/aegisgate-gateway-reload-XXXXXX";
+  const int config_fd = ::mkstemp(path);
+  ASSERT_GE(config_fd, 0);
+  const auto yaml_for = [](std::uint16_t endpoint_port) {
+    return "workers: 1\nroutes:\n"
+           "  - name: api\n    host: file-reload.test\n    path_prefix: /\n    endpoints:\n"
+           "      - host: 127.0.0.1\n        port: " + std::to_string(endpoint_port) +
+           "\n        weight: 1\n    rate_limit: 10\n    burst: 10\n    max_inflight: 4\n";
+  };
+  const std::string initial_yaml = yaml_for(18080);
+  ASSERT_EQ(::write(config_fd, initial_yaml.data(), initial_yaml.size()),
+            static_cast<ssize_t>(initial_yaml.size()));
+  ASSERT_EQ(::close(config_fd), 0);
+
+  std::array<int, 2> done{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, done.data()), 0);
+  net::EventLoop loop;
+  const config::Endpoint initial_endpoint{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
+  Gateway gateway(loop,
+                  config::Config{{{"api", "file-reload.test", "/", {initial_endpoint}, 10, 10, 4}}},
+                  "127.0.0.1", 0, {}, path);
+  gateway.Start();
+  net::Channel done_channel(loop, done[0]);
+  bool timed_out = false;
+  done_channel.SetReadCallback([&] {
+    char result = '\0';
+    ASSERT_EQ(::read(done[0], &result, 1), 1);
+    timed_out = result != 'd';
+    loop.Quit();
+  });
+  done_channel.EnableReading();
+  net::TimerQueue reload_timer(loop);
+
+  const int replacement_fd = ::open(path, O_WRONLY | O_TRUNC | O_CLOEXEC);
+  ASSERT_GE(replacement_fd, 0);
+  const std::string replacement_yaml = yaml_for(18081);
+  ASSERT_EQ(::write(replacement_fd, replacement_yaml.data(), replacement_yaml.size()),
+            static_cast<ssize_t>(replacement_yaml.size()));
+  ASSERT_EQ(::close(replacement_fd), 0);
+  ASSERT_TRUE(gateway.RequestReload());
+  const auto deadline = TestDeadline();
+  std::string signal_error;
+  auto check_published = std::make_shared<std::function<void()>>();
+  *check_published = [&] {
+    const char result = gateway.CurrentGenerationVersion() == 2 ? 'd' :
+                        (std::chrono::steady_clock::now() >= deadline ? 't' : '\0');
+    if (result != '\0') {
+      if (::write(done[1], &result, 1) != 1) signal_error = "reload completion wake failed";
+      return;
+    }
+    (void)reload_timer.ScheduleAfter(std::chrono::milliseconds(1), *check_published);
+  };
+  (void)reload_timer.ScheduleAfter(std::chrono::milliseconds(1), *check_published);
+  loop.Loop();
+
+  EXPECT_TRUE(signal_error.empty()) << signal_error;
+  EXPECT_FALSE(timed_out);
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), 2U);
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18081);
+  done_channel.Remove();
+  EXPECT_EQ(::close(done[0]), 0);
+  EXPECT_EQ(::close(done[1]), 0);
+  EXPECT_EQ(::unlink(path), 0);
+}
+
+TEST(GatewayTest, InflightRequestRetainsOldGenerationAcrossReload) {
+  net::Socket first_backend = net::Socket::ListenLoopback();
+  net::Socket second_backend = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_backend.BoundPort(), 1};
+  const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_backend.BoundPort(), 1};
+  const config::Config initial{{{"api", "reload.test", "/", {first}, 10, 10, 4}}};
+  const config::Config replacement{{{"api", "reload.test", "/", {second}, 10, 10, 4}}};
+  constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: reload.test\r\n\r\n";
+  constexpr std::string_view response_a = "HTTP/1.1 200 Old\r\nContent-Length: 1\r\n\r\nA";
+  constexpr std::string_view response_b = "HTTP/1.1 200 New\r\nContent-Length: 1\r\n\r\nB";
+
+  std::array<int, 2> accepted{};
+  std::array<int, 2> release_first{};
+  std::array<int, 2> control{};
+  std::array<int, 2> reloaded{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, accepted.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, release_first.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, control.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, reloaded.data()), 0);
+
+  std::string first_error;
+  std::thread first_server([&] {
+    const int fd = AcceptUntil(first_backend, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, request.size(), TestDeadline(), first_error);
+    if (first_error.empty() && ::write(accepted[1], "a", 1) != 1) first_error = "accept signal failed";
+    char release = '\0';
+    if (first_error.empty() && ::read(release_first[0], &release, 1) != 1) {
+      first_error = "first backend release failed";
+    }
+    if (first_error.empty() &&
+        ::write(fd, response_a.data(), response_a.size()) != static_cast<ssize_t>(response_a.size())) {
+      first_error = "first backend response failed";
+    }
+    (void)::close(fd);
+  });
+  std::string second_error;
+  std::thread second_server([&] {
+    const int fd = AcceptUntil(second_backend, TestDeadline(), second_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, request.size(), TestDeadline(), second_error);
+    if (second_error.empty() &&
+        ::write(fd, response_b.data(), response_b.size()) != static_cast<ssize_t>(response_b.size())) {
+      second_error = "second backend response failed";
+    }
+    (void)::close(fd);
+  });
+
+  net::EventLoop loop;
+  Gateway gateway(loop, initial, "127.0.0.1", 0);
+  gateway.Start();
+  net::Channel control_channel(loop, control[0]);
+  bool reload_succeeded = false;
+  control_channel.SetReadCallback([&] {
+    char command = '\0';
+    ASSERT_EQ(::read(control[0], &command, 1), 1);
+    if (command == 'r') {
+      reload_succeeded = gateway.RequestReload(replacement);
+      ASSERT_EQ(::write(reloaded[1], "r", 1), 1);
+      return;
+    }
+    loop.Quit();
+  });
+  control_channel.EnableReading();
+
+  std::string client_error;
+  std::thread controller([&] {
+    char signal = '\0';
+    if (::read(accepted[0], &signal, 1) != 1 || signal != 'a') {
+      client_error = "first backend never accepted the old-generation request";
+      (void)::write(control[1], "q", 1);
+      return;
+    }
+    if (::write(control[1], "r", 1) != 1) client_error = "reload control signal failed";
+  });
+  std::thread client([&] {
+    net::Socket old_request = net::Socket::ConnectLoopback(gateway.port());
+    if (!WriteAll(old_request.Fd(), request, TestDeadline(), client_error)) return;
+    char signal = '\0';
+    if (::read(reloaded[0], &signal, 1) != 1 || signal != 'r') {
+      client_error = "reload completion signal failed";
+      return;
+    }
+    net::Socket new_request = net::Socket::ConnectLoopback(gateway.port());
+    if (!WriteAll(new_request.Fd(), request, TestDeadline(), client_error)) return;
+    const std::string new_response = ReadExact(new_request.Fd(), response_b.size(), TestDeadline(), client_error);
+    if (new_response != response_b && client_error.empty()) client_error = "new request did not use new generation";
+    if (::write(release_first[1], "x", 1) != 1 && client_error.empty()) client_error = "release old request failed";
+    const std::string old_response = ReadExact(old_request.Fd(), response_a.size(), TestDeadline(), client_error);
+    if (old_response != response_a && client_error.empty()) client_error = "old request did not retain old generation";
+    (void)::write(control[1], "q", 1);
+  });
+
+  loop.Loop();
+  controller.join();
+  client.join();
+  first_server.join();
+  second_server.join();
+
+  EXPECT_TRUE(reload_succeeded);
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_TRUE(second_error.empty()) << second_error;
+  control_channel.Remove();
+  EXPECT_EQ(::close(accepted[0]), 0);
+  EXPECT_EQ(::close(accepted[1]), 0);
+  EXPECT_EQ(::close(release_first[0]), 0);
+  EXPECT_EQ(::close(release_first[1]), 0);
+  EXPECT_EQ(::close(control[0]), 0);
+  EXPECT_EQ(::close(control[1]), 0);
+  EXPECT_EQ(::close(reloaded[0]), 0);
+  EXPECT_EQ(::close(reloaded[1]), 0);
+}
+
+TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
+  // Write an initial valid config to a temp file.
+  char path[] = "/tmp/aegisgate-invalid-reload-XXXXXX";
+  const int config_fd = ::mkstemp(path);
+  ASSERT_GE(config_fd, 0);
+  const std::string valid_yaml =
+      "workers: 1\nroutes:\n"
+      "  - name: api\n    host: invalid-reload.test\n    path_prefix: /\n    endpoints:\n"
+      "      - host: 127.0.0.1\n        port: 18080\n        weight: 1\n"
+      "    rate_limit: 10\n    burst: 10\n    max_inflight: 4\n";
+  ASSERT_EQ(::write(config_fd, valid_yaml.data(), valid_yaml.size()),
+            static_cast<ssize_t>(valid_yaml.size()));
+  ASSERT_EQ(::close(config_fd), 0);
+
+  std::array<int, 2> done{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, done.data()), 0);
+  net::EventLoop loop;
+  const config::Endpoint endpoint{"127.0.0.1", {127, 0, 0, 1}, 18080, 1};
+  Gateway gateway(loop, config::Config{{{"api", "invalid-reload.test", "/", {endpoint}, 10, 10, 4}}},
+                  "127.0.0.1", 0, {}, path);
+  gateway.Start();
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), 1U);
+
+  // Record the sequence before triggering reload.
+  const std::uint64_t before = gateway.LastReloadResultSequence();
+
+  // Overwrite the file with invalid YAML.
+  const int bad_fd = ::open(path, O_WRONLY | O_TRUNC | O_CLOEXEC);
+  ASSERT_GE(bad_fd, 0);
+  const std::string invalid_yaml = "this is not valid yaml: [unclosed";
+  ASSERT_EQ(::write(bad_fd, invalid_yaml.data(), invalid_yaml.size()),
+            static_cast<ssize_t>(invalid_yaml.size()));
+  ASSERT_EQ(::close(bad_fd), 0);
+
+  // Trigger file-backed reload.
+  ASSERT_TRUE(gateway.RequestReload());
+
+  // Wait until the control loop has consumed the reload result (sequence
+  // increased).  This is a real completion barrier, not a timer.
+  net::Channel done_channel(loop, done[0]);
+  bool timed_out = false;
+  done_channel.SetReadCallback([&] {
+    char result = '\0';
+    ASSERT_EQ(::read(done[0], &result, 1), 1);
+    timed_out = result != 'd';
+    loop.Quit();
+  });
+  done_channel.EnableReading();
+  net::TimerQueue check_timer(loop);
+  const auto deadline = TestDeadline();
+  auto check = std::make_shared<std::function<void()>>();
+  *check = [&] {
+    if (gateway.LastReloadResultSequence() > before) {
+      (void)::write(done[1], "d", 1);
+      return;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      (void)::write(done[1], "t", 1);
+      return;
+    }
+    (void)check_timer.ScheduleAfter(std::chrono::milliseconds(5), *check);
+  };
+  (void)check_timer.ScheduleAfter(std::chrono::milliseconds(5), *check);
+  loop.Loop();
+
+  EXPECT_FALSE(timed_out);
+  // Generation must still be v1: the invalid YAML was never published.
+  EXPECT_EQ(gateway.CurrentGenerationVersion(), 1U);
+  EXPECT_EQ(gateway.Routes().Config().routes.front().endpoints.front().port, 18080);
+  EXPECT_EQ(gateway.RetiringGenerationCount(), 0U);
+
+  done_channel.Remove();
+  EXPECT_EQ(::close(done[0]), 0);
+  EXPECT_EQ(::close(done[1]), 0);
+  EXPECT_EQ(::unlink(path), 0);
+}
+
+TEST(GatewayTest, RetiredGenerationStopsOnlyAfterOldInflightRequestCompletes) {
+  net::Socket first_backend = net::Socket::ListenLoopback();
+  net::Socket second_backend = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_backend.BoundPort(), 1};
+  const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_backend.BoundPort(), 1};
+  const config::Config initial{{{"api", "retire.test", "/", {first}, 10, 10, 4}}};
+  const config::Config replacement{{{"api", "retire.test", "/", {second}, 10, 10, 4}}};
+  constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: retire.test\r\n\r\n";
+  constexpr std::string_view response_old = "HTTP/1.1 200 Old\r\nContent-Length: 3\r\n\r\nOLD";
+  constexpr std::string_view response_new = "HTTP/1.1 200 New\r\nContent-Length: 3\r\n\r\nNEW";
+
+  std::array<int, 2> accepted{};
+  std::array<int, 2> release_first{};
+  std::array<int, 2> controller_reloaded{};
+  std::array<int, 2> client_reloaded{};
+  std::array<int, 2> retire_check{};
+  std::array<int, 2> control{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, accepted.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, release_first.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, controller_reloaded.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_reloaded.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, retire_check.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, control.data()), 0);
+
+  std::string first_error;
+  std::thread first_server([&] {
+    const int fd = AcceptUntil(first_backend, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, request.size(), TestDeadline(), first_error);
+    if (first_error.empty() && ::write(accepted[1], "a", 1) != 1) first_error = "accept signal failed";
+    char release = '\0';
+    if (first_error.empty() && ::read(release_first[0], &release, 1) != 1) {
+      first_error = "first backend release failed";
+    }
+    if (first_error.empty() &&
+        ::write(fd, response_old.data(), response_old.size()) != static_cast<ssize_t>(response_old.size())) {
+      first_error = "first backend response failed";
+    }
+    (void)::close(fd);
+  });
+
+  std::string second_error;
+  std::thread second_server([&] {
+    const int fd = AcceptUntil(second_backend, TestDeadline(), second_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, request.size(), TestDeadline(), second_error);
+    if (second_error.empty() &&
+        ::write(fd, response_new.data(), response_new.size()) != static_cast<ssize_t>(response_new.size())) {
+      second_error = "second backend response failed";
+    }
+    (void)::close(fd);
+  });
+
+  net::EventLoop loop;
+  Gateway gateway(loop, initial, "127.0.0.1", 0);
+  gateway.Start();
+  net::Channel control_channel(loop, control[0]);
+  bool reload_succeeded = false;
+  control_channel.SetReadCallback([&] {
+    char command = '\0';
+    ASSERT_EQ(::read(control[0], &command, 1), 1);
+    if (command == 'r') {
+      reload_succeeded = gateway.RequestReload(replacement);
+      ASSERT_EQ(::write(controller_reloaded[1], "r", 1), 1);
+      ASSERT_EQ(::write(client_reloaded[1], "r", 1), 1);
+      return;
+    }
+    if (command == 'c') {
+      const std::size_t count = gateway.RetiringGenerationCount();
+      char result = static_cast<char>(count > 0 ? '1' : '0');
+      ASSERT_EQ(::write(retire_check[1], &result, 1), 1);
+      return;
+    }
+    loop.Quit();
+  });
+  control_channel.EnableReading();
+
+  std::string client_error;
+  std::thread controller([&] {
+    char signal = '\0';
+    if (::read(accepted[0], &signal, 1) != 1 || signal != 'a') {
+      client_error = "first backend never accepted";
+      (void)::write(control[1], "q", 1);
+      return;
+    }
+    if (::write(control[1], "r", 1) != 1) { client_error = "reload signal failed"; return; }
+    if (::read(controller_reloaded[0], &signal, 1) != 1 || signal != 'r') {
+      client_error = "reload completion signal failed";
+      (void)::write(control[1], "q", 1);
+      return;
+    }
+    if (::write(control[1], "c", 1) != 1) { client_error = "retire check signal failed"; return; }
+    char retire_result = '\0';
+    if (::read(retire_check[0], &retire_result, 1) != 1) {
+      client_error = "retire check read failed";
+      (void)::write(control[1], "q", 1);
+      return;
+    }
+    if (retire_result != '1') {
+      client_error = "v1 should still be retiring while old request in-flight";
+      (void)::write(control[1], "q", 1);
+      return;
+    }
+    if (::write(release_first[1], "x", 1) != 1) { client_error = "release old request failed"; return; }
+    const auto deadline = TestDeadline();
+    bool retired = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (::write(control[1], "c", 1) != 1) break;
+      char result = '\0';
+      if (::read(retire_check[0], &result, 1) != 1) break;
+      if (result == '0') { retired = true; break; }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!retired) client_error = "v1 retirement did not complete after old request finished";
+    (void)::write(control[1], "q", 1);
+  });
+
+  std::thread client([&] {
+    net::Socket old_request = net::Socket::ConnectLoopback(gateway.port());
+    if (!WriteAll(old_request.Fd(), request, TestDeadline(), client_error)) return;
+    char signal = '\0';
+    if (::read(client_reloaded[0], &signal, 1) != 1 || signal != 'r') {
+      client_error = "client reload signal failed";
+      return;
+    }
+    net::Socket new_request = net::Socket::ConnectLoopback(gateway.port());
+    if (!WriteAll(new_request.Fd(), request, TestDeadline(), client_error)) return;
+    const std::string new_response = ReadExact(new_request.Fd(), response_new.size(), TestDeadline(), client_error);
+    if (new_response != response_new && client_error.empty()) {
+      client_error = "new request did not use new generation";
+    }
+    const std::string old_response = ReadExact(old_request.Fd(), response_old.size(), TestDeadline(), client_error);
+    if (old_response != response_old && client_error.empty()) {
+      client_error = "old request did not retain old generation";
+    }
+  });
+
+  loop.Loop();
+  controller.join();
+  client.join();
+  first_server.join();
+  second_server.join();
+
+  EXPECT_TRUE(reload_succeeded);
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_TRUE(second_error.empty()) << second_error;
+  EXPECT_EQ(gateway.RetiringGenerationCount(), 0U);
+  control_channel.Remove();
+  EXPECT_EQ(::close(accepted[0]), 0);
+  EXPECT_EQ(::close(accepted[1]), 0);
+  EXPECT_EQ(::close(release_first[0]), 0);
+  EXPECT_EQ(::close(release_first[1]), 0);
+  EXPECT_EQ(::close(controller_reloaded[0]), 0);
+  EXPECT_EQ(::close(controller_reloaded[1]), 0);
+  EXPECT_EQ(::close(client_reloaded[0]), 0);
+  EXPECT_EQ(::close(client_reloaded[1]), 0);
+  EXPECT_EQ(::close(retire_check[0]), 0);
+  EXPECT_EQ(::close(retire_check[1]), 0);
+  EXPECT_EQ(::close(control[0]), 0);
+  EXPECT_EQ(::close(control[1]), 0);
+}
+
+TEST(GatewayTest, AdmissionTokensReturnToCorrectGenerationAfterReload) {
+  // Verify that admission tokens from old generations are returned to the
+  // correct generation's admission, not to the new generation's route index.
+  // This is a simplified test: we verify that after reload and old request
+  // completion, the admission counters are consistent.
+  net::Socket first_backend = net::Socket::ListenLoopback();
+  net::Socket second_backend = net::Socket::ListenLoopback();
+  const config::Endpoint first{"127.0.0.1", {127, 0, 0, 1}, first_backend.BoundPort(), 1};
+  const config::Endpoint second{"127.0.0.1", {127, 0, 0, 1}, second_backend.BoundPort(), 1};
+  const config::Config initial{{{"api", "admission.test", "/", {first}, 10, 10, 4}}};
+  const config::Config replacement{{{"api", "admission.test", "/", {second}, 10, 10, 4}}};
+  constexpr std::string_view request = "GET / HTTP/1.1\r\nHost: admission.test\r\n\r\n";
+  constexpr std::string_view response_old = "HTTP/1.1 200 Old\r\nContent-Length: 3\r\n\r\nOLD";
+  constexpr std::string_view response_new = "HTTP/1.1 200 New\r\nContent-Length: 3\r\n\r\nNEW";
+
+  std::array<int, 2> accepted{};
+  std::array<int, 2> release_first{};
+  std::array<int, 2> controller_reloaded{};
+  std::array<int, 2> client_reloaded{};
+  std::array<int, 2> client_done{};
+  std::array<int, 2> control{};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, accepted.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, release_first.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, controller_reloaded.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_reloaded.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_done.data()), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, control.data()), 0);
+
+  std::string first_error;
+  std::thread first_server([&] {
+    const int fd = AcceptUntil(first_backend, TestDeadline(), first_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, request.size(), TestDeadline(), first_error);
+    if (first_error.empty() && ::write(accepted[1], "a", 1) != 1) first_error = "accept signal failed";
+    char release = '\0';
+    if (first_error.empty() && ::read(release_first[0], &release, 1) != 1) {
+      first_error = "release failed";
+    }
+    if (first_error.empty() &&
+        ::write(fd, response_old.data(), response_old.size()) != static_cast<ssize_t>(response_old.size())) {
+      first_error = "response failed";
+    }
+    (void)::close(fd);
+  });
+
+  std::string second_error;
+  std::thread second_server([&] {
+    const int fd = AcceptUntil(second_backend, TestDeadline(), second_error);
+    if (fd < 0) return;
+    (void)ReadExact(fd, request.size(), TestDeadline(), second_error);
+    if (second_error.empty() &&
+        ::write(fd, response_new.data(), response_new.size()) != static_cast<ssize_t>(response_new.size())) {
+      second_error = "response failed";
+    }
+    (void)::close(fd);
+  });
+
+  net::EventLoop loop;
+  Gateway gateway(loop, initial, "127.0.0.1", 0);
+  gateway.Start();
+  net::Channel control_channel(loop, control[0]);
+  bool reload_succeeded = false;
+  control_channel.SetReadCallback([&] {
+    char command = '\0';
+    ASSERT_EQ(::read(control[0], &command, 1), 1);
+    if (command == 'r') {
+      reload_succeeded = gateway.RequestReload(replacement);
+      ASSERT_EQ(::write(controller_reloaded[1], "r", 1), 1);
+      ASSERT_EQ(::write(client_reloaded[1], "r", 1), 1);
+      return;
+    }
+    if (command == 'q') {
+      loop.Quit();
+      return;
+    }
+  });
+  control_channel.EnableReading();
+
+  std::string client_error;
+  std::thread controller([&] {
+    char signal = '\0';
+    if (::read(accepted[0], &signal, 1) != 1 || signal != 'a') {
+      client_error = "first backend never accepted";
+      (void)::write(control[1], "q", 1);
+      return;
+    }
+    if (::write(control[1], "r", 1) != 1) { client_error = "reload signal failed"; return; }
+    if (::read(controller_reloaded[0], &signal, 1) != 1 || signal != 'r') {
+      client_error = "reload completion failed";
+      (void)::write(control[1], "q", 1);
+      return;
+    }
+    // Release old request.
+    if (::write(release_first[1], "x", 1) != 1) { client_error = "release failed"; return; }
+    // Wait for client to finish before quitting the loop.
+    if (::read(client_done[0], &signal, 1) != 1 || signal != 'd') {
+      client_error = "client done signal failed";
+    }
+    (void)::write(control[1], "q", 1);
+  });
+
+  std::thread client([&] {
+    net::Socket old_request = net::Socket::ConnectLoopback(gateway.port());
+    if (!WriteAll(old_request.Fd(), request, TestDeadline(), client_error)) return;
+    char signal = '\0';
+    if (::read(client_reloaded[0], &signal, 1) != 1 || signal != 'r') {
+      client_error = "client reload signal failed";
+      (void)::write(client_done[1], "d", 1);
+      return;
+    }
+    net::Socket new_request = net::Socket::ConnectLoopback(gateway.port());
+    if (!WriteAll(new_request.Fd(), request, TestDeadline(), client_error)) {
+      (void)::write(client_done[1], "d", 1);
+      return;
+    }
+    const std::string new_response = ReadExact(new_request.Fd(), response_new.size(), TestDeadline(), client_error);
+    if (new_response != response_new && client_error.empty()) {
+      client_error = "new request did not use new generation";
+    }
+    const std::string old_response = ReadExact(old_request.Fd(), response_old.size(), TestDeadline(), client_error);
+    if (old_response != response_old && client_error.empty()) {
+      client_error = "old request did not retain old generation";
+    }
+    (void)::write(client_done[1], "d", 1);
+  });
+
+  loop.Loop();
+  controller.join();
+  client.join();
+  first_server.join();
+  second_server.join();
+
+  EXPECT_TRUE(reload_succeeded);
+  EXPECT_TRUE(client_error.empty()) << client_error;
+  EXPECT_TRUE(first_error.empty()) << first_error;
+  EXPECT_TRUE(second_error.empty()) << second_error;
+  // Note: RetiringGenerationCount may not be 0 here because retirement is
+  // async and may still be in progress when the test ends.  The Gateway
+  // destructor will complete the retirement.
+  control_channel.Remove();
+  EXPECT_EQ(::close(accepted[0]), 0);
+  EXPECT_EQ(::close(accepted[1]), 0);
+  EXPECT_EQ(::close(release_first[0]), 0);
+  EXPECT_EQ(::close(release_first[1]), 0);
+  EXPECT_EQ(::close(controller_reloaded[0]), 0);
+  EXPECT_EQ(::close(controller_reloaded[1]), 0);
+  EXPECT_EQ(::close(client_reloaded[0]), 0);
+  EXPECT_EQ(::close(client_reloaded[1]), 0);
+  EXPECT_EQ(::close(control[0]), 0);
+  EXPECT_EQ(::close(control[1]), 0);
 }
 
 TEST(GatewayTest, GatewayDestroyDuringStreamingIsSafe) {

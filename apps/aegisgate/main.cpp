@@ -11,6 +11,7 @@
 #include "aegisgate/config/Config.h"
 #include "aegisgate/gateway/Gateway.h"
 #include "aegisgate/net/EventLoop.h"
+#include "aegisgate/runtime/ReloadWatcher.h"
 
 namespace {
 
@@ -37,10 +38,17 @@ int main(int argc, char **argv) {
     return 2;
   }
   try {
+    // signalfd receives SIGHUP only when it is blocked before the worker and
+    // coordinator threads are created; they inherit this process signal mask.
+    aegisgate::runtime::ReloadWatcher::BlockSighupForProcess();
     aegisgate::net::EventLoop loop;
     aegisgate::gateway::Gateway gateway(
-        loop, aegisgate::config::LoadFromYaml(ReadFile(argv[1])), "0.0.0.0", ParsePort(argv[2]));
+        loop, aegisgate::config::LoadFromYaml(ReadFile(argv[1])), "0.0.0.0", ParsePort(argv[2]),
+        {}, argv[1]);
     gateway.Start();
+    aegisgate::runtime::ReloadWatcher watcher(loop, argv[1], [&gateway] {
+      (void)gateway.RequestReload();
+    });
     loop.Loop();
     return 0;
   } catch (const std::exception &error) {

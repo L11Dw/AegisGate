@@ -7,7 +7,7 @@
 
 #include "aegisgate/proxy/ProxyTransaction.h"
 #include "aegisgate/runtime/SelectionState.h"
-#include "aegisgate/runtime/WorkerShared.h"
+#include "aegisgate/runtime/RuntimeGeneration.h"
 
 namespace aegisgate::health {
 class Coordinator;
@@ -25,8 +25,8 @@ namespace aegisgate::runtime {
 // from the live coordinator snapshot.
 class AttemptSelector {
 public:
-  AttemptSelector(SelectionState &selection, std::shared_ptr<WorkerShared> shared,
-                  std::size_t route_index, ConfigSnapshotRef snapshot);
+  AttemptSelector(SelectionState &selection, RuntimeGenerationRef generation,
+                  std::size_t route_index);
 
   // Picks one attempt selection for the route's balance policy.  A nullopt
   // selection means no eligible candidate remains (initial -> unique 503,
@@ -45,7 +45,8 @@ private:
   MakeSelection(std::size_t endpoint_index, const health::HealthCircuitSnapshot &snapshot) noexcept;
 
   SelectionState &selection_;
-  std::shared_ptr<WorkerShared> shared_;
+  RuntimeGenerationRef generation_;
+  std::shared_ptr<health::Coordinator> coordinator_;
   std::size_t route_index_;
   // The request-bound configuration; never re-read from the global snapshot.
   ConfigSnapshotRef snapshot_;

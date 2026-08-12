@@ -28,6 +28,69 @@ CoordinatorState::CoordinatorState(std::shared_ptr<const config::Config> config,
   }
 }
 
+void CoordinatorState::PrepareForMigration() {
+  for (std::size_t route = 0; route < endpoints_.size(); ++route) {
+    const bool checked = config_->routes[route].health_check.has_value();
+    for (EndpointState &state : endpoints_[route]) {
+      state.health.ImportState(checked ? HealthState::kUnknown : HealthState::kImplicitHealthy);
+    }
+  }
+}
+
+ProtectionSnapshot CoordinatorState::ExportProtectionSnapshot(Clock::time_point now) const {
+  ProtectionSnapshot snapshot;
+  for (std::size_t route = 0; route < endpoints_.size(); ++route) {
+    const config::Route &route_config = config_->routes[route];
+    for (std::size_t endpoint = 0; endpoint < endpoints_[route].size(); ++endpoint) {
+      const EndpointState &state = endpoints_[route][endpoint];
+      EndpointProtectionSnapshot record;
+      record.route = RouteKey(route_config);
+      record.endpoint = EndpointKey(route_config.endpoints[endpoint]);
+      record.health_state = state.health.State();
+      record.source_health_policy = route_config.health_check;
+      record.source_breaker_policy = route_config.circuit_breaker;
+      if (state.breaker) record.breaker = state.breaker->ExportSnapshot(now);
+      snapshot.endpoints.push_back(std::move(record));
+    }
+  }
+  return snapshot;
+}
+
+void CoordinatorState::ImportProtectionSnapshot(const ProtectionSnapshot &snapshot,
+                                                Clock::time_point now) {
+  // Begin from the safe prepared baseline.  A record only changes this state
+  // after both its semantic identity and relevant policy match.
+  PrepareForMigration();
+  for (const EndpointProtectionSnapshot &source : snapshot.endpoints) {
+    for (std::size_t route = 0; route < endpoints_.size(); ++route) {
+      const config::Route &route_config = config_->routes[route];
+      if (!SameRouteIdentity(source.route, route_config)) continue;
+      for (std::size_t endpoint = 0; endpoint < endpoints_[route].size(); ++endpoint) {
+        if (!SameEndpointIdentity(source.endpoint, route_config.endpoints[endpoint])) continue;
+        EndpointState &target = endpoints_[route][endpoint];
+        if (SameHealthPolicy(source.source_health_policy, route_config.health_check)) {
+          target.health.ImportState(source.health_state);
+        }
+        if (target.breaker && source.breaker &&
+            SameBreakerPolicy(source.source_breaker_policy, route_config.circuit_breaker)) {
+          const auto cycle = target.breaker->ImportSnapshot(*source.breaker, now);
+          if (cycle) {
+            auto slots = std::make_shared<ProbeSlotState>();
+            slots->remaining.store(cycle->quota, std::memory_order_release);
+            slots->probe_base = cycle->probe_base;
+            slots->generation = cycle->generation;
+            slots->quota = cycle->quota;
+            target.probe_slots.store(std::move(slots), std::memory_order_release);
+          }
+        }
+        // Config validation guarantees identity uniqueness within a route.
+        break;
+      }
+      break;
+    }
+  }
+}
+
 void CoordinatorState::RecordHealth(std::size_t route, std::size_t endpoint, bool healthy) {
   if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) return;
   endpoints_[route][endpoint].health.RecordCheckResult(healthy);
@@ -58,23 +121,15 @@ void CoordinatorState::ArmHalfOpen(std::size_t route, std::size_t endpoint, Cloc
     return;
   }
   if (now < breaker->OpenUntil()) return;
-  const config::CircuitBreakerSettings &settings = *config_->routes[route].circuit_breaker;
-  // The first Select() transitions Open -> HalfOpen; the remaining calls
-  // pre-issue the rest of the quota so pending_probes_ can validate every
-  // worker probe id exactly once (ids are consecutive from the first issue).
-  std::uint64_t base = 0;
-  for (std::uint32_t index = 0; index != settings.half_open_probes; ++index) {
-    const auto permit = breaker->Select(now);
-    if (index == 0) base = permit.probe_id;
-  }
+  const auto cycle = breaker->BeginFreshHalfOpenCycle(now);
   // Publish a fresh per-cycle slot object: workers claim from the object their
   // snapshot holds, so a permit is always consistent with that snapshot.
   auto slots = std::make_shared<ProbeSlotState>();
-  slots->remaining.store(settings.half_open_probes, std::memory_order_release);
+  slots->remaining.store(cycle.quota, std::memory_order_release);
   slots->issued.store(0, std::memory_order_relaxed);
-  slots->probe_base = base;
-  slots->generation = breaker->Generation();
-  slots->quota = settings.half_open_probes;
+  slots->probe_base = cycle.probe_base;
+  slots->generation = cycle.generation;
+  slots->quota = cycle.quota;
   state.probe_slots.store(std::move(slots), std::memory_order_release);
 }
 
@@ -168,6 +223,13 @@ std::size_t CoordinatorState::EndpointCount(std::size_t route) const noexcept {
 bool CoordinatorState::Healthy(std::size_t route, std::size_t endpoint) const noexcept {
   if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) return true;
   return endpoints_[route][endpoint].health.Healthy();
+}
+
+HealthState CoordinatorState::Health(std::size_t route, std::size_t endpoint) const noexcept {
+  if (route >= endpoints_.size() || endpoint >= endpoints_[route].size()) {
+    return HealthState::kImplicitHealthy;
+  }
+  return endpoints_[route][endpoint].health.State();
 }
 
 resilience::CircuitBreaker::State

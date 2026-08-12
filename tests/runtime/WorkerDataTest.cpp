@@ -18,6 +18,7 @@
 #include "aegisgate/observability/Metrics.h"
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
+#include "aegisgate/runtime/RuntimeGeneration.h"
 #include "aegisgate/runtime/WorkerData.h"
 #include "aegisgate/net/Fd.h"
 #include "aegisgate/runtime/WorkerRuntime.h"
@@ -91,6 +92,7 @@ config::Route LeaseRoute() {
 struct Fixture {
   std::shared_ptr<config::Config> config;
   std::shared_ptr<health::Coordinator> coordinator;
+  RuntimeGenerationRef generation;
   std::shared_ptr<WorkerShared> shared;
   std::shared_ptr<resilience::GlobalAdmission> admission;
   std::shared_ptr<std::atomic<std::uint64_t>> client_count;
@@ -101,20 +103,14 @@ Fixture MakeFixture() {
   Fixture fixture;
   fixture.config = std::make_shared<config::Config>();
   fixture.config->routes = {LeaseRoute()};
-  const auto snapshot = std::make_shared<const ConfigSnapshot>(ConfigSnapshot{1, *fixture.config});
-  fixture.coordinator = std::make_shared<health::Coordinator>(
-      fixture.config, health::Coordinator::Clock::now());
+  fixture.generation = std::make_shared<RuntimeGeneration>(/*version=*/1, *fixture.config);
+  fixture.coordinator = fixture.generation->coordinator();
   fixture.shared = std::make_shared<WorkerShared>();
-  fixture.shared->config_snapshot.store(snapshot, std::memory_order_release);
-  fixture.shared->coordinator = fixture.coordinator;
-  fixture.shared->worker_count = 1;
+  fixture.shared->current_generation.store(fixture.generation, std::memory_order_release);
   fixture.shared->flow_control = net::StreamFlowControl{};
   fixture.shared->lifetime_token = std::make_shared<int>(0);
   fixture.shared->metrics_renderer = [] { return std::string{}; };
-  const auto now = resilience::GlobalAdmission::Clock::now();
-  fixture.admission =
-      std::make_shared<resilience::GlobalAdmission>(fixture.config->routes[0], now);
-  fixture.shared->admissions = {fixture.admission};
+  fixture.admission = fixture.generation->admissions().front();
   fixture.client_count = std::make_shared<std::atomic<std::uint64_t>>(0);
   fixture.metrics = std::make_shared<observability::Metrics>();
   return fixture;
