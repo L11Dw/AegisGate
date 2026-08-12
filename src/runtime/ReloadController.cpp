@@ -118,6 +118,7 @@ void ReloadController::ParseLoop() noexcept {
       std::lock_guard<std::mutex> guard(mutex_);
       if (!stopping_) {
         try {
+          result.sequence = next_sequence_++;
           results_.push_back(std::move(result));
           publish = WakeLocked();
           if (!publish) results_.pop_back();

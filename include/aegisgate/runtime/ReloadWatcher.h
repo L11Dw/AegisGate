@@ -35,6 +35,9 @@ public:
   ReloadWatcher(const ReloadWatcher &) = delete;
   ReloadWatcher &operator=(const ReloadWatcher &) = delete;
 
+  // Test observation: number of TryRewatch() calls (including retries).
+  [[nodiscard]] std::size_t RewatchAttemptCount() const noexcept { return rewatch_attempt_count_; }
+
 private:
   void HandleInotify();
   void HandleSighup();
@@ -54,6 +57,8 @@ private:
   int sighup_fd_ = -1;
   net::TimerQueue::TimerId debounce_timer_ = 0;
   net::TimerQueue::TimerId rewatch_timer_ = 0;
+  // Test observation: counts TryRewatch() calls (including retries).
+  std::size_t rewatch_attempt_count_ = 0;
 };
 
 } // namespace aegisgate::runtime

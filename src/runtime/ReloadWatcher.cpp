@@ -19,6 +19,9 @@
 namespace aegisgate::runtime {
 namespace {
 
+// inotify events that indicate the watch on the directory is no longer valid.
+constexpr std::uint32_t kWatchInvalidationMask = IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF;
+
 std::pair<std::string, std::string> SplitPath(const std::string &path) {
   const std::size_t slash = path.find_last_of('/');
   if (slash == std::string::npos) return {".", path};
@@ -88,10 +91,11 @@ void ReloadWatcher::HandleInotify() {
       const std::size_t event_size = sizeof(inotify_event) + event->len;
       if (event_size == 0 || offset + event_size > static_cast<std::size_t>(count)) return;
       if (event->wd == watch_descriptor_) {
-        // Watch invalidation: the kernel removes the watch when the watched
-        // directory is deleted or the filesystem is unmounted.  Re-arm if the
-        // directory is still accessible; otherwise schedule a retry.
-        if ((event->mask & IN_IGNORED) != 0) {
+        // Unified watch invalidation: IN_IGNORED, IN_DELETE_SELF, IN_MOVE_SELF
+        // all indicate the watch is no longer valid.  The kernel removes the
+        // watch automatically after IN_DELETE_SELF/IN_MOVE_SELF; we handle
+        // IN_IGNORED as the final signal.
+        if ((event->mask & kWatchInvalidationMask) != 0) {
           watch_descriptor_ = -1;
           TryRewatch();
           continue;
@@ -107,6 +111,7 @@ void ReloadWatcher::HandleInotify() {
 }
 
 void ReloadWatcher::TryRewatch() {
+  ++rewatch_attempt_count_;
   const int new_wd = ::inotify_add_watch(
       inotify_fd_, directory_.c_str(),
       IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF);
@@ -117,6 +122,9 @@ void ReloadWatcher::TryRewatch() {
       (void)timers_->Cancel(rewatch_timer_);
       rewatch_timer_ = 0;
     }
+    // Trigger a reload: the directory was recreated and the config file may
+    // have been written while the watch was absent.
+    Debounce();
     return;
   }
   // Directory is gone.  Schedule a single retry so we re-arm when it

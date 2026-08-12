@@ -84,6 +84,12 @@ public:
   [[nodiscard]] std::size_t RetiringGenerationCount() const noexcept {
     return retiring_generations_.size();
   }
+  // Control-loop owner only.  Returns the monotonic sequence of the last
+  // reload result consumed by HandleReloadResults().  Tests use this as a
+  // completion barrier: wait until the value increases past a known point.
+  [[nodiscard]] std::uint64_t LastReloadResultSequence() const noexcept {
+    return last_reload_result_sequence_;
+  }
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();
   [[nodiscard]] Lifecycle lifecycle() const noexcept { return lifecycle_; }
@@ -152,6 +158,9 @@ private:
   std::vector<std::thread> retirement_reapers_;
   bool workers_stopped_ = false;
   net::StreamFlowControl flow_control_;
+  // Monotonic sequence of the last reload result consumed by the control loop.
+  // Tests use this as a completion barrier: wait until this value increases.
+  std::uint64_t last_reload_result_sequence_ = 0;
 };
 
 } // namespace aegisgate::gateway

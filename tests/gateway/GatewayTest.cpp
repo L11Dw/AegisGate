@@ -2116,6 +2116,9 @@ TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
   gateway.Start();
   EXPECT_EQ(gateway.CurrentGenerationVersion(), 1U);
 
+  // Record the sequence before triggering reload.
+  const std::uint64_t before = gateway.LastReloadResultSequence();
+
   // Overwrite the file with invalid YAML.
   const int bad_fd = ::open(path, O_WRONLY | O_TRUNC | O_CLOEXEC);
   ASSERT_GE(bad_fd, 0);
@@ -2124,14 +2127,11 @@ TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
             static_cast<ssize_t>(invalid_yaml.size()));
   ASSERT_EQ(::close(bad_fd), 0);
 
-  // Trigger file-backed reload.  The controller will parse the invalid YAML
-  // and report a failure result; Gateway must not publish a new generation.
+  // Trigger file-backed reload.
   ASSERT_TRUE(gateway.RequestReload());
 
-  // The reload controller's background thread will parse and deliver a result
-  // via eventfd.  The control loop will consume it and call HandleReloadResults().
-  // Since the YAML is invalid, no new generation is published.
-  // Use a timer to check after the background thread has had time to finish.
+  // Wait until the control loop has consumed the reload result (sequence
+  // increased).  This is a real completion barrier, not a timer.
   net::Channel done_channel(loop, done[0]);
   bool timed_out = false;
   done_channel.SetReadCallback([&] {
@@ -2142,14 +2142,20 @@ TEST(GatewayTest, InvalidFileReloadLeavesPublishedGenerationUntouched) {
   });
   done_channel.EnableReading();
   net::TimerQueue check_timer(loop);
-  (void)check_timer.ScheduleAfter(std::chrono::milliseconds(500), [&] {
-    // After 500ms, the background thread should have finished parsing.
-    // The control loop has processed the result (or will on next iteration).
-    (void)::write(done[1], "d", 1);
-  });
-  (void)check_timer.ScheduleAfter(std::chrono::seconds(5), [&] {
-    (void)::write(done[1], "t", 1);
-  });
+  const auto deadline = TestDeadline();
+  auto check = std::make_shared<std::function<void()>>();
+  *check = [&] {
+    if (gateway.LastReloadResultSequence() > before) {
+      (void)::write(done[1], "d", 1);
+      return;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      (void)::write(done[1], "t", 1);
+      return;
+    }
+    (void)check_timer.ScheduleAfter(std::chrono::milliseconds(5), *check);
+  };
+  (void)check_timer.ScheduleAfter(std::chrono::milliseconds(5), *check);
   loop.Loop();
 
   EXPECT_FALSE(timed_out);

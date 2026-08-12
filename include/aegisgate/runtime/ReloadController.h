@@ -23,6 +23,7 @@ public:
     std::optional<config::Config> candidate;
     std::string error;
     std::thread::id parser_thread;
+    std::uint64_t sequence = 0;  // monotonic, per-controller
   };
 
   explicit ReloadController(std::string config_path);
@@ -50,6 +51,7 @@ private:
   std::deque<Result> results_;
   std::thread parser_;
   int wake_fd_ = -1;
+  std::uint64_t next_sequence_ = 1;
   bool stopping_ = false;
   bool parsing_ = false;
   bool pending_ = false;

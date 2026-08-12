@@ -146,6 +146,12 @@ void Gateway::HandleReloadResults() {
   if (!loop_.IsOwnerThread() || !reload_controller_) std::terminate();
   auto results = reload_controller_->Drain();
   if (results.empty()) return;
+  // Record the highest sequence so tests can wait for consumption.
+  for (const auto &r : results) {
+    if (r.sequence > last_reload_result_sequence_) {
+      last_reload_result_sequence_ = r.sequence;
+    }
+  }
   // A burst may contain an obsolete completed parse followed by the coalesced
   // latest file image.  Publishing only the newest result prevents an
   // unnecessary transient generation; a failed newest parse leaves the live
