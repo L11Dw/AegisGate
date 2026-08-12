@@ -1,6 +1,7 @@
 #include "aegisgate/resilience/CircuitBreaker.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace aegisgate::resilience {
 
@@ -146,7 +147,7 @@ CircuitBreaker::Aggregate(Clock::time_point now) const noexcept {
 void CircuitBreaker::Open(Clock::time_point now) noexcept {
   state_ = State::kOpen;
   open_until_ = now + config_.open_duration;
-  ++generation_;
+  AdvanceGeneration();
   pending_probes_.clear();
   half_open_issued_ = 0;
   half_open_completed_ = 0;
@@ -154,7 +155,7 @@ void CircuitBreaker::Open(Clock::time_point now) noexcept {
 
 void CircuitBreaker::BeginHalfOpen() noexcept {
   state_ = State::kHalfOpen;
-  ++generation_;
+  AdvanceGeneration();
   pending_probes_.clear();
   half_open_issued_ = 1;
   half_open_completed_ = 0;
@@ -163,7 +164,7 @@ void CircuitBreaker::BeginHalfOpen() noexcept {
 
 void CircuitBreaker::Close() noexcept {
   state_ = State::kClosed;
-  ++generation_;
+  AdvanceGeneration();
   pending_probes_.clear();
   half_open_issued_ = 0;
   half_open_completed_ = 0;
@@ -179,6 +180,108 @@ bool CircuitBreaker::ConsumeProbe(std::uint64_t probe_id) noexcept {
   if (position == pending_probes_.end()) return false;
   pending_probes_.erase(position);
   return true;
+}
+
+void CircuitBreaker::AdvanceGeneration() noexcept {
+  ++generation_;
+  // Zero is reserved for an unbound permit.  Skipping it also gives import a
+  // stable way to create a generation distinct from every normal source epoch.
+  if (generation_ == 0) ++generation_;
+}
+
+CircuitBreakerSnapshot CircuitBreaker::ExportSnapshot(Clock::time_point now) const {
+  CircuitBreakerSnapshot snapshot;
+  snapshot.source_generation = generation_;
+  switch (state_) {
+  case State::kClosed:
+    snapshot.state = CircuitBreakerState::kClosed;
+    break;
+  case State::kOpen:
+    snapshot.state = CircuitBreakerState::kOpen;
+    snapshot.open_remaining = now < open_until_ ? open_until_ - now : Clock::duration::zero();
+    break;
+  case State::kHalfOpen:
+    snapshot.state = CircuitBreakerState::kHalfOpen;
+    snapshot.half_open_quota = config_.half_open_probes;
+    break;
+  }
+  if (state_ != State::kClosed) return snapshot;
+  for (const Bucket &bucket : buckets_) {
+    if (bucket.start == Clock::time_point{} || bucket.start > now ||
+        now - bucket.start >= config_.window) {
+      continue;
+    }
+    snapshot.buckets.push_back({now - bucket.start, bucket.success, bucket.failure});
+  }
+  return snapshot;
+}
+
+std::optional<CircuitBreaker::HalfOpenCycle>
+CircuitBreaker::ImportSnapshot(const CircuitBreakerSnapshot &snapshot, Clock::time_point now) {
+  // Import is a migration boundary, not a continuation of old permits.  The
+  // source epoch is deliberately advanced before any state is made visible.
+  generation_ = snapshot.source_generation;
+  AdvanceGeneration();
+  next_probe_id_ = 1;
+  pending_probes_.clear();
+  half_open_issued_ = 0;
+  half_open_completed_ = 0;
+  open_until_ = Clock::time_point{};
+  epoch_ = now;
+  active_start_ = now;
+  active_index_ = 0;
+  initialized_ = true;
+  for (Bucket &bucket : buckets_) bucket = Bucket{};
+  buckets_[active_index_] = Bucket{active_start_, 0, 0};
+
+  const auto bucket_duration =
+      std::chrono::duration_cast<Clock::duration>(config_.window) /
+      static_cast<int>(kBucketCount);
+  if (snapshot.state == CircuitBreakerState::kClosed) {
+    state_ = State::kClosed;
+    for (const BucketSnapshot &source : snapshot.buckets) {
+      if (source.age_from_export < Clock::duration::zero() ||
+          source.age_from_export >= config_.window) {
+        continue;
+      }
+      const auto steps_back = static_cast<std::size_t>(source.age_from_export / bucket_duration);
+      if (steps_back >= kBucketCount) continue;
+      const std::size_t index = (kBucketCount - steps_back) % kBucketCount;
+      Bucket &target = buckets_[index];
+      if (target.start == Clock::time_point{}) {
+        target.start = now - static_cast<Clock::duration>(steps_back * bucket_duration);
+      }
+      target.success += source.success;
+      target.failure += source.failure;
+    }
+    return std::nullopt;
+  }
+
+  if (snapshot.state == CircuitBreakerState::kOpen &&
+      snapshot.open_remaining > Clock::duration::zero()) {
+    state_ = State::kOpen;
+    open_until_ = now + snapshot.open_remaining;
+    return std::nullopt;
+  }
+
+  // HalfOpen has no transferable in-flight probe ownership, and an elapsed
+  // Open window must not reuse an old timer cycle.  Both form one fresh,
+  // entirely pre-issued cycle and hand its exact range to the coordinator.
+  return BeginFreshHalfOpenCycle(now);
+}
+
+CircuitBreaker::HalfOpenCycle
+CircuitBreaker::BeginFreshHalfOpenCycle(Clock::time_point /*now*/) noexcept {
+  state_ = State::kHalfOpen;
+  AdvanceGeneration();
+  pending_probes_.clear();
+  half_open_completed_ = 0;
+  half_open_issued_ = config_.half_open_probes;
+  const std::uint64_t base = next_probe_id_;
+  for (std::uint32_t index = 0; index < config_.half_open_probes; ++index) {
+    pending_probes_.push_back(next_probe_id_++);
+  }
+  return {generation_, base, config_.half_open_probes};
 }
 
 } // namespace aegisgate::resilience
