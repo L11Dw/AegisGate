@@ -32,6 +32,7 @@ add_executable(aegisgate_tests
     observability/MetricsTest.cpp
     mock/MockBackendTest.cpp
     integration/EndToEndTest.cpp
+    gateway/ReloadTest.cpp
     http/HttpResponseTest.cpp
     http/HttpResponseParserTest.cpp
     http/HttpRequestParserTest.cpp

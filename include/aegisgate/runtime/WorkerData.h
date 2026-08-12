@@ -50,6 +50,12 @@ public:
   // is destroyed.
   void ReturnGenerationLeaseBalance(
       const std::vector<std::shared_ptr<resilience::GlobalAdmission>> &admissions) noexcept;
+  // M4-A: builds a candidate SelectionState on the worker thread for a
+  // reload candidate.  Does NOT replace the current selection_ used by
+  // active requests.  Returns the new state on success, nullptr on failure.
+  // Must be called via PostWithLoop on the worker's owner thread.
+  [[nodiscard]] std::shared_ptr<SelectionState> PrepareSelectionState(
+      const config::Config &config, std::uint64_t version);
   [[nodiscard]] std::shared_ptr<observability::Metrics> Metrics() const noexcept {
     return metrics_;
   }

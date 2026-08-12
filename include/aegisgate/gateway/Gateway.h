@@ -61,6 +61,13 @@ public:
   enum class Lifecycle : std::uint8_t { kNotStarted, kStarting, kRunning, kStopped };
 
   void Start();
+  // M4-A: control-loop owner only.  Attempts to publish a new generation
+  // from the given candidate config.  Returns true if the candidate was
+  // accepted, prepared on all workers, and published atomically.  Returns
+  // false if the candidate is invalid, workers mismatch, prepare fails,
+  // or the gateway is not running.  On failure the current generation
+  // and all runtime state are unchanged.
+  [[nodiscard]] bool RequestReload(config::Config candidate);
   [[nodiscard]] std::uint16_t port() const;
   [[nodiscard]] std::size_t ClientCount() const noexcept;
   [[nodiscard]] std::string MetricsText();

@@ -192,6 +192,15 @@ void WorkerData::Shutdown() noexcept {
   client_count_->store(0, std::memory_order_release);
 }
 
+std::shared_ptr<SelectionState> WorkerData::PrepareSelectionState(
+    const config::Config &config, std::uint64_t version) {
+  try {
+    return std::make_shared<SelectionState>(config, version);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 void WorkerData::ReturnGenerationLeaseBalance(
     const std::vector<std::shared_ptr<resilience::GlobalAdmission>> &admissions) noexcept {
   // Return every unspent lease token to the old generation's admissions.

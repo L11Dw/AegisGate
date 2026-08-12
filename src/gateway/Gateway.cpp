@@ -14,6 +14,7 @@
 #include "aegisgate/net/Channel.h"
 #include "aegisgate/resilience/GlobalAdmission.h"
 #include "aegisgate/runtime/SelectionState.h"
+#include "aegisgate/runtime/SelectionState.h"
 
 namespace aegisgate::gateway {
 
@@ -158,6 +159,64 @@ void Gateway::Start() {
   }
   acceptor_->Listen();
   lifecycle_ = Lifecycle::kRunning;
+}
+
+bool Gateway::RequestReload(config::Config candidate) {
+  if (!loop_.IsOwnerThread() || lifecycle_ != Lifecycle::kRunning) return false;
+  const auto current = current_generation_.load(std::memory_order_acquire);
+  if (!current) return false;
+
+  // 1. Validate workers count matches.
+  if (candidate.workers != current->snapshot()->config.workers) return false;
+
+  // 2. Create candidate RuntimeGeneration.
+  runtime::RuntimeGenerationRef replacement;
+  try {
+    auto snapshot = std::make_shared<runtime::ConfigSnapshot>(
+        runtime::ConfigSnapshot{current->version() + 1, std::move(candidate)});
+    auto coord = std::make_shared<health::Coordinator>(
+        std::make_shared<const config::Config>(snapshot->config),
+        health::Coordinator::Clock::now());
+    const auto now = resilience::GlobalAdmission::Clock::now();
+    std::vector<std::shared_ptr<resilience::GlobalAdmission>> new_admissions;
+    for (const config::Route &route : snapshot->config.routes) {
+      new_admissions.push_back(std::make_shared<resilience::GlobalAdmission>(route, now));
+    }
+    coord->SetAdmissions(new_admissions);
+    // Build per-worker selection states on the control loop (placeholder;
+    // A4 prepare moves this to worker threads).
+    std::vector<std::shared_ptr<runtime::SelectionState>> sel_states;
+    sel_states.reserve(snapshot->config.workers);
+    for (std::uint32_t i = 0; i < snapshot->config.workers; ++i) {
+      sel_states.push_back(
+          std::make_shared<runtime::SelectionState>(snapshot->config, snapshot->version));
+    }
+    replacement = std::make_shared<runtime::RuntimeGeneration>(
+        snapshot->version, snapshot, std::move(coord), std::move(new_admissions),
+        std::move(sel_states));
+  } catch (...) {
+    return false;
+  }
+
+  // 3. Start coordinator in prepared mode.
+  try {
+    replacement->coordinator()->Start();
+  } catch (...) {
+    return false;
+  }
+
+  // 4. Publish atomically.
+  auto old_gen = current;
+  routes_ = routing::RouteTable(replacement->snapshot()->config);
+  current_generation_.store(replacement, std::memory_order_release);
+  worker_shared_->config_snapshot.store(replacement->snapshot(), std::memory_order_release);
+  worker_shared_->current_generation.store(replacement, std::memory_order_release);
+  worker_shared_->coordinator = replacement->coordinator();
+  worker_shared_->admissions = replacement->admissions();
+
+  // 5. Retire old generation via A5 pipeline.
+  RetireGeneration(old_gen);
+  return true;
 }
 
 std::uint16_t Gateway::port() const { return acceptor_->port(); }
