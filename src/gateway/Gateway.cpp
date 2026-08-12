@@ -11,6 +11,7 @@
 
 #include "aegisgate/health/Coordinator.h"
 #include "aegisgate/net/Acceptor.h"
+#include "aegisgate/net/Channel.h"
 #include "aegisgate/resilience/GlobalAdmission.h"
 
 namespace aegisgate::gateway {
@@ -22,7 +23,11 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
       routes_(CurrentGeneration()->snapshot()->config),
       worker_shared_(std::make_shared<runtime::WorkerShared>()),
       acceptor_(std::make_unique<net::Acceptor>(loop, listen_address, listen_port)),
+      generation_mailbox_(std::make_shared<runtime::GenerationMailbox>()),
       flow_control_(flow_control) {
+  if (!loop_.IsOwnerThread()) {
+    throw std::logic_error("gateway must be constructed on its control EventLoop thread");
+  }
   const auto generation = CurrentGeneration();
   worker_shared_->current_generation.store(generation, std::memory_order_release);
   worker_shared_->flow_control = flow_control_;
@@ -34,6 +39,10 @@ Gateway::Gateway(net::EventLoop &loop, config::Config config, std::string_view l
     worker_metrics_[index] = std::make_shared<observability::Metrics>();
     client_counts_[index] = std::make_shared<std::atomic<std::uint64_t>>(0);
   }
+  generation_mailbox_channel_ =
+      std::make_unique<net::Channel>(loop_, generation_mailbox_->wake_fd());
+  generation_mailbox_channel_->SetReadCallback([this] { HandleGenerationEvents(); });
+  generation_mailbox_channel_->EnableReading();
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
 }
 
@@ -46,6 +55,7 @@ Gateway::~Gateway() {
   // them; only then drain the remaining published outcomes on the coordinator
   // loop and stop the coordinator — a worker still publishing to a stopped
   // coordinator would lose breaker accounting.
+  if (!loop_.IsOwnerThread()) std::terminate();
   lifecycle_ = Lifecycle::kStopped;
   lifetime_token_.reset();
   acceptor_.reset();
@@ -76,7 +86,96 @@ Gateway::~Gateway() {
     generation->coordinator()->DrainOutcomesAndWait();
     generation->coordinator()->Stop();
   }
+  for (std::thread &reaper : retirement_reapers_) {
+    if (reaper.joinable()) reaper.join();
+  }
+  generation_mailbox_channel_.reset();
+  generation_mailbox_->Close();
   // worker_datas_ entries are all empty: the destroy tasks ran on their workers.
+}
+
+void Gateway::RetireGeneration(runtime::RuntimeGenerationRef generation) {
+  if (!generation || !loop_.IsOwnerThread()) return;
+  const auto [entry, inserted] = retiring_generations_.try_emplace(
+      generation->version(), RetiringGeneration{generation, 0});
+  if (!inserted) return;
+  const std::weak_ptr<runtime::GenerationMailbox> mailbox = generation_mailbox_;
+  if (!generation->BeginRetirement([mailbox, generation] {
+        const auto alive = mailbox.lock();
+        if (!alive ||
+            !alive->Post({runtime::GenerationMailbox::Kind::kLastRequestLeaseReleased,
+                          generation})) {
+          std::terminate();
+        }
+      })) {
+    retiring_generations_.erase(entry);
+  }
+}
+
+void Gateway::HandleGenerationEvents() {
+  if (!loop_.IsOwnerThread()) std::terminate();
+  for (runtime::GenerationMailbox::Event event : generation_mailbox_->Drain()) {
+    if (!event.generation) continue;
+    const auto found = retiring_generations_.find(event.generation->version());
+    if (found == retiring_generations_.end()) continue;
+    if (event.kind == runtime::GenerationMailbox::Kind::kLastRequestLeaseReleased) {
+      RequestWorkerBalanceReturn(event.generation);
+      continue;
+    }
+    if (event.kind == runtime::GenerationMailbox::Kind::kWorkerBalancesReturned) {
+      ++found->second.returned_worker_balances;
+      if (found->second.returned_worker_balances == worker_datas_.size()) {
+        StartRetirementReaper(event.generation);
+      }
+      continue;
+    }
+    if (event.kind == runtime::GenerationMailbox::Kind::kReaperFinished) {
+      event.generation->MarkRetired();
+      retiring_generations_.erase(found);
+    }
+  }
+}
+
+void Gateway::RequestWorkerBalanceReturn(const runtime::RuntimeGenerationRef &generation) {
+  if (worker_datas_.empty()) {
+    StartRetirementReaper(generation);
+    return;
+  }
+  for (std::size_t index = 0; index < worker_datas_.size(); ++index) {
+    const auto data = worker_datas_[index];
+    if (!data) {
+      (void)generation_mailbox_->Post(
+          {runtime::GenerationMailbox::Kind::kWorkerBalancesReturned, generation});
+      continue;
+    }
+    if (!workers_->At(index).PostWithLoop(
+            [data, generation, mailbox = generation_mailbox_](net::EventLoop &) {
+              data->ReturnGenerationLeaseBalance(generation->version());
+              if (!mailbox->Post(
+                      {runtime::GenerationMailbox::Kind::kWorkerBalancesReturned, generation})) {
+                std::terminate();
+              }
+            })) {
+      std::terminate();
+    }
+  }
+}
+
+void Gateway::StartRetirementReaper(const runtime::RuntimeGenerationRef &generation) {
+  if (!generation || !generation->BeginReaping()) return;
+  const auto mailbox = generation_mailbox_;
+  retirement_reapers_.emplace_back([generation, mailbox] {
+    try {
+      generation->coordinator()->BeginOutcomeStopping();
+      generation->coordinator()->DrainOutcomesAndWait();
+      generation->coordinator()->Stop();
+      if (!mailbox->Post({runtime::GenerationMailbox::Kind::kReaperFinished, generation})) {
+        std::terminate();
+      }
+    } catch (...) {
+      std::terminate();
+    }
+  });
 }
 
 void Gateway::Start() {

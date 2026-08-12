@@ -5,6 +5,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "aegisgate/config/Config.h"
@@ -13,12 +15,14 @@
 #include "aegisgate/resilience/CircuitBreaker.h"
 #include "aegisgate/routing/RouteTable.h"
 #include "aegisgate/runtime/ConfigSnapshot.h"
+#include "aegisgate/runtime/GenerationMailbox.h"
 #include "aegisgate/runtime/WorkerData.h"
 #include "aegisgate/runtime/WorkerSet.h"
 #include "aegisgate/runtime/WorkerShared.h"
 
 namespace aegisgate::net {
 class Acceptor;
+class Channel;
 class EventLoop;
 } // namespace aegisgate::net
 
@@ -75,7 +79,18 @@ public:
   void SubmitResultAndWait(std::size_t route_index, std::size_t endpoint_index, bool success);
 
 private:
+  struct RetiringGeneration {
+    runtime::RuntimeGenerationRef generation;
+    std::size_t returned_worker_balances = 0;
+  };
+
   void Accept(int fd);
+  // Control-loop-only retirement pipeline.  A WorkerData notification never
+  // calls these directly; the cross-thread boundary is GenerationMailbox.
+  void RetireGeneration(runtime::RuntimeGenerationRef generation);
+  void HandleGenerationEvents();
+  void RequestWorkerBalanceReturn(const runtime::RuntimeGenerationRef &generation);
+  void StartRetirementReaper(const runtime::RuntimeGenerationRef &generation);
   [[nodiscard]] runtime::RuntimeGenerationRef CurrentGeneration() const noexcept {
     return current_generation_.load(std::memory_order_acquire);
   }
@@ -98,6 +113,10 @@ private:
   std::vector<std::shared_ptr<runtime::WorkerData>> worker_datas_;
   std::unique_ptr<runtime::WorkerSet> workers_;
   std::unique_ptr<net::Acceptor> acceptor_;
+  std::shared_ptr<runtime::GenerationMailbox> generation_mailbox_;
+  std::unique_ptr<net::Channel> generation_mailbox_channel_;
+  std::unordered_map<std::uint64_t, RetiringGeneration> retiring_generations_;
+  std::vector<std::thread> retirement_reapers_;
   net::StreamFlowControl flow_control_;
 };
 

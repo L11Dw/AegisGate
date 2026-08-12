@@ -43,6 +43,11 @@ public:
   // Runs on the worker thread during shutdown: terminates every exchange
   // (pool CancelAll) and drops the clients so transactions release via RAII.
   void Shutdown() noexcept;
+  // Owner-worker thread only.  Before a retired generation's coordinator is
+  // stopped, return this worker's unused token lease for that generation.
+  // It is idempotent and intentionally does not touch live transactions: their
+  // GlobalAdmission reservations remain owned by ProxyTransaction RAII.
+  void ReturnGenerationLeaseBalance(std::uint64_t generation_version) noexcept;
   [[nodiscard]] std::shared_ptr<observability::Metrics> Metrics() const noexcept {
     return metrics_;
   }

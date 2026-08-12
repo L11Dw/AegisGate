@@ -67,6 +67,22 @@ bool RuntimeGeneration::BeginRetirement(std::function<void()> on_last_lease) {
   return true;
 }
 
+bool RuntimeGeneration::BeginReaping() noexcept {
+  std::lock_guard<std::mutex> guard(retirement_mutex_);
+  if (retirement_state_.load(std::memory_order_acquire) != RetirementState::kRetiring) {
+    return false;
+  }
+  retirement_state_.store(RetirementState::kReaping, std::memory_order_release);
+  return true;
+}
+
+void RuntimeGeneration::MarkRetired() noexcept {
+  std::lock_guard<std::mutex> guard(retirement_mutex_);
+  if (retirement_state_.load(std::memory_order_acquire) == RetirementState::kReaping) {
+    retirement_state_.store(RetirementState::kDone, std::memory_order_release);
+  }
+}
+
 void RuntimeGeneration::ReleaseRequestLease() noexcept {
   std::function<void()> notify;
   {

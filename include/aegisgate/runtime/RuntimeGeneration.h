@@ -69,6 +69,13 @@ public:
   // that same loop through its control mailbox; it must not tear down owner
   // resources on the releasing worker thread.
   [[nodiscard]] bool BeginRetirement(std::function<void()> on_last_lease);
+  // Gateway control-loop only.  Starts the one retirement reaper after all
+  // worker-local balances for this generation were returned.  A duplicate
+  // event is harmlessly rejected rather than starting a second coordinator
+  // shutdown.
+  [[nodiscard]] bool BeginReaping() noexcept;
+  // Gateway control-loop only, after the reaper has joined the coordinator.
+  void MarkRetired() noexcept;
   [[nodiscard]] std::uint64_t active_request_leases() const noexcept {
     return active_request_leases_.load(std::memory_order_acquire);
   }

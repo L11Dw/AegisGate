@@ -39,6 +39,17 @@ TEST(RuntimeGenerationTest, RetiringGenerationRejectsNewRequestLeases) {
   EXPECT_FALSE(generation->TryAcquireRequestLease().has_value());
 }
 
+TEST(RuntimeGenerationTest, RetirementTransitionsToReapingOnlyOnce) {
+  auto generation = std::make_shared<RuntimeGeneration>(/*version=*/81);
+  ASSERT_TRUE(generation->BeginRetirement([] {}));
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kRetiring);
+  EXPECT_TRUE(generation->BeginReaping());
+  EXPECT_FALSE(generation->BeginReaping());
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kReaping);
+  generation->MarkRetired();
+  EXPECT_EQ(generation->retirement_state(), RuntimeGeneration::RetirementState::kDone);
+}
+
 TEST(RuntimeGenerationTest, LastLeasePostsAValueEventForControlLoopRetirement) {
   auto mailbox = std::make_shared<GenerationMailbox>();
   auto generation = std::make_shared<RuntimeGeneration>(/*version=*/9);

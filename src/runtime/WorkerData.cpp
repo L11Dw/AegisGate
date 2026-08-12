@@ -219,6 +219,19 @@ void WorkerData::Shutdown() noexcept {
   client_count_->store(0, std::memory_order_release);
 }
 
+void WorkerData::ReturnGenerationLeaseBalance(std::uint64_t generation_version) noexcept {
+  const auto found = lease_balances_.find(generation_version);
+  if (found == lease_balances_.end()) return;
+  LeaseBalance &balances = found->second;
+  for (std::size_t route = 0; route < balances.balances.size() &&
+                              route < balances.admissions.size();
+       ++route) {
+    balances.admissions[route]->Return(balances.balances[route]);
+    balances.balances[route] = 0;
+  }
+  lease_balances_.erase(found);
+}
+
 void WorkerData::NotifyClientClosed(net::EventLoop &loop, std::weak_ptr<State> weak_state,
                                     std::uint64_t identifier) {
   const auto state = weak_state.lock();

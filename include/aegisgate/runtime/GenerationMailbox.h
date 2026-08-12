@@ -18,7 +18,11 @@ namespace aegisgate::runtime {
 // loop-owned object itself.
 class GenerationMailbox {
 public:
-  enum class Kind : std::uint8_t { kLastRequestLeaseReleased, kReaperFinished };
+  enum class Kind : std::uint8_t {
+    kLastRequestLeaseReleased,
+    kWorkerBalancesReturned,
+    kReaperFinished,
+  };
 
   struct Event {
     Kind kind;
