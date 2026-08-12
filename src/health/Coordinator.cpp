@@ -64,6 +64,204 @@ void Coordinator::Start() {
   future.get();
 }
 
+void Coordinator::StartPrepared() {
+  prepared_ = true;
+  activated_ = false;
+  runtime_->Start();
+  std::promise<void> initialized;
+  auto future = initialized.get_future();
+  if (!runtime_->PostWithLoop([this, &initialized](net::EventLoop &loop) {
+    try {
+      OnPreparedLoopInit(loop);
+      initialized.set_value();
+    } catch (...) {
+      initialized.set_exception(std::current_exception());
+    }
+  })) {
+    throw std::logic_error("coordinator prepared init task was not accepted");
+  }
+  future.get();
+}
+
+void Coordinator::OnPreparedLoopInit(net::EventLoop &loop) {
+  auto data = std::make_unique<LoopData>();
+  data->timers = std::make_unique<net::TimerQueue>(loop);
+  data->arm_timers.resize(config_->routes.size());
+  // Register outcome channel wake descriptors only; no health checkers,
+  // no admission refill started.
+  for (std::size_t route = 0; route < outcome_channels_.size(); ++route) {
+    OutcomeChannel *channel = outcome_channels_[route].get();
+    if (!channel) continue;
+    data->outcome_wake_channels.push_back(
+        std::make_unique<net::Channel>(loop, channel->WakeFd()));
+    data->outcome_wake_channels.back()->SetReadCallback([this, channel] {
+      std::uint64_t counter = 0;
+      for (;;) {
+        const ssize_t count = ::read(channel->WakeFd(), &counter, sizeof(counter));
+        if (count == static_cast<ssize_t>(sizeof(counter))) break;
+        if (count < 0 && errno == EINTR) continue;
+        break;
+      }
+      DrainOneOutcomeChannel(*channel);
+    });
+    data->outcome_wake_channels.back()->EnableReading();
+  }
+  loop_data_ = std::move(data);
+  Publish();
+}
+
+bool Coordinator::ImportProtectionSnapshotAndWait(
+    const ProtectionSnapshot &snapshot, std::chrono::milliseconds timeout) {
+  if (!prepared_ || activated_) return false;
+  struct Completion {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    bool cancelled = false;
+    bool ok = false;
+  };
+  auto completion = std::make_shared<Completion>();
+  if (!PostTask([this, &snapshot, completion] {
+        std::lock_guard<std::mutex> guard(completion->mu);
+        if (completion->cancelled) return;
+        try {
+          // Import health states by identity matching.
+          for (const auto &ep : snapshot.endpoints) {
+            for (std::size_t r = 0; r < config_->routes.size(); ++r) {
+              const auto &route = config_->routes[r];
+              RouteIdentity rid{route.name, route.host, route.path_prefix};
+              if (!SameRouteIdentity(rid, ep.route)) continue;
+              for (std::size_t e = 0; e < route.endpoints.size(); ++e) {
+                const auto &endpoint = route.endpoints[e];
+                EndpointIdentity eid{endpoint.host, endpoint.address, endpoint.port};
+                if (!SameEndpointIdentity(eid, ep.endpoint)) continue;
+                // Import health state.
+                const bool healthy = ep.health.state == HealthState::kHealthy ||
+                                     ep.health.state == HealthState::kImplicitHealthy;
+                state_->RecordHealth(r, e, healthy);
+              }
+            }
+          }
+          Publish();
+          completion->ok = true;
+        } catch (...) {
+          completion->ok = false;
+        }
+        completion->done = true;
+        completion->cv.notify_all();
+      })) {
+    return false;
+  }
+  {
+    std::unique_lock<std::mutex> lock(completion->mu);
+    if (!completion->cv.wait_for(lock, timeout, [&] { return completion->done; })) {
+      completion->cancelled = true;
+      return false;
+    }
+  }
+  return completion->ok;
+}
+
+bool Coordinator::Activate() {
+  if (!prepared_ || activated_) return false;
+  try {
+    std::promise<void> activated;
+    auto future = activated.get_future();
+    if (!runtime_->PostWithLoop([this, &activated](net::EventLoop &loop) {
+      try {
+        OnActivateLoopInit(loop);
+        activated_ = true;
+        activated.set_value();
+      } catch (...) {
+        activated.set_exception(std::current_exception());
+      }
+    })) {
+      return false;
+    }
+    future.get();
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+void Coordinator::OnActivateLoopInit(net::EventLoop &loop) {
+  // Start health checkers.
+  for (std::size_t route = 0; route < config_->routes.size(); ++route) {
+    const config::Route &route_config = config_->routes[route];
+    loop_data_->arm_timers[route].resize(route_config.endpoints.size(), 0);
+    if (!route_config.health_check.has_value()) continue;
+    const auto &settings = *route_config.health_check;
+    for (std::size_t endpoint = 0; endpoint < route_config.endpoints.size(); ++endpoint) {
+      const config::Endpoint &endpoint_config = route_config.endpoints[endpoint];
+      loop_data_->checkers.push_back(std::make_unique<health::HealthChecker>(
+          loop, *loop_data_->timers, endpoint_config,
+          HealthCheckConfig{std::chrono::milliseconds(settings.interval_ms),
+                            std::chrono::milliseconds(settings.timeout_ms)},
+          [this, route, endpoint](bool healthy) {
+            state_->RecordHealth(route, endpoint, healthy);
+            Publish();
+          }));
+      loop_data_->checkers.back()->Start();
+    }
+  }
+  // Start admission refill.
+  if (!admissions_.empty()) ScheduleRefillTick(*loop_data_->timers);
+}
+
+std::optional<ProtectionSnapshot> Coordinator::ExportProtectionSnapshotAndWait(
+    std::chrono::milliseconds timeout) {
+  struct Completion {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    bool cancelled = false;
+    std::optional<ProtectionSnapshot> result;
+  };
+  auto completion = std::make_shared<Completion>();
+  if (!PostTask([this, completion] {
+        std::lock_guard<std::mutex> guard(completion->mu);
+        if (completion->cancelled) return;
+        try {
+          ProtectionSnapshot snap;
+          for (std::size_t r = 0; r < config_->routes.size(); ++r) {
+            const auto &route = config_->routes[r];
+            RouteIdentity rid{route.name, route.host, route.path_prefix};
+            for (std::size_t e = 0; e < route.endpoints.size(); ++e) {
+              const auto &endpoint = route.endpoints[e];
+              EndpointIdentity eid{endpoint.host, endpoint.address, endpoint.port};
+              EndpointProtectionSnapshot ep;
+              ep.route = rid;
+              ep.endpoint = eid;
+              ep.health.state = state_->Healthy(r, e) ? HealthState::kHealthy
+                                                      : HealthState::kUnhealthy;
+              if (route.circuit_breaker.has_value()) {
+                resilience::CircuitBreakerSnapshot bsnap;
+                bsnap.state = static_cast<resilience::CircuitBreakerState>(
+                    static_cast<std::uint8_t>(state_->BreakerState(r, e)));
+                bsnap.half_open_quota = route.circuit_breaker->half_open_probes;
+                ep.breaker = bsnap;
+              }
+              snap.endpoints.push_back(std::move(ep));
+            }
+          }
+          completion->result = std::move(snap);
+        } catch (...) {}
+        completion->done = true;
+        completion->cv.notify_all();
+      })) {
+    return std::nullopt;
+  }
+  {
+    std::unique_lock<std::mutex> lock(completion->mu);
+    if (!completion->cv.wait_for(lock, timeout, [&] { return completion->done; })) {
+      completion->cancelled = true;
+      return std::nullopt;
+    }
+  }
+  return std::move(completion->result);
+}
+
 void Coordinator::Stop() noexcept {
   // The destroy task must run on the coordinator thread (TimerQueue and
   // checkers hold loop registrations).  It captures the Stop-frame owner by
@@ -92,11 +290,13 @@ std::shared_ptr<const HealthCircuitSnapshot> Coordinator::CurrentSnapshot() cons
 }
 
 bool Coordinator::PostResult(const AttemptResult &result) noexcept {
+  if (prepared_ && !activated_) return false;  // Prepared state: reject
   return PostTask([this, result] { RecordResultTask(result); });
 }
 
 std::optional<OutcomeChannel::Reservation>
 Coordinator::ReserveOutcome(std::size_t route_index) noexcept {
+  if (prepared_ && !activated_) return std::nullopt;  // Prepared state: reject
   if (route_index >= outcome_channels_.size() || !outcome_channels_[route_index]) {
     return std::nullopt;
   }
