@@ -1,4 +1,5 @@
 #include "aegisgate/http/HttpRequestSerializer.h"
+#include "aegisgate/http/HttpLimits.h"
 
 #include <stdexcept>
 #include <string_view>
@@ -6,7 +7,6 @@
 namespace aegisgate::http {
 namespace {
 
-constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
 constexpr std::size_t kMaxRequestLineBytes = 8 * 1024;
 constexpr std::size_t kMaxHeaderBytes = 32 * 1024;
 
@@ -138,7 +138,7 @@ std::string LowerAscii(std::string_view value) {
 
 std::string SerializeRequest(const HttpRequest &request) {
   if (!IsToken(request.method) || !IsValidTarget(request.target) ||
-      request.version != "HTTP/1.1" || request.body.size() > kMaxBodyBytes) {
+      request.version != "HTTP/1.1" || request.body.size() > kMaxRequestBodyBytes) {
     throw std::invalid_argument("invalid HTTP request");
   }
 

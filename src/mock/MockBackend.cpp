@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "aegisgate/http/HttpResponse.h"
+#include "aegisgate/http/HttpLimits.h"
 #include "aegisgate/net/Acceptor.h"
 #include "aegisgate/net/ClientConnection.h"
 #include "aegisgate/net/EventLoop.h"
@@ -23,6 +24,9 @@ MockBackend::MockBackend(net::EventLoop &loop, MockBackendOptions options, std::
   if (options_.status < 200 || options_.status > 599) throw std::invalid_argument("mock status must be 200..599");
   if (options_.delay < std::chrono::milliseconds::zero()) throw std::invalid_argument("mock delay cannot be negative");
   if (options_.max_inflight == 0) throw std::invalid_argument("mock max_inflight must be positive");
+  if (options_.body_bytes > http::kMaxUpstreamResponseBodyBytes) {
+    throw std::invalid_argument("mock body exceeds upstream response limit");
+  }
   state_->owner = this;
   acceptor_->SetNewConnectionCallback([this](int fd) { Accept(fd); });
 }

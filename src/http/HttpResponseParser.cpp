@@ -1,4 +1,5 @@
 #include "aegisgate/http/HttpResponseParser.h"
+#include "aegisgate/http/HttpLimits.h"
 
 #include <algorithm>
 #include <cctype>
@@ -10,7 +11,6 @@ namespace {
 
 constexpr std::size_t kMaxStatusLineBytes = 8 * 1024;
 constexpr std::size_t kMaxHeaderBytes = 32 * 1024;
-constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
 
 char LowerAscii(char value) {
   return value >= 'A' && value <= 'Z'
@@ -302,7 +302,7 @@ ParseResult HttpResponseParser::ParseHeaderArea(net::Buffer &input, ParsedHeader
     }
     if (name == "content-length") {
       if (out.has_content_length || !ParseContentLength(value, &out.content_length) ||
-          out.content_length > kMaxBodyBytes) {
+          out.content_length > kMaxUpstreamResponseBodyBytes) {
         return ParseResult::kError;
       }
       out.has_content_length = true;

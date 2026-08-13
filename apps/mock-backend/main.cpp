@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "aegisgate/http/HttpLimits.h"
 #include "aegisgate/mock/MockBackend.h"
 #include "aegisgate/net/EventLoop.h"
 
@@ -49,7 +50,8 @@ int main(int argc, char **argv) {
       } else if (option == "--max-inflight") {
         options.max_inflight = ParseUnsigned<std::size_t>(value, "max-inflight", 1000000);
       } else if (option == "--body-bytes") {
-        options.body_bytes = ParseUnsigned<std::size_t>(value, "body-bytes", 16 * 1024 * 1024);
+        options.body_bytes = ParseUnsigned<std::size_t>(
+            value, "body-bytes", aegisgate::http::kMaxUpstreamResponseBodyBytes);
       } else {
         throw std::invalid_argument("unknown option");
       }

@@ -5,7 +5,7 @@
 ## 已支持范围
 
 - 仅 Linux、C++20、基于 `epoll` 的非阻塞 TCP。
-- HTTP/1.1 请求路由和 Content-Length 响应。
+- HTTP/1.1 请求路由和 Content-Length 响应；上游响应最大 16 MiB。
 - 字面量 IPv4 上游地址。
 - 进程生命周期内固定的 worker 数。
 - worker 本地上游复用，不共享跨 worker 连接池。
@@ -14,7 +14,7 @@
 
 - TLS 终止、证书管理、DNS 解析、服务发现和分布式控制面。
 - HTTP chunked、HTTP/2、HTTP/3、gRPC、WebSocket 和任意协议隧道。
-- 请求 body 流式化；body 处理遵循当前有界 HTTP parser 行为。
+- 请求 body 流式化；请求 body 仍限制为 1 MiB。chunked 响应和超过 16 MiB 的上游 Content-Length 响应会被拒绝。
 - 动态 worker 调整、连接迁移和全局共享 idle 连接池。
 - “生产就绪”、SLA 或可泛化 QPS 的宣称。
 

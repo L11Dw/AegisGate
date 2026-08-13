@@ -462,6 +462,20 @@ std::string Gateway::RenderMetrics() const {
     }
   }
   auto result = observability::Metrics::RenderPrometheus(aggregate, protection);
+  // Keep worker-local gauges visible for benchmark diagnosis.  The aggregate
+  // gauges above answer application-level questions; these labels reveal
+  // imbalance or a single hot worker without exposing worker-owned objects.
+  for (std::size_t index = 0; index < worker_metrics_.size(); ++index) {
+    const auto data = worker_metrics_[index]->Snapshot();
+    result += "aegisgate_worker_active_connections{worker=\"" + std::to_string(index) +
+              "\"} " + std::to_string(data.active_connections) + "\n";
+    result += "aegisgate_worker_inflight_requests{worker=\"" + std::to_string(index) +
+              "\"} " + std::to_string(data.inflight) + "\n";
+    result += "aegisgate_worker_upstream_read_pauses_total{worker=\"" +
+              std::to_string(index) + "\"} " + std::to_string(data.upstream_read_pauses) + "\n";
+    result += "aegisgate_worker_upstream_read_resumes_total{worker=\"" +
+              std::to_string(index) + "\"} " + std::to_string(data.upstream_read_resumes) + "\n";
+  }
   // Append logger stats if available.
   if (logger_) {
     result += "aegisgate_log_dropped_total " + std::to_string(logger_->dropped_total()) + "\n";

@@ -1,4 +1,5 @@
 #include "aegisgate/http/HttpRequestParser.h"
+#include "aegisgate/http/HttpLimits.h"
 
 #include <cctype>
 #include <limits>
@@ -10,7 +11,6 @@ namespace {
 // request.  Route-specific limits belong to the later proxy/config layer.
 constexpr std::size_t kMaxRequestLineBytes = 8 * 1024;
 constexpr std::size_t kMaxHeaderBytes = 32 * 1024;
-constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
 
 char LowerAscii(char value) {
   if (value >= 'A' && value <= 'Z') {
@@ -221,7 +221,7 @@ ParseResult HttpRequestParser::Parse(net::Buffer &input) {
     const std::string_view value = TrimOws(raw_value);
     if (name == "content-length") {
       if (has_content_length || !ParseContentLength(value, &content_length) ||
-          content_length > kMaxBodyBytes) {
+          content_length > kMaxRequestBodyBytes) {
         result_ = ParseResult::kError;
         return result_;
       }

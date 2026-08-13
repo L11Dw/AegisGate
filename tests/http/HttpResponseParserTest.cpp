@@ -1,4 +1,5 @@
 #include "aegisgate/http/HttpResponseParser.h"
+#include "aegisgate/http/HttpLimits.h"
 #include "aegisgate/net/Buffer.h"
 
 #include <gtest/gtest.h>
@@ -61,13 +62,26 @@ TEST(HttpResponseParserTest, RejectsMissingDuplicateInvalidAndOverlimitContentLe
       "HTTP/1.1 200 OK\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
       "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
       "HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999\r\n\r\n",
-      "HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\n\r\n"};
+      "HTTP/1.1 200 OK\r\nContent-Length: " +
+          std::to_string(aegisgate::http::kMaxUpstreamResponseBodyBytes + 1) + "\r\n\r\n"};
   for (const auto &response : invalid) {
     Buffer input;
     input.Append(response);
     HttpResponseParser parser;
     EXPECT_EQ(parser.Parse(input), ParseResult::kError) << response;
   }
+}
+
+TEST(HttpResponseParserTest, AcceptsSixteenMiBContentLengthForStreaming) {
+  Buffer input;
+  input.Append("HTTP/1.1 200 OK\r\nContent-Length: " +
+               std::to_string(aegisgate::http::kMaxUpstreamResponseBodyBytes) + "\r\n\r\n");
+  HttpResponseParser parser;
+
+  EXPECT_EQ(parser.ParseHeaders(input), ParseResult::kComplete);
+  ASSERT_TRUE(parser.Head().content_length.has_value());
+  EXPECT_EQ(*parser.Head().content_length, aegisgate::http::kMaxUpstreamResponseBodyBytes);
+  EXPECT_FALSE(parser.BodyComplete());
 }
 
 TEST(HttpResponseParserTest, RejectsEveryTransferEncodingAsUnsupported) {
