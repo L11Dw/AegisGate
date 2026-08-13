@@ -5,7 +5,7 @@
 ## Supported scope
 
 - Linux only; C++20; non-blocking TCP with `epoll`.
-- HTTP/1.1 request routing and Content-Length responses.
+- HTTP/1.1 request routing and Content-Length responses up to 16 MiB from an upstream.
 - Literal IPv4 upstream addresses.
 - Fixed worker count for the lifetime of a process.
 - Worker-local upstream reuse; no cross-worker pool sharing.
@@ -14,7 +14,8 @@
 
 - TLS termination, certificate management, DNS resolution, service discovery, or a distributed control plane.
 - HTTP chunked transfer encoding, HTTP/2, HTTP/3, gRPC, WebSocket, and arbitrary protocol tunnelling.
-- Request-body streaming; body handling follows the current bounded HTTP parser behavior.
+- Request-body streaming; request bodies remain bounded at 1 MiB. Chunked response bodies and
+  upstream Content-Length values above 16 MiB are rejected.
 - Dynamic worker resizing, connection migration, or a globally shared idle connection pool.
 - A claim of production readiness, an SLA, or a portable QPS number.
 

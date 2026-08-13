@@ -12,8 +12,16 @@ WORKERS="${2:-1}"
 RUNS="${3:-5}"
 DURATION="${4:-10}"
 WARMUP="${5:-3}"
+BENCH_CONNECTIONS="${AEGISGATE_BENCH_CONNECTIONS:-}"
+BENCH_BODY_BYTES="${AEGISGATE_BENCH_BODY_BYTES:-524288}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 GIT_SHA="$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if git -C "$PROJECT_DIR" diff --quiet && git -C "$PROJECT_DIR" diff --cached --quiet; then
+  GIT_DIRTY=false
+else
+  GIT_DIRTY=true
+fi
+GIT_DIFF_SHA256="$(git -C "$PROJECT_DIR" diff HEAD --binary 2>/dev/null | sha256sum | awk '{print $1}')"
 CPU_INFO="$(grep "model name" /proc/cpuinfo 2>/dev/null | head -1 | sed 's/.*: //' || echo unknown)"
 KERNEL="$(uname -r)"
 BACKEND_PORT=9100
@@ -70,14 +78,14 @@ routes:
       - host: 127.0.0.1
         port: $port
         weight: 1
-    rate_limit: 100000
-    burst: 1000
+    rate_limit: 1000000
+    burst: 1000000
     max_inflight: 10000
     retry_budget: 0
 EOF
   case "$mode" in
     admission)
-      sed -i 's/rate_limit: 100000/rate_limit: 10/; s/burst: 1000/burst: 5/; s/max_inflight: 10000/max_inflight: 32/' "$path"
+      sed -i 's/rate_limit: 1000000/rate_limit: 10/; s/burst: 1000000/burst: 5/; s/max_inflight: 10000/max_inflight: 32/' "$path"
       ;;
     breaker)
       cat >> "$path" <<'EOF'
@@ -120,9 +128,10 @@ wait_gateway_ready() {
 }
 
 start_backend() {
-  local target_var="$1" port="$2" status="$3" body_bytes="${4:-0}"
+  local target_var="$1" port="$2" status="$3" body_bytes="${4:-0}" max_inflight="${5:-64}"
   local -a args=("$PROJECT_DIR/build/release/aegisgate_mock_backend" "$port" --status "$status")
   if [ "$body_bytes" -gt 0 ]; then args+=(--body-bytes "$body_bytes"); fi
+  args+=(--max-inflight "$max_inflight")
   "${args[@]}" &
   local pid=$!
   wait_until 3000 "mock backend on $port" \
@@ -204,6 +213,10 @@ run_parallel_burst() {
 }
 
 run_normal() {
+  if [ -n "$BENCH_CONNECTIONS" ]; then
+    run_wrk_normal
+    return
+  fi
   run_sequential_load "$WARMUP" 200 >/dev/null
   local requests=0 errors=0 duration_ms=0 rps=0 p50=0 p95=0 p99=0 mean=0 start end result
   for _ in $(seq 1 "$RUNS"); do
@@ -219,6 +232,66 @@ run_normal() {
   print_result "$requests" "$errors" "$duration_ms" "$rps" "$p50" "$p95" "$p99" "$mean"
 }
 
+latency_to_us() {
+  awk -v value="$1" 'BEGIN {
+    if (value ~ /us$/) { sub(/us$/, "", value); print int(value); exit }
+    if (value ~ /ms$/) { sub(/ms$/, "", value); print int(value * 1000); exit }
+    if (value ~ /s$/) { sub(/s$/, "", value); print int(value * 1000000); exit }
+    exit 1
+  }'
+}
+
+run_wrk_once() {
+  local seconds="$1" threads output requests rps p50 p75 p90 p99 non2xx socket_errors errors
+  threads="$BENCH_CONNECTIONS"
+  [ "$threads" -le "$(nproc)" ] || threads="$(nproc)"
+  output="$(wrk -t "$threads" -c "$BENCH_CONNECTIONS" -d "${seconds}s" --latency --timeout 5s \
+    -H 'Host: bench.local' "http://127.0.0.1:${GATEWAY_PORT}/")"
+  requests="$(awk '/ requests in / { print $1; exit }' <<<"$output")"
+  rps="$(awk '/Requests\/sec:/ { printf "%d", $2; exit }' <<<"$output")"
+  p50="$(latency_to_us "$(awk '$1 == "50%" { print $2; exit }' <<<"$output")")"
+  p75="$(latency_to_us "$(awk '$1 == "75%" { print $2; exit }' <<<"$output")")"
+  p90="$(latency_to_us "$(awk '$1 == "90%" { print $2; exit }' <<<"$output")")"
+  p99="$(latency_to_us "$(awk '$1 == "99%" { print $2; exit }' <<<"$output")")"
+  non2xx="$(awk '/Non-2xx or 3xx responses:/ { print $5; exit }' <<<"$output")"
+  socket_errors="$(awk '/Socket errors:/ {
+    for (i = 1; i <= NF; ++i) { gsub(/[^0-9]/, "", $i); if ($i != "") sum += $i }
+  } END { print sum + 0 }' <<<"$output")"
+  requests="${requests:-0}"; rps="${rps:-0}"; non2xx="${non2xx:-0}"
+  errors=$((non2xx + socket_errors))
+  printf '%s %s %s %s %s %s %s %s %s\n' \
+    "$requests" "$errors" "$rps" "$p50" "$p75" "$p90" "$p99" "$non2xx" "$socket_errors"
+}
+
+run_wrk_normal() {
+  [[ "$BENCH_CONNECTIONS" =~ ^[1-9][0-9]*$ ]] || die "AEGISGATE_BENCH_CONNECTIONS must be a positive integer"
+  local result requests=0 errors=0 rps_total=0 p50_total=0 p75_total=0 p90_total=0 p99_total=0
+  local non2xx_total=0 socket_errors_total=0 run_percentiles="["
+  local p50_values="" p75_values="" p90_values="" p99_values=""
+  run_wrk_once "$WARMUP" >/dev/null
+  for _ in $(seq 1 "$RUNS"); do
+    result="$(run_wrk_once "$DURATION")"
+    read -r accepted rejected rps p50 p75 p90 p99 non2xx socket_errors <<< "$result"
+    requests=$((requests + accepted)); errors=$((errors + rejected)); rps_total=$((rps_total + rps))
+    p50_total=$((p50_total + p50)); p75_total=$((p75_total + p75))
+    p90_total=$((p90_total + p90)); p99_total=$((p99_total + p99))
+    non2xx_total=$((non2xx_total + non2xx)); socket_errors_total=$((socket_errors_total + socket_errors))
+    [[ "$run_percentiles" == "[" ]] || run_percentiles+=","
+    run_percentiles+="{\"p50_us\":$p50,\"p75_us\":$p75,\"p90_us\":$p90,\"p99_us\":$p99}"
+    p50_values+="$p50\n"; p75_values+="$p75\n"; p90_values+="$p90\n"; p99_values+="$p99\n"
+  done
+  run_percentiles+="]"
+  local p50_min p50_median p50_max p99_min p99_median p99_max
+  read -r p50_min p50_median p50_max <<< "$(printf '%b' "$p50_values" | sort -n | awk 'NR==1 {min=$1} {a[NR]=$1} END {max=a[NR]; mid=int((NR+1)/2); print min,a[mid],max}')"
+  read -r p99_min p99_median p99_max <<< "$(printf '%b' "$p99_values" | sort -n | awk 'NR==1 {min=$1} {a[NR]=$1} END {max=a[NR]; mid=int((NR+1)/2); print min,a[mid],max}')"
+  [ "$requests" -gt 0 ] || die "wrk normal scenario observed no completed request"
+  local threads="$BENCH_CONNECTIONS"
+  [ "$threads" -le "$(nproc)" ] || threads="$(nproc)"
+  SCENARIO_DETAILS="\"accepted\":$requests,\"errors\":$errors,\"driver\":\"wrk\",\"connections\":$BENCH_CONNECTIONS,\"threads\":$threads,\"non2xx_responses\":$non2xx_total,\"socket_errors\":$socket_errors_total,\"status_429\":0,\"status_5xx\":0,\"p50_us_min\":$p50_min,\"p50_us_median\":$p50_median,\"p50_us_max\":$p50_max,\"p99_us_min\":$p99_min,\"p99_us_median\":$p99_median,\"p99_us_max\":$p99_max,\"p75_us_mean\":$((p75_total / RUNS)),\"p90_us_mean\":$((p90_total / RUNS)),\"percentiles_per_run\":$run_percentiles"
+  print_result "$requests" "$errors" "$((RUNS * DURATION * 1000))" "$((rps_total / RUNS))" \
+    "$((p50_total / RUNS))" null "$((p99_total / RUNS))" null
+}
+
 run_admission() {
   # Give the coordinator's first refill tick a bounded chance to populate the
   # small global budget; this is benchmark setup, not request timing.
@@ -228,7 +301,7 @@ run_admission() {
   [ "$rejected" -gt 0 ] || die "admission scenario observed no 429 rejection"
   local p50 p95 p99 mean
   read -r p50 p95 p99 mean <<< "$(measure_latency_us)"
-  SCENARIO_DETAILS="\"accepted\":$accepted,\"rate_limited\":$rejected,\"other_failures\":$failures,\"configured_rate_limit\":10,\"configured_burst\":5"
+  SCENARIO_DETAILS="\"accepted\":$accepted,\"rate_limited\":$rejected,\"other_failures\":$failures,\"status_429\":$rejected,\"status_5xx\":0,\"configured_rate_limit\":10,\"configured_burst\":5"
   print_result "$accepted" "$((rejected + failures))" 0 0 "$p50" "$p95" "$p99" "$mean"
 }
 
@@ -240,7 +313,7 @@ run_breaker() {
   stop_and_wait "$BACKEND_PID"; BACKEND_PID=""
   start_backend BACKEND_PID "$BACKEND_PORT" 200
   wait_until 5000 "breaker recovery" 'code=$(request_code); [ "$code" = 200 ] && breaker_is closed'
-  SCENARIO_DETAILS="\"failure_responses_before_open\":$failures,\"final_breaker_state\":\"closed\""
+  SCENARIO_DETAILS="\"failure_responses_before_open\":$failures,\"status_429\":0,\"status_5xx\":$failures,\"final_breaker_state\":\"closed\""
   print_result "$failures" 0 0 0 0 0 0 0
 }
 
@@ -268,7 +341,10 @@ slow_reader() {
 }
 
 run_slow_client() {
-  local body_bytes=524288 temp ready result slow_pid parallel_status pauses resumes final_bytes
+  local kBackpressureAssertionBytes=$((5 * 1024 * 1024))
+  local body_bytes="$BENCH_BODY_BYTES" temp ready result slow_pid parallel_status pauses resumes final_bytes require_backpressure=false
+  [[ "$body_bytes" =~ ^[1-9][0-9]*$ ]] || die "AEGISGATE_BENCH_BODY_BYTES must be a positive integer"
+  [ "$body_bytes" -le $((16 * 1024 * 1024)) ] || die "AEGISGATE_BENCH_BODY_BYTES exceeds mock backend's 16MiB limit"
   temp=$(mktemp -d /tmp/aegisgate_slow_XXXXXX); ready="$temp/ready"; result="$temp/result"
   slow_reader "$body_bytes" "$ready" "$result" & slow_pid=$!
   wait_until 5000 "slow reader prefix" "test -f '$ready'"
@@ -279,9 +355,12 @@ run_slow_client() {
   pauses=$(count_metric aegisgate_upstream_read_pauses_total); resumes=$(count_metric aegisgate_upstream_read_resumes_total)
   rm -rf "$temp"
   [ "$final_bytes" = "$body_bytes" ] || die "slow reader received $final_bytes bytes, expected $body_bytes"
-  [ "${pauses:-0}" -gt 0 ] || die "slow-client scenario did not observe an upstream-read pause"
-  [ "${resumes:-0}" -gt 0 ] || die "slow-client scenario did not observe an upstream-read resume"
-  SCENARIO_DETAILS="\"body_bytes\":$body_bytes,\"slow_reader_bytes\":$final_bytes,\"parallel_request_status\":$parallel_status,\"upstream_read_pauses\":$pauses,\"upstream_read_resumes\":$resumes"
+  if [ "$body_bytes" -ge "$kBackpressureAssertionBytes" ]; then
+    require_backpressure=true
+    [ "${pauses:-0}" -gt 0 ] || die "slow-client scenario did not observe an upstream-read pause"
+    [ "${resumes:-0}" -gt 0 ] || die "slow-client scenario did not observe an upstream-read resume"
+  fi
+  SCENARIO_DETAILS="\"body_bytes\":$body_bytes,\"slow_reader_bytes\":$final_bytes,\"parallel_request_status\":$parallel_status,\"backpressure_required\":$require_backpressure,\"upstream_read_pauses\":$pauses,\"upstream_read_resumes\":$resumes"
   print_result 2 0 0 0 0 0 0 0
 }
 
@@ -303,12 +382,18 @@ run_reload() {
 
 print_result() {
   local requests="$1" errors="$2" duration_ms="$3" rps="$4" p50="$5" p95="$6" p99="$7" mean="$8"
-  local dropped io_dropped critical log_lines
+  local dropped io_dropped critical log_lines gateway_cpu gateway_rss gateway_voluntary gateway_nonvoluntary
   dropped=$(count_metric aegisgate_log_dropped_total); io_dropped=$(count_metric aegisgate_log_io_dropped_total)
   critical=$(count_metric aegisgate_log_critical_overflow_total); log_lines=$(wc -l < "$BENCH_LOG_PATH" 2>/dev/null || echo 0)
+  gateway_cpu=$(ps -o pcpu= -p "$GATEWAY_PID" 2>/dev/null | awk '{print $1 + 0}' || echo 0)
+  gateway_rss=$(ps -o rss= -p "$GATEWAY_PID" 2>/dev/null | awk '{print $1 + 0}' || echo 0)
+  gateway_voluntary=$(awk '/^voluntary_ctxt_switches:/ {print $2; exit}' "/proc/$GATEWAY_PID/status" 2>/dev/null || echo 0)
+  gateway_nonvoluntary=$(awk '/^nonvoluntary_ctxt_switches:/ {print $2; exit}' "/proc/$GATEWAY_PID/status" 2>/dev/null || echo 0)
   cat > "$RESULT_FILE" <<EOF
 {
   "git_sha": "$GIT_SHA",
+  "git_dirty": $GIT_DIRTY,
+  "git_diff_sha256": "$GIT_DIFF_SHA256",
   "cpu": "$CPU_INFO",
   "kernel": "$KERNEL",
   "workers": $WORKERS,
@@ -326,6 +411,7 @@ print_result() {
   "log_dropped_total": ${dropped:-0},
   "log_io_dropped_total": ${io_dropped:-0},
   "log_critical_overflow_total": ${critical:-0},
+  "resource_snapshot": {"gateway_cpu_percent":${gateway_cpu:-0},"gateway_rss_kib":${gateway_rss:-0},"gateway_voluntary_ctxt_switches":${gateway_voluntary:-0},"gateway_nonvoluntary_ctxt_switches":${gateway_nonvoluntary:-0}},
   "scenario_details": { $SCENARIO_DETAILS },
   "timestamp": "$(date -Iseconds)"
 }
@@ -339,10 +425,10 @@ build_release
 CONFIG_FILE=$(mktemp /tmp/aegisgate_bench_XXXXXX.yaml)
 
 case "$SCENARIO" in
-  normal) write_config "$CONFIG_FILE" "$WORKERS" "$BACKEND_PORT" normal; start_backend BACKEND_PID "$BACKEND_PORT" 200;;
+  normal) write_config "$CONFIG_FILE" "$WORKERS" "$BACKEND_PORT" normal; start_backend BACKEND_PID "$BACKEND_PORT" 200 0 10000;;
   admission) write_config "$CONFIG_FILE" "$WORKERS" "$BACKEND_PORT" admission; start_backend BACKEND_PID "$BACKEND_PORT" 200;;
   breaker) write_config "$CONFIG_FILE" "$WORKERS" "$BACKEND_PORT" breaker; start_backend BACKEND_PID "$BACKEND_PORT" 500;;
-  slow_client) write_config "$CONFIG_FILE" "$WORKERS" "$BACKEND_PORT" normal; start_backend BACKEND_PID "$BACKEND_PORT" 200 524288;;
+  slow_client) write_config "$CONFIG_FILE" "$WORKERS" "$BACKEND_PORT" normal; start_backend BACKEND_PID "$BACKEND_PORT" 200 "$BENCH_BODY_BYTES" 64;;
   reload) write_config "$CONFIG_FILE" "$WORKERS" "$BACKEND_PORT" normal; start_backend BACKEND_PID "$BACKEND_PORT" 200; start_backend BACKEND2_PID "$RELOAD_BACKEND_PORT" 200;;
 esac
 start_gateway

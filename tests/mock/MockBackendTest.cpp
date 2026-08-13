@@ -1,4 +1,5 @@
 #include "aegisgate/mock/MockBackend.h"
+#include "aegisgate/http/HttpLimits.h"
 
 #include <array>
 #include <cerrno>
@@ -173,6 +174,11 @@ TEST(MockBackendTest, ValidatesStartupOptions) {
   EXPECT_THROW((MockBackend(loop, MockBackendOptions{.status = 99}, "127.0.0.1", 0)), std::invalid_argument);
   EXPECT_THROW((MockBackend(loop, MockBackendOptions{.status = 100}, "127.0.0.1", 0)), std::invalid_argument);
   EXPECT_THROW((MockBackend(loop, MockBackendOptions{.max_inflight = 0}, "127.0.0.1", 0)), std::invalid_argument);
+  EXPECT_THROW((MockBackend(loop,
+                            MockBackendOptions{.body_bytes =
+                                                   aegisgate::http::kMaxUpstreamResponseBodyBytes + 1},
+                            "127.0.0.1", 0)),
+               std::invalid_argument);
 }
 
 } // namespace
